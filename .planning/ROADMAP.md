@@ -10,7 +10,7 @@ This first roadmap takes Codex from interrupting automatic compaction to backgro
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 1: Background Trigger And Continued Turns** - Start automatic mid-turn compaction in the background while agent output continues.
+- [x] **Phase 1: Background Trigger And Continued Turns** - Start automatic mid-turn compaction in the background while agent output continues.
 - [ ] **Phase 2: Safe Transcript Splicing** - Apply completed background compactions only to the captured transcript slice and preserve newer messages.
 - [ ] **Phase 3: Durable History And Surface Compatibility** - Keep post-compaction history consistent across persistence, replay, and existing compaction surfaces.
 - [ ] **Phase 4: Failure Recovery And Blocking Guardrails** - Recover failed background jobs through the existing blocking path without changing manual or pre-turn semantics.
@@ -77,7 +77,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Background Trigger And Continued Turns | 2/4 | In progress | - |
+| 1. Background Trigger And Continued Turns | 4/4 | Complete | 2026-03-09 |
 | 2. Safe Transcript Splicing | 0/TBD | Not started | - |
 | 3. Durable History And Surface Compatibility | 0/TBD | Not started | - |
 | 4. Failure Recovery And Blocking Guardrails | 0/TBD | Not started | - |
