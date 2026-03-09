@@ -510,6 +510,115 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_remote_background_auto_compact_falls_back_to_blocking_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const FAILED_REMOTE_FALLBACK_REPLY: &str = "FINAL_REPLY";
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let session_id = harness.test().session_configured.session_id.to_string();
+    let auto_compact_call_id = "m1";
+
+    mount_sse_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_shell_command_call(auto_compact_call_id, "echo 'hi'"),
+            responses::ev_completed_with_tokens("resp-1", 100000000),
+        ]),
+    )
+    .await;
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![responses::sse(vec![
+            responses::ev_assistant_message("m2", FAILED_REMOTE_FALLBACK_REPLY),
+            responses::ev_completed("resp-2"),
+        ])],
+    )
+    .await;
+
+    let failed_compact_mock = responses::mount_compact_response_once(
+        harness.server(),
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "code": "server_error",
+                "message": "background compact failed"
+            }
+        })),
+    )
+    .await;
+    let fallback_compact_mock = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({
+            "output": compacted_summary_only_output("REMOTE_COMPACTED_SUMMARY")
+        }),
+    )
+    .await;
+    let post_fallback_turn_mock = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            responses::ev_assistant_message("m3", "SHOULD_NOT_RUN"),
+            responses::ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello remote compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let mut saw_turn_complete = false;
+    let mut saw_turn_aborted = false;
+    while !saw_turn_complete {
+        let event = codex.next_event().await.expect("next event");
+        match event.msg {
+            EventMsg::TurnComplete(_) => saw_turn_complete = true,
+            EventMsg::TurnAborted(_) => saw_turn_aborted = true,
+            _ => {}
+        }
+    }
+
+    assert_eq!(failed_compact_mock.requests().len(), 1);
+    assert_eq!(fallback_compact_mock.requests().len(), 1);
+    assert!(
+        post_fallback_turn_mock.requests().is_empty(),
+        "failed remote background compaction should stop the agent loop after fallback"
+    );
+    assert!(
+        !saw_turn_aborted,
+        "failed remote background fallback should not emit a separate abort event"
+    );
+
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        1,
+        "expected only the immediate continuation request before fallback stops the turn"
+    );
+
+    let fallback_request = fallback_compact_mock.single_request();
+    let fallback_body = fallback_request.body_json().to_string();
+    assert_eq!(
+        fallback_request.header("session_id").as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(
+        fallback_body.contains(FAILED_REMOTE_FALLBACK_REPLY),
+        "fallback remote compaction should run against the current history after the continued turn step"
+    );
+
+    Ok(())
+}
+
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
@@ -649,7 +758,7 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
     .await?;
     let codex = harness.test().codex.clone();
 
-    let responses_mock = responses::mount_sse_sequence(
+    let _responses_mock = responses::mount_sse_sequence(
         harness.server(),
         vec![
             sse(vec![
@@ -668,14 +777,18 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
                 responses::ev_assistant_message("trimmed-assistant", "trimmed complete"),
                 responses::ev_completed_with_tokens("trimmed-final-response", 500_000),
             ]),
-            sse(vec![
-                responses::ev_assistant_message(
-                    "auto-compact-final",
-                    "AUTO_REMOTE_COMPACT_FINAL_REPLY",
-                ),
-                responses::ev_completed("auto-compact-final-response"),
-            ]),
         ],
+    )
+    .await;
+    let _optional_post_compact_turn = mount_sse_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_assistant_message(
+                "auto-compact-final",
+                "AUTO_REMOTE_COMPACT_FINAL_REPLY",
+            ),
+            responses::ev_completed("auto-compact-final-response"),
+        ]),
     )
     .await;
 
@@ -688,16 +801,7 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
             final_output_json_schema: None,
         })
         .await?;
-    for _ in 0..400 {
-        if responses_mock.requests().len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        responses_mock.requests().len() >= 2,
-        "expected at least two model requests after the first setup turn"
-    );
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
@@ -708,16 +812,7 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
             final_output_json_schema: None,
         })
         .await?;
-    for _ in 0..400 {
-        if responses_mock.requests().len() >= 4 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        responses_mock.requests().len() >= 4,
-        "expected at least four model requests after the second setup turn"
-    );
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let compact_mock = responses::mount_compact_user_history_with_summary_once(
         harness.server(),

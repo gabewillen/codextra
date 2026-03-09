@@ -35,6 +35,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_response_sequence;
+use core_test_support::responses::mount_response_sequence_match;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -252,7 +253,8 @@ async fn summarize_context_three_requests_and_instructions() {
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
 
     // Build config pointing to the mock server and spawn Codex.
-    let model_provider = non_openai_model_provider(&server);
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
@@ -817,6 +819,120 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             .unwrap_or_default()
             .contains(first_function_name),
         "continued turn should still send the active turn tool output before background apply completes"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_background_auto_compact_falls_back_to_blocking_compaction_once() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_function_name = "test_tool_one";
+    let first_call_id = "call-background-failure-1";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, first_function_name, "{}"),
+        ev_completed_with_tokens("r1", 500),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 50),
+    ]);
+    let failed_compact_turn = sse_failed(
+        "resp-fail-1",
+        "server_error",
+        "background compact failed",
+    );
+    let fallback_compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+
+    let first_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && !request_function_output_contains(req, first_function_name)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
+
+    let continued_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, first_function_name)
+    };
+    let continued_turn_mock =
+        mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
+
+    let compaction_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let compaction_mock = mount_response_sequence_match(
+        &server,
+        compaction_matcher,
+        vec![
+            sse_response(failed_compact_turn),
+            sse_response(fallback_compact_turn),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    let event_result = timeout(Duration::from_secs(20), async {
+        let mut saw_turn_complete = false;
+        let mut saw_turn_aborted = false;
+        while !saw_turn_complete {
+            let event = codex.next_event().await.expect("next event");
+            match event.msg {
+                EventMsg::TurnComplete(_) => saw_turn_complete = true,
+                EventMsg::TurnAborted(_) => saw_turn_aborted = true,
+                _ => {}
+            }
+        }
+        (saw_turn_complete, saw_turn_aborted)
+    })
+    .await;
+    let (_saw_turn_complete, saw_turn_aborted) = match event_result {
+        Ok(result) => result,
+        Err(_) => panic!(
+            "timed out waiting for failed background compaction fallback: first={}, continued={}, compactions={}",
+            first_turn_mock.requests().len(),
+            continued_turn_mock.requests().len(),
+            compaction_mock.requests().len(),
+        ),
+    };
+
+    assert_eq!(first_turn_mock.requests().len(), 1);
+    assert_eq!(continued_turn_mock.requests().len(), 1);
+    assert_eq!(
+        compaction_mock.requests().len(),
+        2,
+        "expected one failed background compaction attempt and one blocking fallback compaction"
+    );
+    assert!(
+        !saw_turn_aborted,
+        "failed background compaction fallback should end the turn without a separate abort event"
     );
 
     codex.submit(Op::Shutdown).await.unwrap();
