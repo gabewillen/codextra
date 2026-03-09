@@ -347,11 +347,12 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     .await?;
     let codex = harness.test().codex.clone();
     let session_id = harness.test().session_configured.session_id.to_string();
+    let auto_compact_call_id = "m1";
 
     mount_sse_once(
         harness.server(),
         sse(vec![
-            responses::ev_shell_command_call("m1", "echo 'hi'"),
+            responses::ev_shell_command_call(auto_compact_call_id, "echo 'hi'"),
             responses::ev_completed_with_tokens("resp-1", 100000000), // over token limit
         ]),
     )
@@ -365,9 +366,11 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     )
     .await;
 
-    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+    let compact_mock = responses::mount_compact_json_once(
         harness.server(),
-        "REMOTE_COMPACTED_SUMMARY",
+        serde_json::json!({
+            "output": compacted_summary_only_output("REMOTE_COMPACTED_SUMMARY")
+        }),
     )
     .await;
 
@@ -381,13 +384,42 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         })
         .await?;
 
-    let message = wait_for_event_match(&codex, |event| match event {
-        EventMsg::ContextCompacted(_) => Some(true),
-        _ => None,
-    })
-    .await;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    assert!(message);
+    let mut saw_compaction_started = false;
+    let mut auto_compact_lifecycle_events = Vec::new();
+    loop {
+        let event = codex.next_event().await.expect("next event");
+        if event.id.starts_with("auto-compact-")
+            && matches!(
+                &event.msg,
+                EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_)
+            )
+        {
+            auto_compact_lifecycle_events.push(event.id.clone());
+        }
+        match event.msg {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            }) => {
+                saw_compaction_started = true;
+            }
+            EventMsg::TurnAborted(aborted) => {
+                panic!("did not expect background auto compact to abort the turn: {aborted:?}");
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_compaction_started,
+        "expected remote background auto compaction to start during the active turn"
+    );
+    assert!(
+        auto_compact_lifecycle_events.is_empty(),
+        "background auto compact should not emit separate task lifecycle events"
+    );
+
     assert_eq!(compact_mock.requests().len(), 1);
     assert_eq!(
         compact_mock
@@ -398,7 +430,31 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     );
     let follow_up_request = responses_mock.single_request();
     let follow_up_body = follow_up_request.body_json().to_string();
-    assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
+    let follow_up_user_messages = follow_up_request.message_input_texts("user");
+    assert!(
+        follow_up_user_messages
+            .iter()
+            .any(|message| message == "hello remote compact"),
+        "expected the live continuation request to keep the active user message"
+    );
+    assert!(
+        follow_up_request.has_function_call(auto_compact_call_id),
+        "expected the live continuation request to keep the tool call history"
+    );
+    assert!(
+        follow_up_request
+            .function_call_output_text(auto_compact_call_id)
+            .is_some(),
+        "expected the live continuation request to keep the tool call output"
+    );
+    assert!(
+        !follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"),
+        "did not expect the completed background summary to be applied to the live continuation request"
+    );
+    assert!(
+        !follow_up_body.contains("\"type\":\"compaction\""),
+        "did not expect the live continuation request to contain a compaction item"
+    );
 
     Ok(())
 }
@@ -522,7 +578,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
+async fn auto_remote_compact_carries_function_call_history_into_compact_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let first_user_message = "turn with retained shell call";
@@ -530,7 +586,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
     let retained_call_id = "retained-call";
     let trimmed_call_id = "trimmed-call";
     let retained_command = "echo retained-shell-output";
-    let trimmed_command = "yes x | head -n 3000";
+    let trimmed_command = "x".repeat(12_000);
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -542,7 +598,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
     .await?;
     let codex = harness.test().codex.clone();
 
-    responses::mount_sse_sequence(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
         vec![
             sse(vec![
@@ -554,13 +610,20 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
                 responses::ev_completed("retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(trimmed_call_id, trimmed_command),
+                responses::ev_shell_command_call(trimmed_call_id, &trimmed_command),
                 responses::ev_completed_with_tokens("trimmed-call-response", 100),
             ]),
-            sse(vec![responses::ev_completed_with_tokens(
-                "trimmed-final-response",
-                500_000,
-            )]),
+            sse(vec![
+                responses::ev_assistant_message("trimmed-assistant", "trimmed complete"),
+                responses::ev_completed_with_tokens("trimmed-final-response", 500_000),
+            ]),
+            sse(vec![
+                responses::ev_assistant_message(
+                    "auto-compact-final",
+                    "AUTO_REMOTE_COMPACT_FINAL_REPLY",
+                ),
+                responses::ev_completed("auto-compact-final-response"),
+            ]),
         ],
     )
     .await;
@@ -574,7 +637,16 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    for _ in 0..400 {
+        if responses_mock.requests().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        responses_mock.requests().len() >= 2,
+        "expected at least two model requests after the first setup turn"
+    );
 
     codex
         .submit(Op::UserInput {
@@ -585,7 +657,16 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    for _ in 0..400 {
+        if responses_mock.requests().len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        responses_mock.requests().len() >= 4,
+        "expected at least four model requests after the second setup turn"
+    );
 
     let compact_mock = responses::mount_compact_user_history_with_summary_once(
         harness.server(),
@@ -602,7 +683,12 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    for _ in 0..400 {
+        if compact_mock.requests().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(
         compact_mock.requests().len(),
         1,
@@ -632,22 +718,20 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
         "expected compact request to keep the older function call/result pair"
     );
     assert!(
-        !compact_request.has_function_call(trimmed_call_id)
+        compact_request.has_function_call(trimmed_call_id)
             && compact_request
                 .function_call_output_text(trimmed_call_id)
-                .is_none(),
-        "expected compact request to drop the trailing function call/result pair past the boundary"
+                .is_some(),
+        "expected compact request to carry the newer function call/result pair from the active history"
     );
 
-    assert_eq!(
-        compact_request.inputs_of_type("function_call").len(),
-        1,
-        "expected exactly one function call after trimming"
+    assert!(
+        compact_request.inputs_of_type("function_call").len() >= 2,
+        "expected compact request to include the retained and newer function calls"
     );
-    assert_eq!(
-        compact_request.inputs_of_type("function_call_output").len(),
-        1,
-        "expected exactly one function call output after trimming"
+    assert!(
+        compact_request.inputs_of_type("function_call_output").len() >= 2,
+        "expected compact request to include the retained and newer function call outputs"
     );
 
     Ok(())
@@ -1832,27 +1916,35 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
     let compact_request = compact_mock.single_request();
     let post_compact_request = &requests[2];
     assert_request_contains_realtime_end(second_turn_request);
+    assert_request_contains_realtime_end(post_compact_request);
+    let post_compact_body = post_compact_request.body_json().to_string();
     assert!(
-        !post_compact_request
-            .body_json()
-            .to_string()
-            .contains("<realtime_conversation>"),
-        "did not expect post-compaction history to restate realtime instructions once the current turn had already established an inactive baseline"
+        post_compact_request.has_function_call("call-remote-mid-turn"),
+        "expected the live continuation request to keep the in-turn function call"
     );
-
-    insta::assert_snapshot!(
-        "remote_mid_turn_compaction_does_not_restate_realtime_end_shapes",
-        format_labeled_requests_snapshot(
-            "Remote mid-turn continuation compaction after realtime was closed before the turn: the initial second-turn request emits realtime-end instructions, but the continuation request does not restate them after compaction because the current turn already established the inactive baseline.",
-            &[
-                ("Second Turn Initial Request", second_turn_request),
-                ("Remote Compaction Request", &compact_request),
-                (
-                    "Remote Post-Compaction History Layout",
-                    post_compact_request
-                ),
-            ]
-        )
+    assert!(
+        post_compact_request
+            .function_call_output_text("call-remote-mid-turn")
+            .is_some(),
+        "expected the live continuation request to keep the function call output"
+    );
+    assert!(
+        !post_compact_body.contains("REMOTE_MID_TURN_REALTIME_CLOSED_SUMMARY"),
+        "did not expect the completed background summary to be applied to the live continuation request"
+    );
+    assert!(
+        !post_compact_body.contains("\"type\":\"compaction\""),
+        "did not expect the live continuation request to contain a compaction item"
+    );
+    assert!(
+        compact_request.has_function_call("call-remote-mid-turn"),
+        "expected the compact request to include the in-turn function call history"
+    );
+    assert!(
+        compact_request
+            .function_call_output_text("call-remote-mid-turn")
+            .is_some(),
+        "expected the compact request to include the in-turn function call output"
     );
 
     realtime_server.shutdown().await;
@@ -2332,9 +2424,11 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     )
     .await;
 
-    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+    let compact_mock = responses::mount_compact_json_once(
         harness.server(),
-        &summary_with_prefix("REMOTE_MID_TURN_SUMMARY"),
+        serde_json::json!({
+            "output": compacted_summary_only_output("REMOTE_MID_TURN_SUMMARY")
+        }),
     )
     .await;
 
@@ -2358,15 +2452,42 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     );
 
     let compact_request = compact_mock.single_request();
-    insta::assert_snapshot!(
-        "remote_mid_turn_compaction_shapes",
-        format_labeled_requests_snapshot(
-            "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.",
-            &[
-                ("Remote Compaction Request", &compact_request),
-                ("Remote Post-Compaction History Layout", &requests[1]),
-            ]
-        )
+    let post_compact_request = &requests[1];
+    let post_compact_body = post_compact_request.body_json().to_string();
+    let post_compact_user_messages = post_compact_request.message_input_texts("user");
+    assert!(
+        compact_request.has_function_call("call-remote-mid-turn"),
+        "expected the compact request to include the in-turn function call"
+    );
+    assert!(
+        compact_request
+            .function_call_output_text("call-remote-mid-turn")
+            .is_some(),
+        "expected the compact request to include the in-turn function call output"
+    );
+    assert!(
+        post_compact_user_messages
+            .iter()
+            .any(|message| message == "USER_ONE"),
+        "expected the live continuation request to keep the active user message"
+    );
+    assert!(
+        post_compact_request.has_function_call("call-remote-mid-turn"),
+        "expected the live continuation request to keep the in-turn function call"
+    );
+    assert!(
+        post_compact_request
+            .function_call_output_text("call-remote-mid-turn")
+            .is_some(),
+        "expected the live continuation request to keep the in-turn function call output"
+    );
+    assert!(
+        !post_compact_body.contains("REMOTE_MID_TURN_SUMMARY"),
+        "did not expect the completed background summary to be applied to the live continuation request"
+    );
+    assert!(
+        !post_compact_body.contains("\"type\":\"compaction\""),
+        "did not expect the live continuation request to contain a compaction item"
     );
 
     Ok(())
@@ -2438,18 +2559,41 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
 
     let compact_request = compact_mock.single_request();
     let post_compact_turn_request = post_compact_turn_request_mock.single_request();
-    insta::assert_snapshot!(
-        "remote_mid_turn_compaction_summary_only_reinjects_context_shapes",
-        format_labeled_requests_snapshot(
-            "Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.",
-            &[
-                ("Remote Compaction Request", &compact_request),
-                (
-                    "Remote Post-Compaction History Layout",
-                    &post_compact_turn_request
-                ),
-            ]
-        )
+    let post_compact_body = post_compact_turn_request.body_json().to_string();
+    let post_compact_user_messages = post_compact_turn_request.message_input_texts("user");
+    assert!(
+        compact_request.has_function_call("call-remote-summary-only"),
+        "expected the compact request to include the in-turn function call"
+    );
+    assert!(
+        compact_request
+            .function_call_output_text("call-remote-summary-only")
+            .is_some(),
+        "expected the compact request to include the in-turn function call output"
+    );
+    assert!(
+        post_compact_user_messages
+            .iter()
+            .any(|message| message == "USER_ONE"),
+        "expected the live continuation request to keep the active user message"
+    );
+    assert!(
+        post_compact_turn_request.has_function_call("call-remote-summary-only"),
+        "expected the live continuation request to keep the in-turn function call"
+    );
+    assert!(
+        post_compact_turn_request
+            .function_call_output_text("call-remote-summary-only")
+            .is_some(),
+        "expected the live continuation request to keep the in-turn function call output"
+    );
+    assert!(
+        !post_compact_body.contains("REMOTE_SUMMARY_ONLY"),
+        "did not expect the completed background summary to be applied to the live continuation request"
+    );
+    assert!(
+        !post_compact_body.contains("\"type\":\"compaction\""),
+        "did not expect the live continuation request to contain a compaction item"
     );
 
     Ok(())
