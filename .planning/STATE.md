@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-08)
 ## Current Position
 
 Phase: 3 of 5 (Durable History And Surface Compatibility)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-03-09 — Completed Wave 1 by proving persisted spliced compaction replay/resume/fork/rollback parity in core without changing runtime replay semantics
+Last activity: 2026-03-09 — Completed Wave 2 by making app-server compaction history semantics explicit in protocol tests and docs without changing reducer behavior
 
 Progress: [████░░░░░░] 40%
 
@@ -29,7 +29,7 @@ Progress: [████░░░░░░] 40%
 |-------|-------|-------|----------|
 | 1 | 4/4 | 305 min | 76 min |
 | 2 | 3/3 | 235 min | 78 min |
-| 3 | 1/3 | 35 min | 35 min |
+| 3 | 2/3 | 63 min | 32 min |
 | 4 | TBD | 0 min | - |
 | 5 | TBD | 0 min | - |
 
@@ -50,11 +50,12 @@ Recent decisions affecting current work:
 - [Phase 1] Launch mid-turn auto-compaction as auxiliary turn-owned work and defer all live-history application to Phase 2.
 - [Phase 3] Make replay, resume, rollback, and read-flow parity a dedicated phase before UX hardening.
 - [Phase 3] Treat persisted spliced `replacement_history` as already durable in core and lock that contract behind rollout-backed tests before touching app-server surfaces.
+- [Phase 3] Keep app-server thread history marker-only for persisted compaction checkpoints and document that contract instead of synthesizing extra thread items from `replacement_history`.
 - [Phase 5] Land multi-compaction overlap together with the visible background indicator after correctness and recovery work.
 
 ### Pending Todos
 
-- Execute Plans 03-02 and 03-03 to extend the same durability guarantees across app-server read/resume/rollback surfaces and their regression harnesses.
+- Execute Plan 03-03 to add end-to-end regressions across app-server read/resume/rollback surfaces on top of the now-explicit compaction history contract.
 
 ### Blockers/Concerns
 
@@ -63,5 +64,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-09 14:50 CDT
-Stopped at: Phase 3 Wave 1 complete; next up is app-server compatibility work for the same persisted splice semantics
+Stopped at: Phase 3 Wave 2 complete; next up is the final regression wave for app-server read/rollback compatibility
 Resume file: None

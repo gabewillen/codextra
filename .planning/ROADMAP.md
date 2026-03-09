@@ -79,6 +79,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Background Trigger And Continued Turns | 4/4 | Complete | 2026-03-09 |
 | 2. Safe Transcript Splicing | 3/3 | Complete | 2026-03-09 |
-| 3. Durable History And Surface Compatibility | 1/3 | In progress | - |
+| 3. Durable History And Surface Compatibility | 2/3 | In progress | - |
 | 4. Failure Recovery And Blocking Guardrails | 0/TBD | Not started | - |
 | 5. Visible Rolling Background Compaction | 0/TBD | Not started | - |
