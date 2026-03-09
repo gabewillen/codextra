@@ -5,21 +5,21 @@
 See: .planning/PROJECT.md (updated 2026-03-08)
 
 **Core value:** When an agent is working, compaction never interrupts the agent unless it fails, and I can see compactions happening in an indicator below the input.
-**Current focus:** Phase 2 - Safe Transcript Splicing
+**Current focus:** Phase 3 - Durable History And Surface Compatibility
 
 ## Current Position
 
-Phase: 2 of 5 (Safe Transcript Splicing)
+Phase: 3 of 5 (Durable History And Surface Compatibility)
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-03-09 — Phase 1 complete; mid-turn auto-compaction now runs as auxiliary work and stays out of live history
+Last activity: 2026-03-09 — Phase 2 complete; completed background compactions now splice into live history when the captured prefix still matches
 
-Progress: [██░░░░░░░░] 20%
+Progress: [████░░░░░░] 40%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
+- Total plans completed: 7
 - Average duration: 76 min
 - Total execution time: 5.1 hours
 
@@ -28,7 +28,7 @@ Progress: [██░░░░░░░░] 20%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4/4 | 305 min | 76 min |
-| 2 | TBD | 0 min | - |
+| 2 | 3/3 | 235 min | 78 min |
 | 3 | TBD | 0 min | - |
 | 4 | TBD | 0 min | - |
 | 5 | TBD | 0 min | - |
@@ -53,14 +53,14 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 2 must splice stored background compaction results into the intended transcript slice without dropping or reordering newer messages.
+- Phase 3 must keep the new spliced transcript shape consistent across replay, resume, rollback, and other history consumers.
 
 ### Blockers/Concerns
 
-None yet.
+- Full `cargo test -p codex-core` had one transient `shell_snapshot` timeout on the first run; the isolated rerun passed.
 
 ## Session Continuity
 
-Last session: 2026-03-09 07:25 CDT
-Stopped at: Phase 1 complete; next up is planning Phase 2 transcript splice application
+Last session: 2026-03-09 14:50 CDT
+Stopped at: Phase 2 complete; next up is planning durable replay/read compatibility for the new splice semantics
 Resume file: None
