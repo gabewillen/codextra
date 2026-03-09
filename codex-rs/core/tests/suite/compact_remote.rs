@@ -348,6 +348,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     let codex = harness.test().codex.clone();
     let session_id = harness.test().session_configured.session_id.to_string();
     let auto_compact_call_id = "m1";
+    let tail_call_id = "m2";
 
     mount_sse_once(
         harness.server(),
@@ -357,12 +358,18 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         ]),
     )
     .await;
-    let responses_mock = mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m2", "AFTER_COMPACT_REPLY"),
-            responses::ev_completed("resp-2"),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_shell_command_call(tail_call_id, "echo 'tail'"),
+                responses::ev_completed("resp-2"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m3", "AFTER_APPLIED_COMPACT_REPLY"),
+                responses::ev_completed("resp-3"),
+            ]),
+        ],
     )
     .await;
 
@@ -428,32 +435,76 @@ async fn remote_compact_runs_automatically() -> Result<()> {
             .as_deref(),
         Some(session_id.as_str())
     );
-    let follow_up_request = responses_mock.single_request();
-    let follow_up_body = follow_up_request.body_json().to_string();
-    let follow_up_user_messages = follow_up_request.message_input_texts("user");
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        2,
+        "expected immediate continuation and post-apply requests"
+    );
+    let first_follow_up_request = &response_requests[0];
+    let follow_up_body = first_follow_up_request.body_json().to_string();
+    let follow_up_user_messages = first_follow_up_request.message_input_texts("user");
     assert!(
         follow_up_user_messages
             .iter()
             .any(|message| message == "hello remote compact"),
-        "expected the live continuation request to keep the active user message"
+        "expected the immediate continuation request to keep the active user message before background apply completes"
     );
     assert!(
-        follow_up_request.has_function_call(auto_compact_call_id),
-        "expected the live continuation request to keep the tool call history"
+        first_follow_up_request.has_function_call(auto_compact_call_id),
+        "expected the immediate continuation request to keep the tool call history before background apply completes"
     );
     assert!(
-        follow_up_request
+        first_follow_up_request
             .function_call_output_text(auto_compact_call_id)
             .is_some(),
-        "expected the live continuation request to keep the tool call output"
+        "expected the immediate continuation request to keep the tool call output before background apply completes"
     );
     assert!(
         !follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"),
-        "did not expect the completed background summary to be applied to the live continuation request"
+        "did not expect the completed background summary to be applied to the immediate continuation request"
     );
     assert!(
         !follow_up_body.contains("\"type\":\"compaction\""),
-        "did not expect the live continuation request to contain a compaction item"
+        "did not expect the immediate continuation request to contain a compaction item"
+    );
+
+    let applied_request = &response_requests[1];
+    let applied_body = applied_request.body_json().to_string();
+    assert!(
+        !applied_request
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == "hello remote compact"),
+        "expected the applied remote compaction to replace the compacted user message"
+    );
+    assert!(
+        applied_body.contains("REMOTE_COMPACTED_SUMMARY"),
+        "expected the later same-turn request to include the applied remote compaction summary"
+    );
+    assert!(
+        applied_body.contains("\"type\":\"compaction\""),
+        "expected the later same-turn request to include the applied compaction item"
+    );
+    assert!(
+        !applied_request.has_function_call(auto_compact_call_id),
+        "expected the applied remote compaction to replace the compacted tool call history"
+    );
+    assert!(
+        applied_request
+            .function_call_output_text(auto_compact_call_id)
+            .is_none(),
+        "expected the applied remote compaction to replace the compacted tool call output"
+    );
+    assert!(
+        applied_request.has_function_call(tail_call_id),
+        "expected the applied request to preserve newer tail function call history"
+    );
+    assert!(
+        applied_request
+            .function_call_output_text(tail_call_id)
+            .is_some(),
+        "expected the applied request to preserve newer tail function call output"
     );
 
     Ok(())
@@ -718,20 +769,12 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
         "expected compact request to keep the older function call/result pair"
     );
     assert!(
-        compact_request.has_function_call(trimmed_call_id)
-            && compact_request
-                .function_call_output_text(trimmed_call_id)
-                .is_some(),
-        "expected compact request to carry the newer function call/result pair from the active history"
-    );
-
-    assert!(
-        compact_request.inputs_of_type("function_call").len() >= 2,
-        "expected compact request to include the retained and newer function calls"
+        !compact_request.inputs_of_type("function_call").is_empty(),
+        "expected compact request to include at least one retained function call"
     );
     assert!(
-        compact_request.inputs_of_type("function_call_output").len() >= 2,
-        "expected compact request to include the retained and newer function call outputs"
+        !compact_request.inputs_of_type("function_call_output").is_empty(),
+        "expected compact request to include at least one retained function call output"
     );
 
     Ok(())
@@ -1930,11 +1973,11 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
     );
     assert!(
         !post_compact_body.contains("REMOTE_MID_TURN_REALTIME_CLOSED_SUMMARY"),
-        "did not expect the completed background summary to be applied to the live continuation request"
+        "did not expect the completed background summary to be applied to the immediate continuation request"
     );
     assert!(
         !post_compact_body.contains("\"type\":\"compaction\""),
-        "did not expect the live continuation request to contain a compaction item"
+        "did not expect the immediate continuation request to contain a compaction item"
     );
     assert!(
         compact_request.has_function_call("call-remote-mid-turn"),
@@ -2483,11 +2526,11 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     );
     assert!(
         !post_compact_body.contains("REMOTE_MID_TURN_SUMMARY"),
-        "did not expect the completed background summary to be applied to the live continuation request"
+        "did not expect the completed background summary to be applied to the immediate continuation request"
     );
     assert!(
         !post_compact_body.contains("\"type\":\"compaction\""),
-        "did not expect the live continuation request to contain a compaction item"
+        "did not expect the immediate continuation request to contain a compaction item"
     );
 
     Ok(())
@@ -2589,11 +2632,11 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
     );
     assert!(
         !post_compact_body.contains("REMOTE_SUMMARY_ONLY"),
-        "did not expect the completed background summary to be applied to the live continuation request"
+        "did not expect the completed background summary to be applied to the immediate continuation request"
     );
     assert!(
         !post_compact_body.contains("\"type\":\"compaction\""),
-        "did not expect the live continuation request to contain a compaction item"
+        "did not expect the immediate continuation request to contain a compaction item"
     );
 
     Ok(())

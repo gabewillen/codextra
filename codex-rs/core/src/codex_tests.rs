@@ -1346,6 +1346,177 @@ async fn thread_rollback_fails_when_num_turns_is_zero() {
 }
 
 #[tokio::test]
+async fn apply_completed_background_auto_compaction_splices_prefix_once() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let snapshot_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+    ];
+    let live_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+        assistant_message("newer tail"),
+    ];
+    let replacement_history = vec![user_message("replacement summary")];
+    sess.replace_history(live_history, None).await;
+
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        let snapshot_marker = "snapshot-1".to_string();
+        let handle = tokio::spawn(async {});
+        assert!(active_turn.set_background_auto_compaction(
+            crate::state::BackgroundAutoCompaction {
+                snapshot_marker: snapshot_marker.clone(),
+                snapshot_history: snapshot_history.clone(),
+                compaction_item: ContextCompactionItem::new(),
+                cancellation_token: CancellationToken::new(),
+                handle,
+            }
+        ));
+        let compacted_item = CompactedItem {
+            message: "replacement summary".to_string(),
+            replacement_history: None,
+        };
+        let completed_item = active_turn.finish_background_auto_compaction(
+            &snapshot_marker,
+            crate::state::BackgroundAutoCompactionOutcome::Succeeded(Box::new(
+                crate::state::BackgroundAutoCompactionResult::Local(
+                    crate::compact::LocalCompactResult {
+                        replacement_history: replacement_history.clone(),
+                        reference_context_item: None,
+                        compacted_item,
+                    },
+                ),
+            )),
+        );
+        assert!(completed_item.is_some());
+    }
+
+    assert!(
+        apply_completed_background_auto_compact_if_ready(&sess, &tc)
+            .await
+            .expect("apply completed background compaction"),
+    );
+    assert_eq!(
+        sess.clone_history().await.raw_items(),
+        vec![
+            user_message("replacement summary"),
+            assistant_message("newer tail")
+        ]
+    );
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        assert!(
+            active_turn
+                .take_completed_background_auto_compaction()
+                .is_none(),
+            "completed result should be cleared after apply"
+        );
+    }
+    assert!(
+        !apply_completed_background_auto_compact_if_ready(&sess, &tc)
+            .await
+            .expect("second apply should be a no-op"),
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let snapshot_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+    ];
+    let live_history = vec![
+        user_message("captured user"),
+        assistant_message("diverged reply"),
+    ];
+    sess.replace_history(live_history.clone(), None).await;
+
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        let snapshot_marker = "snapshot-2".to_string();
+        let handle = tokio::spawn(async {});
+        assert!(active_turn.set_background_auto_compaction(
+            crate::state::BackgroundAutoCompaction {
+                snapshot_marker: snapshot_marker.clone(),
+                snapshot_history,
+                compaction_item: ContextCompactionItem::new(),
+                cancellation_token: CancellationToken::new(),
+                handle,
+            }
+        ));
+        let compacted_item = CompactedItem {
+            message: "replacement summary".to_string(),
+            replacement_history: None,
+        };
+        let completed_item = active_turn.finish_background_auto_compaction(
+            &snapshot_marker,
+            crate::state::BackgroundAutoCompactionOutcome::Succeeded(Box::new(
+                crate::state::BackgroundAutoCompactionResult::Local(
+                    crate::compact::LocalCompactResult {
+                        replacement_history: vec![user_message("replacement summary")],
+                        reference_context_item: None,
+                        compacted_item,
+                    },
+                ),
+            )),
+        );
+        assert!(completed_item.is_some());
+    }
+
+    assert!(
+        !apply_completed_background_auto_compact_if_ready(&sess, &tc)
+            .await
+            .expect("mismatched prefix should be skipped"),
+    );
+    assert_eq!(sess.clone_history().await.raw_items(), live_history);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        assert!(
+            active_turn
+                .take_completed_background_auto_compaction()
+                .is_none(),
+            "mismatched completed result should be cleared after the skipped apply"
+        );
+    }
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn set_rate_limits_retains_previous_credits() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;

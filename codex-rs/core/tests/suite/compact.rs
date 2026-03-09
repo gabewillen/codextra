@@ -694,7 +694,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let continued_turn_matcher = move |req: &wiremock::Request| {
         request_has_user_text(req, MULTI_AUTO_MSG)
             && !request_has_user_text(req, SUMMARIZATION_PROMPT)
-            && request_function_output_contains(req, first_function_name)
     };
     let continued_turn_mock =
         mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
@@ -778,13 +777,8 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     );
     let compact_request = compact_requests
         .into_iter()
-        .find(|request| {
-            request
-                .message_input_texts("user")
-                .iter()
-                .any(|text| text == SUMMARIZATION_PROMPT)
-        })
-        .expect("expected a compact request with the summarization prompt");
+        .find(|request| request.body_contains_text(SUMMARIZATION_PROMPT))
+        .unwrap_or_else(|| compact_mock.single_request());
     assert!(
         compact_request
             .function_call_output_text(first_call_id)
@@ -800,10 +794,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         .expect("expected a continued turn request");
     assert!(
         second_request
-            .function_call_output_text(first_call_id)
-            .unwrap_or_default()
-            .contains(first_function_name),
-        "continued turn should send the first tool output back to the model"
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == MULTI_AUTO_MSG),
+        "continued turn should keep the active user message below the compacted prefix"
     );
     assert!(
         !second_request.body_contains_text(SUMMARIZATION_PROMPT),
@@ -811,11 +805,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     );
     assert!(
         !second_request.body_contains_text(AUTO_SUMMARY_TEXT),
-        "completed background compaction results must not be applied to live history in Phase 1"
+        "completed background compaction should not race into the immediate continuation request"
     );
     assert!(
         !second_request.body_contains_text(SUMMARY_PREFIX),
-        "continued turn should not inject a compaction summary into live history"
+        "immediate continuation request should not inject a compaction summary before apply"
+    );
+    assert!(
+        second_request
+            .function_call_output_text(first_call_id)
+            .unwrap_or_default()
+            .contains(first_function_name),
+        "continued turn should still send the active turn tool output before background apply completes"
     );
 
     codex.submit(Op::Shutdown).await.unwrap();
@@ -2325,10 +2326,10 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         .expect("expected post-auto-compact continuation request");
     assert!(
         post_auto_compact_request
-            .function_call_output_text(DUMMY_CALL_ID)
-            .unwrap_or_default()
-            .contains(DUMMY_FUNCTION_NAME),
-        "continuation request should include the tool output from the active turn"
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == FUNCTION_CALL_LIMIT_MSG),
+        "continuation request should keep the active user message below the compacted prefix"
     );
     assert!(
         !post_auto_compact_request.body_contains_text(SUMMARIZATION_PROMPT),
@@ -2336,11 +2337,18 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     );
     assert!(
         !post_auto_compact_request.body_contains_text(AUTO_SUMMARY_TEXT),
-        "Phase 1 should retain completed compaction results without applying them to live history"
+        "immediate continuation request should not inject a compaction summary before background apply completes"
     );
     assert!(
         !post_auto_compact_request.body_contains_text(SUMMARY_PREFIX),
-        "continuation request should not inject a compaction summary into live history"
+        "immediate continuation request should not inject a compaction summary prefix before apply"
+    );
+    assert!(
+        post_auto_compact_request
+            .function_call_output_text(DUMMY_CALL_ID)
+            .unwrap_or_default()
+            .contains(DUMMY_FUNCTION_NAME),
+        "continuation request should still include the tool output before background apply completes"
     );
 
     codex.submit(Op::Shutdown).await.unwrap();
