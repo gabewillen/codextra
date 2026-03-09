@@ -166,6 +166,22 @@ impl ActiveTurn {
         None
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_failed_completed_background_auto_compaction(
+        &mut self,
+    ) -> Option<CompletedBackgroundAutoCompaction> {
+        if matches!(
+            self.completed_background_auto_compaction,
+            Some(CompletedBackgroundAutoCompaction {
+                outcome: BackgroundAutoCompactionOutcome::Failed(_),
+                ..
+            })
+        ) {
+            return self.take_completed_background_auto_compaction();
+        }
+        None
+    }
+
     pub(crate) fn clear_completed_background_auto_compaction(&mut self) {
         let Some(CompletedBackgroundAutoCompaction {
             snapshot_marker,

@@ -1682,6 +1682,83 @@ async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
 }
 
 #[tokio::test]
+async fn failed_completed_background_auto_compaction_can_be_consumed_once() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let snapshot_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+    ];
+    let snapshot_marker = "snapshot-failed".to_string();
+
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        let handle = tokio::spawn(async {});
+        assert!(active_turn.set_background_auto_compaction(
+            crate::state::BackgroundAutoCompaction {
+                snapshot_marker: snapshot_marker.clone(),
+                snapshot_history,
+                compaction_item: ContextCompactionItem::new(),
+                cancellation_token: CancellationToken::new(),
+                handle,
+            }
+        ));
+        let completed_item = active_turn.finish_background_auto_compaction(
+            &snapshot_marker,
+            crate::state::BackgroundAutoCompactionOutcome::Failed("boom".to_string()),
+        );
+        assert!(completed_item.is_some());
+        assert!(
+            !active_turn.can_start_background_auto_compaction(),
+            "failed completed background compaction should block a new run until consumed"
+        );
+        assert!(
+            active_turn
+                .take_successful_completed_background_auto_compaction()
+                .is_none(),
+            "failed outcomes must not flow through the success-only consume path"
+        );
+
+        let failed = active_turn
+            .take_failed_completed_background_auto_compaction()
+            .expect("failed completed background compaction");
+        assert_eq!(failed.snapshot_marker, snapshot_marker);
+        match failed.outcome {
+            crate::state::BackgroundAutoCompactionOutcome::Failed(message) => {
+                assert_eq!(message, "boom");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+
+        assert!(
+            active_turn.can_start_background_auto_compaction(),
+            "consuming the failed terminal outcome should reopen background compaction"
+        );
+        assert!(
+            active_turn
+                .take_failed_completed_background_auto_compaction()
+                .is_none(),
+            "failed outcome should be consumable exactly once"
+        );
+    }
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn thread_rollback_replays_persisted_spliced_compaction_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&sess).await;
