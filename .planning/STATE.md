@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-08)
 
 **Core value:** When an agent is working, compaction never interrupts the agent unless it fails, and I can see compactions happening in an indicator below the input.
-**Current focus:** Phase 3 - Durable History And Surface Compatibility
+**Current focus:** Phase 4 - Failure Recovery And Blocking Guardrails
 
 ## Current Position
 
 Phase: 3 of 5 (Durable History And Surface Compatibility)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-03-09 — Completed Wave 2 by making app-server compaction history semantics explicit in protocol tests and docs without changing reducer behavior
+Plan: 3 of 3 in current phase
+Status: Complete
+Last activity: 2026-03-09 — Completed Wave 3 by locking durable compaction compatibility behind protocol and app-server read/resume/rollback regression coverage
 
-Progress: [████░░░░░░] 40%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
-- Average duration: 76 min
-- Total execution time: 5.1 hours
+- Total plans completed: 8
+- Average duration: 69 min
+- Total execution time: 5.4 hours
 
 **By Phase:**
 
@@ -29,13 +29,13 @@ Progress: [████░░░░░░] 40%
 |-------|-------|-------|----------|
 | 1 | 4/4 | 305 min | 76 min |
 | 2 | 3/3 | 235 min | 78 min |
-| 3 | 2/3 | 63 min | 32 min |
+| 3 | 3/3 | 83 min | 28 min |
 | 4 | TBD | 0 min | - |
 | 5 | TBD | 0 min | - |
 
 **Recent Trend:**
-- Last 5 plans: 65m, 65m, 95m, 80m
-- Trend: Slightly increasing with runtime/test orchestration work
+- Last 5 plans: 35m, 28m, 20m, 65m, 65m
+- Trend: Stable after Phase 3 shifted from runtime changes to compatibility lock-in
 
 ## Accumulated Context
 
@@ -55,14 +55,14 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Execute Plan 03-03 to add end-to-end regressions across app-server read/resume/rollback surfaces on top of the now-explicit compaction history contract.
+- Plan Phase 4 to define failure recovery, fallback interruption, and blocking guardrail work on top of the now-proven durable history surfaces.
 
 ### Blockers/Concerns
 
-- Full `cargo test -p codex-core` had one transient `shell_snapshot` timeout on the first run; the isolated rerun passed.
+- Full workspace `cargo test` has not been rerun; Phase 3 used the repo-required scoped crate suites plus scoped clippy/format passes.
 
 ## Session Continuity
 
-Last session: 2026-03-09 14:50 CDT
-Stopped at: Phase 3 Wave 2 complete; next up is the final regression wave for app-server read/rollback compatibility
+Last session: 2026-03-09 15:54 CDT
+Stopped at: Phase 3 complete; next up is Phase 4 planning
 Resume file: None

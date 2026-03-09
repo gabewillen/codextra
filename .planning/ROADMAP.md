@@ -12,7 +12,7 @@ This first roadmap takes Codex from interrupting automatic compaction to backgro
 
 - [x] **Phase 1: Background Trigger And Continued Turns** - Start automatic mid-turn compaction in the background while agent output continues.
 - [x] **Phase 2: Safe Transcript Splicing** - Apply completed background compactions only to the captured transcript slice and preserve newer messages.
-- [ ] **Phase 3: Durable History And Surface Compatibility** - Keep post-compaction history consistent across persistence, replay, and existing compaction surfaces.
+- [x] **Phase 3: Durable History And Surface Compatibility** - Keep post-compaction history consistent across persistence, replay, and existing compaction surfaces.
 - [ ] **Phase 4: Failure Recovery And Blocking Guardrails** - Recover failed background jobs through the existing blocking path without changing manual or pre-turn semantics.
 - [ ] **Phase 5: Visible Rolling Background Compaction** - Show lightweight background compaction status and support multiple concurrent auto-compactions.
 
@@ -79,6 +79,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Background Trigger And Continued Turns | 4/4 | Complete | 2026-03-09 |
 | 2. Safe Transcript Splicing | 3/3 | Complete | 2026-03-09 |
-| 3. Durable History And Surface Compatibility | 2/3 | In progress | - |
+| 3. Durable History And Surface Compatibility | 3/3 | Complete | 2026-03-09 |
 | 4. Failure Recovery And Blocking Guardrails | 0/TBD | Not started | - |
 | 5. Visible Rolling Background Compaction | 0/TBD | Not started | - |
