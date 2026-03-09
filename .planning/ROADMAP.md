@@ -15,7 +15,7 @@ This first roadmap takes Codex from interrupting automatic compaction to backgro
 - [x] **Phase 3: Durable History And Surface Compatibility** - Keep post-compaction history consistent across persistence, replay, and existing compaction surfaces.
 - [x] **Phase 4: Failure Recovery And Blocking Guardrails** - Recover failed background jobs through the existing blocking path without changing manual or pre-turn semantics.
 - [x] **Phase 5: Visible Rolling Background Compaction** - Show lightweight background compaction status and support multiple concurrent auto-compactions.
-- [ ] **Phase 6: Verification And Traceability Closure** - Backfill milestone verification artifacts, close remaining validation debt, and rerun the milestone audit cleanly.
+- [x] **Phase 6: Verification And Traceability Closure** - Backfill milestone verification artifacts, close remaining validation debt, and rerun the milestone audit cleanly.
 
 ## Phase Details
 
@@ -37,7 +37,7 @@ This first roadmap takes Codex from interrupting automatic compaction to backgro
 1. After background compaction finishes, only the targeted transcript section is replaced.
 2. Messages created after compaction started remain below the new compacted top message in the correct order.
 3. User does not see duplicated, reordered, or dropped messages after a compaction is applied.
-**Plans**: TBD during phase planning
+**Plans**: 3 plans
 
 ### Phase 3: Durable History And Surface Compatibility
 **Goal**: Async compaction results stay durable and compatible across live sessions, replay flows, and existing compaction surfaces.
@@ -95,4 +95,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. Durable History And Surface Compatibility | 3/3 | Complete | 2026-03-09 |
 | 4. Failure Recovery And Blocking Guardrails | 4/4 | Complete | 2026-03-09 |
 | 5. Visible Rolling Background Compaction | 4/4 | Complete   | 2026-03-09 |
-| 6. Verification And Traceability Closure | 0/0 | Pending | — |
+| 6. Verification And Traceability Closure | 3/3 | Complete | 2026-03-09 |
