@@ -81,6 +81,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
@@ -278,6 +279,9 @@ use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
+use crate::state::BackgroundAutoCompaction;
+use crate::state::BackgroundAutoCompactionOutcome;
+use crate::state::BackgroundAutoCompactionResult;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -5708,18 +5712,18 @@ pub(crate) async fn run_turn(
                 );
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
-                    if run_auto_compact(
+                if token_limit_reached
+                    && needs_follow_up
+                    && start_background_auto_compact(
                         &sess,
                         &turn_context,
+                        cancellation_token.child_token(),
                         InitialContextInjection::BeforeLastUserMessage,
                     )
                     .await
                     .is_err()
-                    {
-                        return None;
-                    }
-                    continue;
+                {
+                    return None;
                 }
 
                 if !needs_follow_up {
@@ -5959,6 +5963,167 @@ async fn run_auto_compact(
         .await?;
     }
     Ok(())
+}
+
+async fn start_background_auto_compact(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    cancellation_token: CancellationToken,
+    initial_context_injection: InitialContextInjection,
+) -> CodexResult<()> {
+    let history = sess.clone_history().await;
+    let compaction_item = ContextCompactionItem::new();
+    let snapshot_marker = compaction_item.id.clone();
+    let background_cancellation_token = cancellation_token.child_token();
+    let (start_tx, start_rx) = oneshot::channel();
+
+    let worker_sess = Arc::clone(sess);
+    let worker_turn_context = Arc::clone(turn_context);
+    let worker_snapshot_marker = snapshot_marker.clone();
+    let worker_compaction_item = compaction_item.clone();
+    let worker_cancellation_token = background_cancellation_token.clone();
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+
+        let outcome = run_background_auto_compact_worker(
+            Arc::clone(&worker_sess),
+            Arc::clone(&worker_turn_context),
+            history,
+            worker_cancellation_token.clone(),
+            initial_context_injection,
+        )
+        .await;
+
+        let should_emit_completed = outcome.is_ok();
+        let stored_outcome = match outcome {
+            Ok(result) => BackgroundAutoCompactionOutcome::Succeeded(Box::new(result)),
+            Err(err) => {
+                if worker_cancellation_token.is_cancelled() {
+                    return;
+                }
+                if should_use_remote_compact_task(&worker_turn_context.provider) {
+                    let event = EventMsg::Error(
+                        err.to_error_event(Some("Error running remote compact task".to_string())),
+                    );
+                    worker_sess.send_event(&worker_turn_context, event).await;
+                }
+                BackgroundAutoCompactionOutcome::Failed(err.to_string())
+            }
+        };
+
+        let completed_item = {
+            let mut active = worker_sess.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return;
+            };
+            if !active_turn.tasks.contains_key(&worker_turn_context.sub_id) {
+                return;
+            }
+            active_turn.finish_background_auto_compaction(&worker_snapshot_marker, stored_outcome)
+        };
+
+        if let Some(completed_item) = completed_item
+            && should_emit_completed
+        {
+            worker_sess
+                .emit_turn_item_completed(
+                    &worker_turn_context,
+                    TurnItem::ContextCompaction(completed_item),
+                )
+                .await;
+            if !should_use_remote_compact_task(&worker_turn_context.provider) {
+                let warning = EventMsg::Warning(WarningEvent {
+                    message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+                });
+                worker_sess.send_event(&worker_turn_context, warning).await;
+            }
+        }
+    });
+
+    {
+        let mut active = sess.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            handle.abort();
+            return Ok(());
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id)
+            || !active_turn.set_background_auto_compaction(BackgroundAutoCompaction {
+                snapshot_marker: snapshot_marker.clone(),
+                compaction_item: worker_compaction_item,
+                cancellation_token: background_cancellation_token,
+                handle,
+            })
+        {
+            return Ok(());
+        }
+    }
+
+    sess.emit_turn_item_started(turn_context, &TurnItem::ContextCompaction(compaction_item))
+        .await;
+
+    if start_tx.send(()).is_err() {
+        let background_auto_compaction = {
+            let mut active = sess.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return Ok(());
+            };
+            if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+                return Ok(());
+            }
+            let Some(background_auto_compaction) = active_turn.take_background_auto_compaction()
+            else {
+                return Ok(());
+            };
+            if background_auto_compaction.snapshot_marker != snapshot_marker {
+                active_turn.set_background_auto_compaction(background_auto_compaction);
+                return Ok(());
+            }
+            background_auto_compaction
+        };
+        background_auto_compaction.cancellation_token.cancel();
+        background_auto_compaction.handle.abort();
+    }
+
+    Ok(())
+}
+
+async fn run_background_auto_compact_worker(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    history: ContextManager,
+    cancellation_token: CancellationToken,
+    initial_context_injection: InitialContextInjection,
+) -> CodexResult<BackgroundAutoCompactionResult> {
+    if should_use_remote_compact_task(&turn_context.provider) {
+        tokio::select! {
+            result = crate::compact_remote::run_remote_compact_worker(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                history,
+                initial_context_injection,
+            ) => result.map(BackgroundAutoCompactionResult::Remote),
+            _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        }
+    } else {
+        let prompt = turn_context.compact_prompt().to_string();
+        let input = vec![UserInput::Text {
+            text: prompt,
+            text_elements: Vec::new(),
+        }];
+        let mut history = history;
+        tokio::select! {
+            result = crate::compact::compute_local_compact_result(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &mut history,
+                input,
+                initial_context_injection,
+            ) => result.map(BackgroundAutoCompactionResult::Local),
+            _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        }
+    }
 }
 
 fn collect_explicit_app_ids_from_skill_items(
