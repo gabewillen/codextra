@@ -732,7 +732,9 @@ async fn auto_remote_compact_carries_function_call_history_into_compact_request(
         "expected compact request to include at least one retained function call"
     );
     assert!(
-        !compact_request.inputs_of_type("function_call_output").is_empty(),
+        !compact_request
+            .inputs_of_type("function_call_output")
+            .is_empty(),
         "expected compact request to include at least one retained function call output"
     );
 

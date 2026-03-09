@@ -1481,6 +1481,128 @@ async fn apply_completed_background_auto_compaction_splices_prefix_once() {
 }
 
 #[tokio::test]
+async fn apply_completed_background_auto_compaction_persists_spliced_history_for_resume_and_fork() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let snapshot_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+    ];
+    let live_history = vec![
+        user_message("captured user"),
+        assistant_message("captured reply"),
+        assistant_message("newer tail"),
+    ];
+    let expected_spliced_history = vec![
+        user_message("replacement summary"),
+        assistant_message("newer tail"),
+    ];
+    let reference_context_item = tc.to_turn_context_item();
+    sess.replace_history(live_history, None).await;
+
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.as_mut().expect("active turn");
+        let snapshot_marker = "snapshot-persisted".to_string();
+        let handle = tokio::spawn(async {});
+        assert!(active_turn.set_background_auto_compaction(
+            crate::state::BackgroundAutoCompaction {
+                snapshot_marker: snapshot_marker.clone(),
+                snapshot_history: snapshot_history.clone(),
+                compaction_item: ContextCompactionItem::new(),
+                cancellation_token: CancellationToken::new(),
+                handle,
+            }
+        ));
+        let compacted_item = CompactedItem {
+            message: "replacement summary".to_string(),
+            replacement_history: None,
+        };
+        let completed_item = active_turn.finish_background_auto_compaction(
+            &snapshot_marker,
+            crate::state::BackgroundAutoCompactionOutcome::Succeeded(Box::new(
+                crate::state::BackgroundAutoCompactionResult::Local(
+                    crate::compact::LocalCompactResult {
+                        replacement_history: vec![user_message("replacement summary")],
+                        reference_context_item: Some(reference_context_item.clone()),
+                        compacted_item,
+                    },
+                ),
+            )),
+        );
+        assert!(completed_item.is_some());
+    }
+
+    assert!(
+        apply_completed_background_auto_compact_if_ready(&sess, &tc)
+            .await
+            .expect("apply completed background compaction"),
+    );
+    sess.flush_rollout().await;
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let persisted_compacted_item = resumed
+        .history
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted_item) => Some(compacted_item.clone()),
+            _ => None,
+        })
+        .expect("persisted compaction item");
+    assert_eq!(
+        persisted_compacted_item.replacement_history,
+        Some(expected_spliced_history.clone())
+    );
+
+    let (resumed_session, _resumed_tc) = make_session_and_context().await;
+    resumed_session
+        .record_initial_history(InitialHistory::Resumed(resumed.clone()))
+        .await;
+    assert_eq!(
+        resumed_session.clone_history().await.raw_items(),
+        expected_spliced_history
+    );
+
+    let (forked_session, _forked_tc) = make_session_and_context().await;
+    let resumed_history = resumed.history;
+    forked_session
+        .record_initial_history(InitialHistory::Forked(resumed_history))
+        .await;
+    let mut expected_forked_history = expected_spliced_history;
+    let reconstruction_turn = forked_session.new_default_turn().await;
+    expected_forked_history.extend(
+        forked_session
+            .build_initial_context(reconstruction_turn.as_ref())
+            .await,
+    );
+    assert_eq!(
+        forked_session.clone_history().await.raw_items(),
+        expected_forked_history
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     sess.spawn_task(
@@ -1557,6 +1679,146 @@ async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
     }
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn thread_rollback_replays_persisted_spliced_compaction_history() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+
+    let first_context_item = tc.to_turn_context_item();
+    let first_turn_id = first_context_item
+        .turn_id
+        .clone()
+        .expect("turn context should have turn_id");
+
+    let mut compacted_context_item = first_context_item.clone();
+    compacted_context_item.turn_id = Some("compacted-turn".to_string());
+    compacted_context_item.model = "compacted-model".to_string();
+    let compacted_turn_id = compacted_context_item
+        .turn_id
+        .clone()
+        .expect("compacted turn context should have turn_id");
+
+    let mut rolled_back_context_item = compacted_context_item.clone();
+    rolled_back_context_item.turn_id = Some("rolled-back-turn".to_string());
+    rolled_back_context_item.model = "rolled-back-model".to_string();
+    let rolled_back_turn_id = rolled_back_context_item
+        .turn_id
+        .clone()
+        .expect("rolled back turn context should have turn_id");
+
+    let expected_history = vec![
+        user_message("replacement summary"),
+        user_message("tail user"),
+        assistant_message("tail assistant"),
+    ];
+
+    sess.persist_rollout_items(&[
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: first_turn_id.clone(),
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "first user".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        })),
+        RolloutItem::TurnContext(first_context_item),
+        RolloutItem::ResponseItem(user_message("first user")),
+        RolloutItem::ResponseItem(assistant_message("first assistant")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: first_turn_id,
+            last_agent_message: None,
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: compacted_turn_id.clone(),
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "tail user".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        })),
+        RolloutItem::TurnContext(compacted_context_item.clone()),
+        RolloutItem::ResponseItem(user_message("tail user")),
+        RolloutItem::ResponseItem(assistant_message("tail assistant")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: compacted_turn_id,
+            last_agent_message: None,
+        })),
+        RolloutItem::Compacted(CompactedItem {
+            message: "replacement summary".to_string(),
+            replacement_history: Some(expected_history.clone()),
+        }),
+        RolloutItem::TurnContext(compacted_context_item.clone()),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: rolled_back_turn_id.clone(),
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "rolled back user".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        })),
+        RolloutItem::TurnContext(rolled_back_context_item),
+        RolloutItem::ResponseItem(user_message("rolled back user")),
+        RolloutItem::ResponseItem(assistant_message("rolled back assistant")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: rolled_back_turn_id,
+            last_agent_message: None,
+        })),
+    ])
+    .await;
+    sess.replace_history(
+        vec![assistant_message("stale history")],
+        Some(compacted_context_item.clone()),
+    )
+    .await;
+    sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+        model: "stale-model".to_string(),
+        realtime_active: None,
+    }))
+    .await;
+
+    handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
+    let rollback_event = wait_for_thread_rolled_back(&rx).await;
+    assert_eq!(rollback_event.num_turns, 1);
+
+    assert_eq!(sess.clone_history().await.raw_items(), expected_history);
+    assert_eq!(
+        sess.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: "compacted-model".to_string(),
+            realtime_active: Some(tc.realtime_active),
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(sess.reference_context_item().await)
+            .expect("serialize replayed reference context item"),
+        serde_json::to_value(Some(compacted_context_item))
+            .expect("serialize expected replayed reference context item")
+    );
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(resumed.history.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback))
+            if rollback.num_turns == 1
+        )
+    }));
 }
 
 #[tokio::test]
