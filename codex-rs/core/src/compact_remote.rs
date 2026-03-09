@@ -18,9 +18,17 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TurnContextItem;
 use futures::TryFutureExt;
 use tracing::error;
 use tracing::info;
+
+#[derive(Debug)]
+pub(crate) struct RemoteCompactionResult {
+    replacement_history: Vec<ResponseItem>,
+    reference_context_item: Option<TurnContextItem>,
+    compacted_item: CompactedItem,
+}
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -70,11 +78,31 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let mut history = sess.clone_history().await;
+    let history = sess.clone_history().await;
+    let compaction_result = run_remote_compact_worker(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        history,
+        initial_context_injection,
+    )
+    .await?;
+    apply_remote_compact_result(sess.as_ref(), turn_context.as_ref(), compaction_result).await;
+
+    sess.emit_turn_item_completed(turn_context, compaction_item)
+        .await;
+    Ok(())
+}
+
+pub(crate) async fn run_remote_compact_worker(
+    sess: &Session,
+    turn_context: &TurnContext,
+    mut history: ContextManager,
+    initial_context_injection: InitialContextInjection,
+) -> CodexResult<RemoteCompactionResult> {
     let base_instructions = sess.get_base_instructions().await;
     let deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
-        turn_context.as_ref(),
+        turn_context,
         &base_instructions,
     );
     if deleted_items > 0 {
@@ -101,7 +129,7 @@ async fn run_remote_compact_task_inner_impl(
         output_schema: None,
     };
 
-    let mut new_history = sess
+    let mut replacement_history = sess
         .services
         .model_client
         .compact_conversation_history(
@@ -122,32 +150,47 @@ async fn run_remote_compact_task_inner_impl(
             Err(err)
         })
         .await?;
-    new_history = process_compacted_history(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        new_history,
+    replacement_history = process_compacted_history(
+        sess,
+        turn_context,
+        replacement_history,
         initial_context_injection,
     )
     .await;
 
     if !ghost_snapshots.is_empty() {
-        new_history.extend(ghost_snapshots);
+        replacement_history.extend(ghost_snapshots);
     }
+
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
     };
     let compacted_item = CompactedItem {
         message: String::new(),
-        replacement_history: Some(new_history.clone()),
+        replacement_history: Some(replacement_history.clone()),
     };
-    sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
+
+    Ok(RemoteCompactionResult {
+        replacement_history,
+        reference_context_item,
+        compacted_item,
+    })
+}
+
+pub(crate) async fn apply_remote_compact_result(
+    sess: &Session,
+    turn_context: &TurnContext,
+    compaction_result: RemoteCompactionResult,
+) {
+    let RemoteCompactionResult {
+        replacement_history,
+        reference_context_item,
+        compacted_item,
+    } = compaction_result;
+    sess.replace_compacted_history(replacement_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(turn_context).await;
-
-    sess.emit_turn_item_completed(turn_context, compaction_item)
-        .await;
-    Ok(())
 }
 
 pub(crate) async fn process_compacted_history(
@@ -167,7 +210,6 @@ pub(crate) async fn process_compacted_history(
     } else {
         Vec::new()
     };
-
     compacted_history.retain(should_keep_compacted_history_item);
     insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context)
 }
