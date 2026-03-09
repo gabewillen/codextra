@@ -171,6 +171,18 @@ impl ContextManager {
         self.items = items;
     }
 
+    pub(crate) fn splice_compacted_prefix(
+        live_history: &[ResponseItem],
+        captured_snapshot: &[ResponseItem],
+        replacement_history: &[ResponseItem],
+    ) -> Option<Vec<ResponseItem>> {
+        let tail = live_history.strip_prefix(captured_snapshot)?;
+        let mut spliced_history = Vec::with_capacity(replacement_history.len() + tail.len());
+        spliced_history.extend_from_slice(replacement_history);
+        spliced_history.extend_from_slice(tail);
+        Some(spliced_history)
+    }
+
     /// Replace image content in the last turn if it originated from a tool output.
     /// Returns true when a tool image was replaced, false otherwise.
     pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {

@@ -35,9 +35,9 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
 #[derive(Debug)]
 pub(crate) struct LocalCompactResult {
-    replacement_history: Vec<ResponseItem>,
-    reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
-    compacted_item: CompactedItem,
+    pub(crate) replacement_history: Vec<ResponseItem>,
+    pub(crate) reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
+    pub(crate) compacted_item: CompactedItem,
 }
 
 /// Controls whether compaction replacement history must include initial context.

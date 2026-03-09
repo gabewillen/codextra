@@ -25,9 +25,9 @@ use tracing::info;
 
 #[derive(Debug)]
 pub(crate) struct RemoteCompactionResult {
-    replacement_history: Vec<ResponseItem>,
-    reference_context_item: Option<TurnContextItem>,
-    compacted_item: CompactedItem,
+    pub(crate) replacement_history: Vec<ResponseItem>,
+    pub(crate) reference_context_item: Option<TurnContextItem>,
+    pub(crate) compacted_item: CompactedItem,
 }
 
 pub(crate) async fn run_inline_remote_auto_compact_task(

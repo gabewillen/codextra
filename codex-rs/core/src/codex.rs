@@ -5360,6 +5360,13 @@ pub(crate) async fn run_turn(
             }
         }
 
+        if apply_completed_background_auto_compact_if_ready(&sess, &turn_context)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
             sess.clone_history()
@@ -5395,6 +5402,12 @@ pub(crate) async fn run_turn(
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                if apply_completed_background_auto_compact_if_ready(&sess, &turn_context)
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -5614,6 +5627,63 @@ async fn run_auto_compact(
     Ok(())
 }
 
+async fn apply_completed_background_auto_compact_if_ready(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> CodexResult<bool> {
+    let completed_background_auto_compaction = {
+        let mut active = sess.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Ok(false);
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return Ok(false);
+        }
+        active_turn.take_successful_completed_background_auto_compaction()
+    };
+    let Some(completed_background_auto_compaction) = completed_background_auto_compaction else {
+        return Ok(false);
+    };
+
+    let replacement_outcome = match completed_background_auto_compaction.outcome {
+        BackgroundAutoCompactionOutcome::Succeeded(result) => result,
+        BackgroundAutoCompactionOutcome::Failed(_) => return Ok(false),
+    };
+    let (replacement_history, reference_context_item, mut compacted_item) =
+        match *replacement_outcome {
+            BackgroundAutoCompactionResult::Local(result) => (
+                result.replacement_history,
+                result.reference_context_item,
+                result.compacted_item,
+            ),
+            BackgroundAutoCompactionResult::Remote(result) => (
+                result.replacement_history,
+                result.reference_context_item,
+                result.compacted_item,
+            ),
+        };
+
+    let live_history = sess.clone_history().await;
+    let Some(spliced_history) = ContextManager::splice_compacted_prefix(
+        live_history.raw_items(),
+        &completed_background_auto_compaction.snapshot_history,
+        &replacement_history,
+    ) else {
+        warn!(
+            turn_id = %turn_context.sub_id,
+            snapshot_marker = %completed_background_auto_compaction.snapshot_marker,
+            "skipping completed background auto compaction because live history diverged from the captured snapshot"
+        );
+        return Ok(false);
+    };
+
+    compacted_item.replacement_history = Some(spliced_history.clone());
+    sess.replace_compacted_history(spliced_history, reference_context_item, compacted_item)
+        .await;
+    sess.recompute_token_usage(turn_context.as_ref()).await;
+    Ok(true)
+}
+
 async fn start_background_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -5621,6 +5691,7 @@ async fn start_background_auto_compact(
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     let history = sess.clone_history().await;
+    let snapshot_history = history.raw_items().to_vec();
     let compaction_item = ContextCompactionItem::new();
     let snapshot_marker = compaction_item.id.clone();
     let background_cancellation_token = cancellation_token.child_token();
@@ -5700,6 +5771,7 @@ async fn start_background_auto_compact(
         if !active_turn.tasks.contains_key(&turn_context.sub_id)
             || !active_turn.set_background_auto_compaction(BackgroundAutoCompaction {
                 snapshot_marker: snapshot_marker.clone(),
+                snapshot_history,
                 compaction_item: worker_compaction_item,
                 cancellation_token: background_cancellation_token,
                 handle,
