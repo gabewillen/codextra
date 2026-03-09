@@ -9,6 +9,7 @@ use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
+use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -31,6 +32,13 @@ use tracing::error;
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+#[derive(Debug)]
+pub(crate) struct LocalCompactResult {
+    replacement_history: Vec<ResponseItem>,
+    reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
+    compacted_item: CompactedItem,
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -96,13 +104,34 @@ async fn run_compact_task_inner(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
-    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
-
     let mut history = sess.clone_history().await;
-    history.record_items(
-        &[initial_input_for_turn.into()],
-        turn_context.truncation_policy,
-    );
+    let result = compute_local_compact_result(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &mut history,
+        input,
+        initial_context_injection,
+    )
+    .await?;
+    apply_local_compact_result(sess.as_ref(), turn_context.as_ref(), result).await;
+
+    sess.emit_turn_item_completed(&turn_context, compaction_item)
+        .await;
+    let warning = EventMsg::Warning(WarningEvent {
+        message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+    });
+    sess.send_event(&turn_context, warning).await;
+    Ok(())
+}
+
+pub(crate) async fn compute_local_compact_result(
+    sess: &Session,
+    turn_context: &TurnContext,
+    history: &mut ContextManager,
+    input: Vec<UserInput>,
+    initial_context_injection: InitialContextInjection,
+) -> CodexResult<LocalCompactResult> {
+    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut truncated_count = 0usize;
 
@@ -114,10 +143,15 @@ async fn run_compact_task_inner(
     // survives retries within this compact turn.
 
     loop {
-        // Clone is required because of the loop
-        let turn_input = history
-            .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
+        // Build the prompt from the frozen history plus the synthesized summarize instruction,
+        // but keep the returned compaction result based on the underlying history snapshot
+        // without that synthetic prompt item.
+        let mut prompt_history = history.clone();
+        prompt_history.record_items(
+            &[initial_input_for_turn.clone().into()],
+            turn_context.truncation_policy,
+        );
+        let turn_input = prompt_history.for_prompt(&turn_context.model_info.input_modalities);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -127,8 +161,9 @@ async fn run_compact_task_inner(
         };
         let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
         let attempt_result = drain_to_completed(
-            &sess,
-            turn_context.as_ref(),
+            sess,
+            turn_context,
+            history,
             &mut client_session,
             turn_metadata_header.as_deref(),
             &prompt,
@@ -139,7 +174,7 @@ async fn run_compact_task_inner(
             Ok(()) => {
                 if truncated_count > 0 {
                     sess.notify_background_event(
-                        turn_context.as_ref(),
+                        turn_context,
                         format!(
                             "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
                         ),
@@ -162,9 +197,9 @@ async fn run_compact_task_inner(
                     retries = 0;
                     continue;
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
+                sess.set_total_tokens_full(turn_context).await;
                 let event = EventMsg::Error(e.to_error_event(None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) => {
@@ -172,63 +207,88 @@ async fn run_compact_task_inner(
                     retries += 1;
                     let delay = backoff(retries);
                     sess.notify_stream_error(
-                        turn_context.as_ref(),
+                        turn_context,
                         format!("Reconnecting... {retries}/{max_retries}"),
                         e,
                     )
                     .await;
                     tokio::time::sleep(delay).await;
                     continue;
-                } else {
-                    let event = EventMsg::Error(e.to_error_event(None));
-                    sess.send_event(&turn_context, event).await;
-                    return Err(e);
                 }
+                let event = EventMsg::Error(e.to_error_event(None));
+                sess.send_event(turn_context, event).await;
+                return Err(e);
             }
         }
     }
 
-    let history_snapshot = sess.clone_history().await;
-    let history_items = history_snapshot.raw_items();
+    Ok(build_local_compact_result(
+        sess,
+        turn_context,
+        history.raw_items(),
+        initial_context_injection,
+    )
+    .await)
+}
+
+pub(crate) async fn apply_local_compact_result(
+    sess: &Session,
+    turn_context: &TurnContext,
+    result: LocalCompactResult,
+) {
+    let LocalCompactResult {
+        replacement_history,
+        reference_context_item,
+        compacted_item,
+    } = result;
+    sess.replace_compacted_history(replacement_history, reference_context_item, compacted_item)
+        .await;
+    sess.recompute_token_usage(turn_context).await;
+}
+
+async fn build_local_compact_result(
+    sess: &Session,
+    turn_context: &TurnContext,
+    history_items: &[ResponseItem],
+    initial_context_injection: InitialContextInjection,
+) -> LocalCompactResult {
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
 
-    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    let mut replacement_history =
+        build_compacted_history(Vec::new(), &user_messages, &summary_text);
 
     if matches!(
         initial_context_injection,
         InitialContextInjection::BeforeLastUserMessage
     ) {
-        let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
-        new_history =
-            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
+        let initial_context = sess.build_initial_context(turn_context).await;
+        replacement_history = insert_initial_context_before_last_real_user_or_summary(
+            replacement_history,
+            initial_context,
+        );
     }
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
         .cloned()
         .collect();
-    new_history.extend(ghost_snapshots);
-    let reference_context_item = match initial_context_injection {
-        InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
-    };
-    let compacted_item = CompactedItem {
-        message: summary_text.clone(),
-        replacement_history: Some(new_history.clone()),
-    };
-    sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
-        .await;
-    sess.recompute_token_usage(&turn_context).await;
+    replacement_history.extend(ghost_snapshots);
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
-        .await;
-    let warning = EventMsg::Warning(WarningEvent {
-        message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
-    });
-    sess.send_event(&turn_context, warning).await;
-    Ok(())
+    LocalCompactResult {
+        reference_context_item: match initial_context_injection {
+            InitialContextInjection::DoNotInject => None,
+            InitialContextInjection::BeforeLastUserMessage => {
+                Some(turn_context.to_turn_context_item())
+            }
+        },
+        compacted_item: CompactedItem {
+            message: summary_text.clone(),
+            replacement_history: Some(replacement_history.clone()),
+        },
+        replacement_history,
+    }
 }
 
 pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
@@ -392,6 +452,7 @@ fn build_compacted_history_with_limit(
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
+    history: &mut ContextManager,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
@@ -417,8 +478,7 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_into_history(std::slice::from_ref(&item), turn_context)
-                    .await;
+                history.record_items([&item], turn_context.truncation_policy);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
