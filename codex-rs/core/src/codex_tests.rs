@@ -1426,6 +1426,7 @@ async fn apply_completed_background_auto_compaction_splices_prefix_once() {
                 snapshot_marker: snapshot_marker.clone(),
                 snapshot_history: snapshot_history.clone(),
                 compaction_item: ContextCompactionItem::new(),
+                completion: Arc::new(tokio::sync::Notify::new()),
                 cancellation_token: CancellationToken::new(),
                 handle,
             }
@@ -1523,6 +1524,7 @@ async fn apply_completed_background_auto_compaction_persists_spliced_history_for
                 snapshot_marker: snapshot_marker.clone(),
                 snapshot_history: snapshot_history.clone(),
                 compaction_item: ContextCompactionItem::new(),
+                completion: Arc::new(tokio::sync::Notify::new()),
                 cancellation_token: CancellationToken::new(),
                 handle,
             }
@@ -1638,6 +1640,7 @@ async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
                 snapshot_marker: snapshot_marker.clone(),
                 snapshot_history,
                 compaction_item: ContextCompactionItem::new(),
+                completion: Arc::new(tokio::sync::Notify::new()),
                 cancellation_token: CancellationToken::new(),
                 handle,
             }
@@ -1712,6 +1715,7 @@ async fn failed_completed_background_auto_compaction_can_be_consumed_once() {
                 snapshot_marker: snapshot_marker.clone(),
                 snapshot_history,
                 compaction_item: ContextCompactionItem::new(),
+                completion: Arc::new(tokio::sync::Notify::new()),
                 cancellation_token: CancellationToken::new(),
                 handle,
             }

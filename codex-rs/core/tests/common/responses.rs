@@ -1436,6 +1436,17 @@ pub async fn mount_response_sequence(
     server: &MockServer,
     responses: Vec<ResponseTemplate>,
 ) -> ResponseMock {
+    mount_response_sequence_match(server, wiremock::matchers::any(), responses).await
+}
+
+pub async fn mount_response_sequence_match<M>(
+    server: &MockServer,
+    matcher: M,
+    responses: Vec<ResponseTemplate>,
+) -> ResponseMock
+where
+    M: wiremock::Match + Send + Sync + 'static,
+{
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1461,7 +1472,8 @@ pub async fn mount_response_sequence(
     };
 
     let (mock, response_mock) = base_mock();
-    mock.respond_with(responder)
+    mock.and(matcher)
+        .respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)

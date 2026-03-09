@@ -5366,6 +5366,9 @@ pub(crate) async fn run_turn(
         {
             return None;
         }
+        if recover_failed_background_auto_compact_if_ready(&sess, &turn_context).await {
+            break;
+        }
 
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
@@ -5408,6 +5411,9 @@ pub(crate) async fn run_turn(
                 {
                     return None;
                 }
+                if recover_failed_background_auto_compact_if_ready(&sess, &turn_context).await {
+                    break;
+                }
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -5440,6 +5446,11 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    if recover_failed_background_auto_compact_before_turn_end(&sess, &turn_context)
+                        .await
+                    {
+                        break;
+                    }
                     last_agent_message = sampling_request_last_agent_message;
                     let hook_outcomes = sess
                         .hooks()
@@ -5684,6 +5695,93 @@ async fn apply_completed_background_auto_compact_if_ready(
     Ok(true)
 }
 
+async fn recover_failed_background_auto_compact_if_ready(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> bool {
+    let completed_background_auto_compaction = {
+        let mut active = sess.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return false;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return false;
+        }
+        active_turn.take_failed_completed_background_auto_compaction()
+    };
+    let Some(completed_background_auto_compaction) = completed_background_auto_compaction else {
+        return false;
+    };
+
+    let BackgroundAutoCompactionOutcome::Failed(message) =
+        completed_background_auto_compaction.outcome
+    else {
+        return false;
+    };
+
+    warn!(
+        turn_id = %turn_context.sub_id,
+        snapshot_marker = %completed_background_auto_compaction.snapshot_marker,
+        error = %message,
+        "background auto compaction failed; running blocking fallback compaction"
+    );
+
+    if let Err(err) = run_auto_compact(
+        sess,
+        turn_context,
+        InitialContextInjection::BeforeLastUserMessage,
+    )
+    .await
+    {
+        info!("Fallback compact error: {err:#}");
+        let event = EventMsg::Error(err.to_error_event(None));
+        sess.send_event(turn_context, event).await;
+    }
+
+    true
+}
+
+async fn recover_failed_background_auto_compact_before_turn_end(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> bool {
+    if recover_failed_background_auto_compact_if_ready(sess, turn_context).await {
+        return true;
+    }
+
+    let background_completion = {
+        let active = sess.active_turn.lock().await;
+        let Some(active_turn) = active.as_ref() else {
+            return false;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return false;
+        }
+        active_turn.background_auto_compaction_completion()
+    };
+    let Some(background_completion) = background_completion else {
+        return false;
+    };
+
+    let wait_timeout_ms = if should_use_remote_compact_task(&turn_context.provider) {
+        100
+    } else {
+        1_000
+    };
+
+    if tokio::time::timeout(
+        tokio::time::Duration::from_millis(wait_timeout_ms),
+        background_completion.notified(),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+
+    recover_failed_background_auto_compact_if_ready(sess, turn_context).await
+}
+
 async fn start_background_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -5695,6 +5793,7 @@ async fn start_background_auto_compact(
     let compaction_item = ContextCompactionItem::new();
     let snapshot_marker = compaction_item.id.clone();
     let background_cancellation_token = cancellation_token.child_token();
+    let background_completion = Arc::new(tokio::sync::Notify::new());
     let (start_tx, start_rx) = oneshot::channel();
 
     let worker_sess = Arc::clone(sess);
@@ -5702,7 +5801,17 @@ async fn start_background_auto_compact(
     let worker_snapshot_marker = snapshot_marker.clone();
     let worker_compaction_item = compaction_item.clone();
     let worker_cancellation_token = background_cancellation_token.clone();
+    let worker_background_completion = Arc::clone(&background_completion);
     let handle = tokio::spawn(async move {
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_waiters();
+            }
+        }
+
+        let _notify_on_drop = NotifyOnDrop(worker_background_completion);
         if start_rx.await.is_err() {
             return;
         }
@@ -5722,12 +5831,6 @@ async fn start_background_auto_compact(
             Err(err) => {
                 if worker_cancellation_token.is_cancelled() {
                     return;
-                }
-                if should_use_remote_compact_task(&worker_turn_context.provider) {
-                    let event = EventMsg::Error(
-                        err.to_error_event(Some("Error running remote compact task".to_string())),
-                    );
-                    worker_sess.send_event(&worker_turn_context, event).await;
                 }
                 BackgroundAutoCompactionOutcome::Failed(err.to_string())
             }
@@ -5773,6 +5876,7 @@ async fn start_background_auto_compact(
                 snapshot_marker: snapshot_marker.clone(),
                 snapshot_history,
                 compaction_item: worker_compaction_item,
+                completion: background_completion,
                 cancellation_token: background_cancellation_token,
                 handle,
             })
