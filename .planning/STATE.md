@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-03-08)
 
 **Core value:** When an agent is working, compaction never interrupts the agent unless it fails, and I can see compactions happening in an indicator below the input.
-**Current focus:** Phase 4 - Failure Recovery And Blocking Guardrails
+**Current focus:** Phase 5 - Visible Rolling Background Compaction
 
 ## Current Position
 
-Phase: 4 of 5 (Failure Recovery And Blocking Guardrails)
-Plan: 3 of 4 in current phase
-Status: In progress
-Last activity: 2026-03-09 — Completed Wave 2 by locking manual and pre-turn blocking guardrails while preserving non-blocking successful background compaction
+Phase: 5 of 5 (Visible Rolling Background Compaction)
+Plan: 0 of TBD in current phase
+Status: Ready to plan
+Last activity: 2026-03-09 — Completed Phase 4 with final terminal-outcome regression coverage and passing core/app-server compaction suites
 
-Progress: [████████░░] 78%
+Progress: [██████████] 82%
 
 ## Performance Metrics
 
@@ -30,7 +30,7 @@ Progress: [████████░░] 78%
 | 1 | 4/4 | 305 min | 76 min |
 | 2 | 3/3 | 235 min | 78 min |
 | 3 | 3/3 | 83 min | 28 min |
-| 4 | 3/4 | 69 min | 23 min |
+| 4 | 4/4 | 77 min | 19 min |
 | 5 | TBD | 0 min | - |
 
 **Recent Trend:**
@@ -55,14 +55,14 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Execute Wave 3 Plan 04 of Phase 4 to add final terminal-outcome and cross-surface regression proof.
+- Plan Phase 5 to add the visible background indicator and overlapping rolling compaction behavior.
 
 ### Blockers/Concerns
 
-- Full workspace `cargo test` has not been rerun; Phase 3 used the repo-required scoped crate suites plus scoped clippy/format passes.
+- Full workspace `cargo test` has not been rerun; the project continues to use the repo-required scoped crate suites plus scoped clippy/format passes.
 
 ## Session Continuity
 
-Last session: 2026-03-09 10:27 CDT
-Stopped at: Phase 4 Wave 2 Plan 03 complete; next up is Wave 3 Plan 04 final regression lock-in
+Last session: 2026-03-09 10:35 CDT
+Stopped at: Phase 4 complete; next up is Phase 5 planning
 Resume file: None
