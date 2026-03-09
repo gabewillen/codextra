@@ -2426,6 +2426,86 @@ mod tests {
     }
 
     #[test]
+    fn thread_rollback_preserves_prior_compaction_turn() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-before".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "Before".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "A1".into(),
+                phase: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-before".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-compact".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            RolloutItem::Compacted(CompactedItem {
+                message: "summary".into(),
+                replacement_history: Some(vec![ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "summary".into(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                }]),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-compact".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-after".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "After".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "A2".into(),
+                phase: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-after".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].id, "turn-before");
+        assert_eq!(turns[1].id, "turn-compact");
+        assert_eq!(
+            turns[1].items,
+            vec![ThreadItem::ContextCompaction {
+                id: "item-3".into()
+            }]
+        );
+    }
+
+    #[test]
     fn reconstructs_collab_resume_end_item() {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
