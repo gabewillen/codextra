@@ -1,7 +1,7 @@
 ---
 phase: 04
 slug: failure-recovery-and-blocking-guardrails
-status: draft
+status: ready
 nyquist_compliant: true
 wave_0_complete: true
 created: 2026-03-09
@@ -69,4 +69,4 @@ All phase behaviors have automated verification.
 - [x] Feedback latency < 120s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** ready for planning

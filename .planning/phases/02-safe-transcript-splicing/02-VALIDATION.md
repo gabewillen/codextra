@@ -1,9 +1,9 @@
 ---
 phase: 2
 slug: safe-transcript-splicing
-status: draft
+status: ready
 nyquist_compliant: true
-wave_0_complete: false
+wave_0_complete: true
 created: 2026-03-09
 ---
 
@@ -67,4 +67,4 @@ All phase behaviors have automated verification.
 - [x] Feedback latency < 30s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** ready for planning
