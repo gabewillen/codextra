@@ -317,6 +317,8 @@ If this was the last subscriber, the server unloads the thread and emits `thread
 
 Use `thread/read` to fetch a stored thread by id without resuming it. Pass `includeTurns` when you want the rollout history loaded into `thread.turns`. The returned thread includes `agentNickname` and `agentRole` for AgentControl-spawned thread sub-agents when available.
 
+When a rollout contains compaction checkpoints, `thread.turns` reflects the persisted turn-item stream and compaction markers (`ContextCompaction` items / compaction-only turns). It does not synthesize extra thread items from compacted `replacementHistory` payloads.
+
 ```json
 { "method": "thread/read", "id": 22, "params": { "threadId": "thr_123" } }
 { "id": 22, "result": {
