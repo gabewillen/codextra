@@ -46,7 +46,7 @@ This first roadmap takes Codex from interrupting automatic compaction to backgro
 1. User sees the same post-compaction transcript in live sessions, resume, rollback, and read flows.
 2. Existing app-server and thread-item compaction consumers continue to work with background compaction enabled.
 3. Persisted async compaction results replay into the same transcript structure that live users saw when compaction completed.
-**Plans**: TBD during phase planning
+**Plans**: 3 plans
 
 ### Phase 4: Failure Recovery And Blocking Guardrails
 **Goal**: Failed background compactions recover through the existing blocking path while manual and pre-turn compaction semantics stay unchanged.
@@ -79,6 +79,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Background Trigger And Continued Turns | 4/4 | Complete | 2026-03-09 |
 | 2. Safe Transcript Splicing | 3/3 | Complete | 2026-03-09 |
-| 3. Durable History And Surface Compatibility | 0/TBD | Not started | - |
+| 3. Durable History And Surface Compatibility | 0/3 | Planned | - |
 | 4. Failure Recovery And Blocking Guardrails | 0/TBD | Not started | - |
 | 5. Visible Rolling Background Compaction | 0/TBD | Not started | - |

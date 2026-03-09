@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-08)
 ## Current Position
 
 Phase: 3 of 5 (Durable History And Surface Compatibility)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-03-09 — Phase 2 complete; completed background compactions now splice into live history when the captured prefix still matches
+Plan: 0 of 3 in current phase
+Status: Ready to execute
+Last activity: 2026-03-09 — Planned Phase 3 around durable replay parity and existing app-server/thread-item compaction compatibility
 
 Progress: [████░░░░░░] 40%
 
@@ -29,7 +29,7 @@ Progress: [████░░░░░░] 40%
 |-------|-------|-------|----------|
 | 1 | 4/4 | 305 min | 76 min |
 | 2 | 3/3 | 235 min | 78 min |
-| 3 | TBD | 0 min | - |
+| 3 | 0/3 | 0 min | - |
 | 4 | TBD | 0 min | - |
 | 5 | TBD | 0 min | - |
 
@@ -53,7 +53,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 3 must keep the new spliced transcript shape consistent across replay, resume, rollback, and other history consumers.
+- Execute Phase 3 to make persisted spliced compactions replay identically across core and app-server history surfaces.
 
 ### Blockers/Concerns
 
@@ -62,5 +62,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-09 14:50 CDT
-Stopped at: Phase 2 complete; next up is planning durable replay/read compatibility for the new splice semantics
+Stopped at: Phase 3 planned; next up is executing durable replay/read compatibility for the new splice semantics
 Resume file: None
