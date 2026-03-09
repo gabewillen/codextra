@@ -7,31 +7,31 @@
 
 ### Runtime
 
-- [ ] **RUN-01**: Codex can start automatic mid-turn compaction in the background without interrupting an active agent turn
-- [ ] **RUN-02**: User can continue seeing agent progress while background compaction is in progress
-- [ ] **RUN-03**: Codex can run multiple automatic background compactions concurrently on different transcript ranges
+- [x] **RUN-01**: Codex can start automatic mid-turn compaction in the background without interrupting an active agent turn
+- [x] **RUN-02**: User can continue seeing agent progress while background compaction is in progress
+- [x] **RUN-03**: Codex can run multiple automatic background compactions concurrently on different transcript ranges
 
 ### History Integrity
 
-- [ ] **HIST-01**: Codex replaces only the transcript section covered by a completed background compaction
-- [ ] **HIST-02**: User can see messages created after compaction started remain below the new compacted top message in the correct order
-- [ ] **HIST-03**: User sees the same post-compaction transcript across live sessions, resume, rollback, and read flows
+- [x] **HIST-01**: Codex replaces only the transcript section covered by a completed background compaction
+- [x] **HIST-02**: User can see messages created after compaction started remain below the new compacted top message in the correct order
+- [x] **HIST-03**: User sees the same post-compaction transcript across live sessions, resume, rollback, and read flows
 
 ### Recovery
 
-- [ ] **RECV-01**: If a background compaction fails, Codex stops the active agent and falls back to the existing blocking compaction flow
-- [ ] **RECV-02**: Each background compaction resolves through exactly one terminal outcome: applied, failed-then-fallback, or aborted
+- [x] **RECV-01**: If a background compaction fails, Codex stops the active agent and falls back to the existing blocking compaction flow
+- [x] **RECV-02**: Each background compaction resolves through exactly one terminal outcome: applied, failed-then-fallback, or aborted
 
 ### Visibility
 
-- [ ] **VIS-01**: User can see a lightweight indicator below the input while background compaction is active
-- [ ] **VIS-02**: User does not see transcript interruption chatter for successful background compactions
+- [x] **VIS-01**: User can see a lightweight indicator below the input while background compaction is active
+- [x] **VIS-02**: User does not see transcript interruption chatter for successful background compactions
 
 ### Compatibility
 
-- [ ] **COMP-01**: User-triggered manual compaction keeps its current blocking behavior
-- [ ] **COMP-02**: Pre-turn protective compaction keeps its current blocking behavior
-- [ ] **COMP-03**: Existing app-server and thread-item compaction flows remain compatible with the new background compaction behavior
+- [x] **COMP-01**: User-triggered manual compaction keeps its current blocking behavior
+- [x] **COMP-02**: Pre-turn protective compaction keeps its current blocking behavior
+- [x] **COMP-03**: Existing app-server and thread-item compaction flows remain compatible with the new background compaction behavior
 
 ## v2 Requirements
 
@@ -57,19 +57,19 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RUN-01 | Phase 6 - Verification And Traceability Closure | Pending |
-| RUN-02 | Phase 6 - Verification And Traceability Closure | Pending |
-| RUN-03 | Phase 6 - Verification And Traceability Closure | Pending |
-| HIST-01 | Phase 6 - Verification And Traceability Closure | Pending |
-| HIST-02 | Phase 6 - Verification And Traceability Closure | Pending |
-| HIST-03 | Phase 6 - Verification And Traceability Closure | Pending |
-| RECV-01 | Phase 6 - Verification And Traceability Closure | Pending |
-| RECV-02 | Phase 6 - Verification And Traceability Closure | Pending |
-| VIS-01 | Phase 6 - Verification And Traceability Closure | Pending |
-| VIS-02 | Phase 6 - Verification And Traceability Closure | Pending |
-| COMP-01 | Phase 6 - Verification And Traceability Closure | Pending |
-| COMP-02 | Phase 6 - Verification And Traceability Closure | Pending |
-| COMP-03 | Phase 6 - Verification And Traceability Closure | Pending |
+| RUN-01 | Phase 1 - Background Trigger And Continued Turns | Satisfied |
+| RUN-02 | Phase 1 - Background Trigger And Continued Turns | Satisfied |
+| RUN-03 | Phase 5 - Visible Rolling Background Compaction | Satisfied |
+| HIST-01 | Phase 2 - Safe Transcript Splicing | Satisfied |
+| HIST-02 | Phase 2 - Safe Transcript Splicing | Satisfied |
+| HIST-03 | Phase 3 - Durable History And Surface Compatibility | Satisfied |
+| RECV-01 | Phase 4 - Failure Recovery And Blocking Guardrails | Satisfied |
+| RECV-02 | Phase 4 - Failure Recovery And Blocking Guardrails | Satisfied |
+| VIS-01 | Phase 5 - Visible Rolling Background Compaction | Satisfied |
+| VIS-02 | Phase 5 - Visible Rolling Background Compaction | Satisfied |
+| COMP-01 | Phase 4 - Failure Recovery And Blocking Guardrails | Satisfied |
+| COMP-02 | Phase 4 - Failure Recovery And Blocking Guardrails | Satisfied |
+| COMP-03 | Phase 3 - Durable History And Surface Compatibility | Satisfied |
 
 **Coverage:**
 - v1 requirements: 13 total
@@ -78,4 +78,4 @@
 
 ---
 *Requirements defined: 2026-03-08*
-*Last updated: 2026-03-09 after milestone gap planning*
+*Last updated: 2026-03-09 after milestone verification closure*
