@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-08)
 ## Current Position
 
 Phase: 5 of 5 (Visible Rolling Background Compaction)
-Plan: 0 of 4 in current phase
-Status: Planned
-Last activity: 2026-03-09 — Planned Phase 5 with rolling overlap, footer indicator, and cross-surface regression work split into 4 plans
+Plan: 1 of 4 in current phase
+Status: In progress
+Last activity: 2026-03-09 — Completed Plan 05-01 with rolling job tracking, distinct-range launch gating, and ordered completed background jobs in core
 
 Progress: [██████████] 82%
 

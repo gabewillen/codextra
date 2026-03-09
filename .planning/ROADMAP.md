@@ -81,4 +81,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 2. Safe Transcript Splicing | 3/3 | Complete | 2026-03-09 |
 | 3. Durable History And Surface Compatibility | 3/3 | Complete | 2026-03-09 |
 | 4. Failure Recovery And Blocking Guardrails | 4/4 | Complete | 2026-03-09 |
-| 5. Visible Rolling Background Compaction | 0/4 | Not started | - |
+| 5. Visible Rolling Background Compaction | 1/4 | In Progress|  |

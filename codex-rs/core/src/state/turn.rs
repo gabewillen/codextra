@@ -1,6 +1,7 @@
 //! Turn-scoped state and active turn metadata scaffolding.
 
 use indexmap::IndexMap;
+use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -29,8 +30,9 @@ use crate::tasks::SessionTask;
 pub(crate) struct ActiveTurn {
     pub(crate) tasks: IndexMap<String, RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
-    background_auto_compaction: Option<BackgroundAutoCompaction>,
-    completed_background_auto_compaction: Option<CompletedBackgroundAutoCompaction>,
+    background_auto_compactions: Vec<BackgroundAutoCompaction>,
+    completed_background_auto_compactions: VecDeque<CompletedBackgroundAutoCompaction>,
+    next_background_auto_compaction_launch_ordinal: u64,
 }
 
 impl Default for ActiveTurn {
@@ -38,8 +40,9 @@ impl Default for ActiveTurn {
         Self {
             tasks: IndexMap::new(),
             turn_state: Arc::new(Mutex::new(TurnState::default())),
-            background_auto_compaction: None,
-            completed_background_auto_compaction: None,
+            background_auto_compactions: Vec::new(),
+            completed_background_auto_compactions: VecDeque::new(),
+            next_background_auto_compaction_launch_ordinal: 0,
         }
     }
 }
@@ -64,7 +67,9 @@ pub(crate) struct RunningTask {
 
 pub(crate) struct BackgroundAutoCompaction {
     pub(crate) snapshot_marker: String,
+    pub(crate) snapshot_history_len: usize,
     pub(crate) snapshot_history: Vec<ResponseItem>,
+    pub(crate) launch_ordinal: u64,
     pub(crate) compaction_item: ContextCompactionItem,
     pub(crate) failure_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
@@ -85,7 +90,9 @@ pub(crate) enum BackgroundAutoCompactionOutcome {
 
 pub(crate) struct CompletedBackgroundAutoCompaction {
     pub(crate) snapshot_marker: String,
+    pub(crate) snapshot_history_len: usize,
     pub(crate) snapshot_history: Vec<ResponseItem>,
+    pub(crate) launch_ordinal: u64,
     pub(crate) compaction_item: ContextCompactionItem,
     pub(crate) outcome: BackgroundAutoCompactionOutcome,
 }
@@ -105,19 +112,57 @@ impl ActiveTurn {
         self.tasks.drain(..).map(|(_, task)| task).collect()
     }
 
-    pub(crate) fn can_start_background_auto_compaction(&self) -> bool {
-        self.background_auto_compaction.is_none()
-            && self.completed_background_auto_compaction.is_none()
+    pub(crate) fn can_start_background_auto_compaction(&self, snapshot_history_len: usize) -> bool {
+        self.max_tracked_background_auto_compaction_snapshot_history_len()
+            .is_none_or(|max_snapshot_history_len| snapshot_history_len > max_snapshot_history_len)
+    }
+
+    pub(crate) fn next_background_auto_compaction_launch_ordinal(&mut self) -> u64 {
+        let launch_ordinal = self.next_background_auto_compaction_launch_ordinal;
+        self.next_background_auto_compaction_launch_ordinal += 1;
+        launch_ordinal
+    }
+
+    fn max_tracked_background_auto_compaction_snapshot_history_len(&self) -> Option<usize> {
+        self.background_auto_compactions
+            .iter()
+            .map(|background_auto_compaction| background_auto_compaction.snapshot_history_len)
+            .chain(
+                self.completed_background_auto_compactions
+                    .iter()
+                    .map(|completed_background_auto_compaction| {
+                        completed_background_auto_compaction.snapshot_history_len
+                    }),
+            )
+            .max()
+    }
+
+    fn insert_completed_background_auto_compaction(
+        &mut self,
+        completed_background_auto_compaction: CompletedBackgroundAutoCompaction,
+    ) {
+        let insertion_index = self
+            .completed_background_auto_compactions
+            .iter()
+            .position(|existing_background_auto_compaction| {
+                existing_background_auto_compaction.launch_ordinal
+                    > completed_background_auto_compaction.launch_ordinal
+            })
+            .unwrap_or(self.completed_background_auto_compactions.len());
+        self.completed_background_auto_compactions
+            .insert(insertion_index, completed_background_auto_compaction);
     }
 
     pub(crate) fn set_background_auto_compaction(
         &mut self,
         background_auto_compaction: BackgroundAutoCompaction,
     ) -> bool {
-        if !self.can_start_background_auto_compaction() {
+        if !self.can_start_background_auto_compaction(background_auto_compaction.snapshot_history_len)
+        {
             return false;
         }
-        self.background_auto_compaction = Some(background_auto_compaction);
+        self.background_auto_compactions
+            .push(background_auto_compaction);
         true
     }
 
@@ -126,95 +171,128 @@ impl ActiveTurn {
         snapshot_marker: &str,
         outcome: BackgroundAutoCompactionOutcome,
     ) -> Option<ContextCompactionItem> {
-        let background_auto_compaction = self.background_auto_compaction.take()?;
-        if background_auto_compaction.snapshot_marker != snapshot_marker {
-            self.background_auto_compaction = Some(background_auto_compaction);
-            return None;
-        }
+        let background_auto_compaction_index = self
+            .background_auto_compactions
+            .iter()
+            .position(|background_auto_compaction| {
+                background_auto_compaction.snapshot_marker == snapshot_marker
+            })?;
+        let background_auto_compaction = self
+            .background_auto_compactions
+            .swap_remove(background_auto_compaction_index);
 
         let compaction_item = background_auto_compaction.compaction_item;
-        self.completed_background_auto_compaction = Some(CompletedBackgroundAutoCompaction {
-            snapshot_marker: snapshot_marker.to_string(),
+        self.insert_completed_background_auto_compaction(CompletedBackgroundAutoCompaction {
+            snapshot_marker: background_auto_compaction.snapshot_marker,
+            snapshot_history_len: background_auto_compaction.snapshot_history_len,
             snapshot_history: background_auto_compaction.snapshot_history,
+            launch_ordinal: background_auto_compaction.launch_ordinal,
             compaction_item: compaction_item.clone(),
             outcome,
         });
         Some(compaction_item)
     }
 
-    pub(crate) fn take_background_auto_compaction(&mut self) -> Option<BackgroundAutoCompaction> {
-        self.background_auto_compaction.take()
+    pub(crate) fn take_background_auto_compaction(
+        &mut self,
+        snapshot_marker: &str,
+    ) -> Option<BackgroundAutoCompaction> {
+        let background_auto_compaction_index = self
+            .background_auto_compactions
+            .iter()
+            .position(|background_auto_compaction| {
+                background_auto_compaction.snapshot_marker == snapshot_marker
+            })?;
+        Some(
+            self.background_auto_compactions
+                .swap_remove(background_auto_compaction_index),
+        )
     }
 
-    pub(crate) fn background_auto_compaction_failure_notify(&self) -> Option<Arc<Notify>> {
-        self.background_auto_compaction
-            .as_ref()
+    pub(crate) fn take_all_background_auto_compactions(&mut self) -> Vec<BackgroundAutoCompaction> {
+        self.background_auto_compactions.drain(..).collect()
+    }
+
+    pub(crate) fn background_auto_compaction_failure_notifies(&self) -> Vec<Arc<Notify>> {
+        self.background_auto_compactions
+            .iter()
             .map(|background_auto_compaction| {
                 Arc::clone(&background_auto_compaction.failure_notify)
             })
+            .collect()
     }
 
     pub(crate) fn take_completed_background_auto_compaction(
         &mut self,
     ) -> Option<CompletedBackgroundAutoCompaction> {
-        self.completed_background_auto_compaction.take()
+        self.completed_background_auto_compactions.pop_front()
     }
 
     pub(crate) fn take_successful_completed_background_auto_compaction(
         &mut self,
     ) -> Option<CompletedBackgroundAutoCompaction> {
-        if matches!(
-            self.completed_background_auto_compaction,
-            Some(CompletedBackgroundAutoCompaction {
-                outcome: BackgroundAutoCompactionOutcome::Succeeded(_),
-                ..
-            })
-        ) {
-            return self.take_completed_background_auto_compaction();
-        }
-        None
+        let successful_completed_background_auto_compaction_index = self
+            .completed_background_auto_compactions
+            .iter()
+            .position(|completed_background_auto_compaction| {
+                matches!(
+                    completed_background_auto_compaction,
+                    CompletedBackgroundAutoCompaction {
+                        outcome: BackgroundAutoCompactionOutcome::Succeeded(_),
+                        ..
+                    }
+                )
+            })?;
+        self.completed_background_auto_compactions
+            .remove(successful_completed_background_auto_compaction_index)
     }
 
     pub(crate) fn take_failed_completed_background_auto_compaction(
         &mut self,
     ) -> Option<CompletedBackgroundAutoCompaction> {
-        if matches!(
-            self.completed_background_auto_compaction,
-            Some(CompletedBackgroundAutoCompaction {
-                outcome: BackgroundAutoCompactionOutcome::Failed(_),
-                ..
-            })
-        ) {
-            return self.take_completed_background_auto_compaction();
-        }
-        None
+        let failed_completed_background_auto_compaction_index = self
+            .completed_background_auto_compactions
+            .iter()
+            .position(|completed_background_auto_compaction| {
+                matches!(
+                    completed_background_auto_compaction,
+                    CompletedBackgroundAutoCompaction {
+                        outcome: BackgroundAutoCompactionOutcome::Failed(_),
+                        ..
+                    }
+                )
+            })?;
+        self.completed_background_auto_compactions
+            .remove(failed_completed_background_auto_compaction_index)
     }
 
-    pub(crate) fn clear_completed_background_auto_compaction(&mut self) {
-        let Some(CompletedBackgroundAutoCompaction {
+    pub(crate) fn clear_completed_background_auto_compactions(&mut self) {
+        while let Some(CompletedBackgroundAutoCompaction {
             snapshot_marker,
+            snapshot_history_len,
             snapshot_history,
+            launch_ordinal,
             compaction_item,
             outcome,
         }) = self.take_completed_background_auto_compaction()
-        else {
-            return;
-        };
-
-        let _ = snapshot_marker;
-        let _ = snapshot_history;
-        let _ = compaction_item;
-        match outcome {
-            BackgroundAutoCompactionOutcome::Succeeded(result) => match *result {
-                BackgroundAutoCompactionResult::Local(result) => {
-                    let _ = result;
+        {
+            let _ = snapshot_marker;
+            let _ = snapshot_history_len;
+            let _ = snapshot_history;
+            let _ = launch_ordinal;
+            let _ = compaction_item;
+            match outcome {
+                BackgroundAutoCompactionOutcome::Succeeded(result) => match *result {
+                    BackgroundAutoCompactionResult::Local(result) => {
+                        let _ = result;
+                    }
+                    BackgroundAutoCompactionResult::Remote(result) => {
+                        let _ = result;
+                    }
+                },
+                BackgroundAutoCompactionOutcome::Failed(message) => {
+                    let _ = message;
                 }
-                BackgroundAutoCompactionResult::Remote(result) => {
-                    let _ = result;
-                }
-            },
-            BackgroundAutoCompactionOutcome::Failed(message) => {
-                let _ = message;
             }
         }
     }

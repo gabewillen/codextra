@@ -113,6 +113,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
 use futures::future::BoxFuture;
+use futures::future::select_all;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use rmcp::model::ListResourceTemplatesResult;
@@ -5749,7 +5750,7 @@ async fn recover_failed_background_auto_compact_before_turn_end(
         return true;
     }
 
-    let background_failure_notify = {
+    let background_failure_notifies = {
         let active = sess.active_turn.lock().await;
         let Some(active_turn) = active.as_ref() else {
             return false;
@@ -5757,11 +5758,11 @@ async fn recover_failed_background_auto_compact_before_turn_end(
         if !active_turn.tasks.contains_key(&turn_context.sub_id) {
             return false;
         }
-        active_turn.background_auto_compaction_failure_notify()
+        active_turn.background_auto_compaction_failure_notifies()
     };
-    let Some(background_failure_notify) = background_failure_notify else {
+    if background_failure_notifies.is_empty() {
         return false;
-    };
+    }
 
     let wait_timeout_ms = if should_use_remote_compact_task(&turn_context.provider) {
         100
@@ -5771,7 +5772,15 @@ async fn recover_failed_background_auto_compact_before_turn_end(
 
     if tokio::time::timeout(
         tokio::time::Duration::from_millis(wait_timeout_ms),
-        background_failure_notify.notified(),
+        async {
+            let notified_futures = background_failure_notifies
+                .into_iter()
+                .map(|background_failure_notify| {
+                    async move { background_failure_notify.notified().await }.boxed()
+                })
+                .collect::<Vec<_>>();
+            let _ = select_all(notified_futures).await;
+        },
     )
     .await
     .is_err()
@@ -5790,6 +5799,7 @@ async fn start_background_auto_compact(
 ) -> CodexResult<()> {
     let history = sess.clone_history().await;
     let snapshot_history = history.raw_items().to_vec();
+    let snapshot_history_len = snapshot_history.len();
     let compaction_item = ContextCompactionItem::new();
     let snapshot_marker = compaction_item.id.clone();
     let background_cancellation_token = cancellation_token.child_token();
@@ -5863,10 +5873,13 @@ async fn start_background_auto_compact(
             handle.abort();
             return Ok(());
         };
+        let launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
         if !active_turn.tasks.contains_key(&turn_context.sub_id)
             || !active_turn.set_background_auto_compaction(BackgroundAutoCompaction {
                 snapshot_marker: snapshot_marker.clone(),
+                snapshot_history_len,
                 snapshot_history,
+                launch_ordinal,
                 compaction_item: worker_compaction_item,
                 failure_notify: background_failure_notify,
                 cancellation_token: background_cancellation_token,
@@ -5889,14 +5902,11 @@ async fn start_background_auto_compact(
             if !active_turn.tasks.contains_key(&turn_context.sub_id) {
                 return Ok(());
             }
-            let Some(background_auto_compaction) = active_turn.take_background_auto_compaction()
+            let Some(background_auto_compaction) =
+                active_turn.take_background_auto_compaction(&snapshot_marker)
             else {
                 return Ok(());
             };
-            if background_auto_compaction.snapshot_marker != snapshot_marker {
-                active_turn.set_background_auto_compaction(background_auto_compaction);
-                return Ok(());
-            }
             background_auto_compaction
         };
         background_auto_compaction.cancellation_token.cancel();

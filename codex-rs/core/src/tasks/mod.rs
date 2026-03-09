@@ -224,7 +224,7 @@ impl Session {
         let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
         let mut turn_tool_calls = 0_u64;
-        let mut background_auto_compaction = None;
+        let mut background_auto_compactions = Vec::new();
         if let Some(at) = active.as_mut()
             && at.remove_task(&turn_context.sub_id)
         {
@@ -233,15 +233,15 @@ impl Session {
             turn_tool_calls = ts.tool_calls;
             token_usage_at_turn_start = Some(ts.token_usage_at_turn_start.clone());
             drop(ts);
-            background_auto_compaction = at.take_background_auto_compaction();
-            at.clear_completed_background_auto_compaction();
+            background_auto_compactions = at.take_all_background_auto_compactions();
+            at.clear_completed_background_auto_compactions();
             should_clear_active_turn = true;
         }
         if should_clear_active_turn {
             *active = None;
         }
         drop(active);
-        if let Some(background_auto_compaction) = background_auto_compaction {
+        for background_auto_compaction in background_auto_compactions {
             self.cancel_background_auto_compaction(background_auto_compaction)
                 .await;
         }
@@ -356,10 +356,10 @@ impl Session {
         match active.take() {
             Some(mut at) => {
                 at.clear_pending().await;
-                let background_auto_compaction = at.take_background_auto_compaction();
-                at.clear_completed_background_auto_compaction();
+                let background_auto_compactions = at.take_all_background_auto_compactions();
+                at.clear_completed_background_auto_compactions();
                 drop(active);
-                if let Some(background_auto_compaction) = background_auto_compaction {
+                for background_auto_compaction in background_auto_compactions {
                     self.cancel_background_auto_compaction(background_auto_compaction)
                         .await;
                 }
