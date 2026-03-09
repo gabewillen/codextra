@@ -57,25 +57,25 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RUN-01 | Phase TBD | Pending |
-| RUN-02 | Phase TBD | Pending |
-| RUN-03 | Phase TBD | Pending |
-| HIST-01 | Phase TBD | Pending |
-| HIST-02 | Phase TBD | Pending |
-| HIST-03 | Phase TBD | Pending |
-| RECV-01 | Phase TBD | Pending |
-| RECV-02 | Phase TBD | Pending |
-| VIS-01 | Phase TBD | Pending |
-| VIS-02 | Phase TBD | Pending |
-| COMP-01 | Phase TBD | Pending |
-| COMP-02 | Phase TBD | Pending |
-| COMP-03 | Phase TBD | Pending |
+| RUN-01 | Phase 1 - Background Trigger And Continued Turns | Planned |
+| RUN-02 | Phase 1 - Background Trigger And Continued Turns | Planned |
+| RUN-03 | Phase 5 - Visible Rolling Background Compaction | Planned |
+| HIST-01 | Phase 2 - Safe Transcript Splicing | Planned |
+| HIST-02 | Phase 2 - Safe Transcript Splicing | Planned |
+| HIST-03 | Phase 3 - Durable History And Surface Compatibility | Planned |
+| RECV-01 | Phase 4 - Failure Recovery And Blocking Guardrails | Planned |
+| RECV-02 | Phase 4 - Failure Recovery And Blocking Guardrails | Planned |
+| VIS-01 | Phase 5 - Visible Rolling Background Compaction | Planned |
+| VIS-02 | Phase 5 - Visible Rolling Background Compaction | Planned |
+| COMP-01 | Phase 4 - Failure Recovery And Blocking Guardrails | Planned |
+| COMP-02 | Phase 4 - Failure Recovery And Blocking Guardrails | Planned |
+| COMP-03 | Phase 3 - Durable History And Surface Compatibility | Planned |
 
 **Coverage:**
 - v1 requirements: 13 total
-- Mapped to phases: 0
-- Unmapped: 13 ⚠️
+- Mapped to phases: 13
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-08*
-*Last updated: 2026-03-08 after initial definition*
+*Last updated: 2026-03-09 after initial roadmap creation*
