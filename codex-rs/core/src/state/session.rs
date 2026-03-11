@@ -22,6 +22,7 @@ use codex_protocol::protocol::TurnContextItem;
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
+    token_usage_generation: u64,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) dependency_env: HashMap<String, String>,
@@ -44,6 +45,7 @@ impl SessionState {
         Self {
             session_configuration,
             history,
+            token_usage_generation: 0,
             latest_rate_limits: None,
             server_reasoning_included: false,
             dependency_env: HashMap::new(),
@@ -112,6 +114,15 @@ impl SessionState {
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
         self.history.token_info()
+    }
+
+    pub(crate) fn token_usage_generation(&self) -> u64 {
+        self.token_usage_generation
+    }
+
+    pub(crate) fn bump_token_usage_generation(&mut self) -> u64 {
+        self.token_usage_generation = self.token_usage_generation.saturating_add(1);
+        self.token_usage_generation
     }
 
     pub(crate) fn set_rate_limits(&mut self, snapshot: RateLimitSnapshot) {

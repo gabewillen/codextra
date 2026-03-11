@@ -834,6 +834,110 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_auto_compact_defaults_to_fifty_percent_used() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_function_name = "test_tool_one";
+    let first_call_id = "call-default-async-threshold-1";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, first_function_name, "{}"),
+        ev_completed_with_tokens("r1", 600),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 50),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+
+    let first_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && !request_function_output_contains(req, first_function_name)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
+
+    let compact_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, first_function_name)
+    };
+    let compact_mock = mount_sse_once_match(&server, compact_matcher, compact_turn).await;
+
+    let continued_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let continued_turn_mock =
+        mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(20);
+        set_test_compact_prompt(config);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    let (compact_started, compact_request_count, continued_request_count) =
+        timeout(Duration::from_secs(20), async {
+            let mut compact_started = false;
+            loop {
+                if !compact_mock.requests().is_empty() && !continued_turn_mock.requests().is_empty()
+                {
+                    break (
+                        compact_started,
+                        compact_mock.requests().len(),
+                        continued_turn_mock.requests().len(),
+                    );
+                }
+
+                let event = codex.next_event().await.expect("next event");
+                if matches!(
+                    event.msg,
+                    EventMsg::ItemStarted(ItemStartedEvent {
+                        item: TurnItem::ContextCompaction(_),
+                        ..
+                    })
+                ) {
+                    compact_started = true;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for background compaction activity");
+
+    assert!(compact_started, "expected background compaction to start");
+    assert_eq!(first_turn_mock.requests().len(), 1);
+    assert!(
+        compact_request_count >= 1,
+        "default async threshold should trigger compaction at 50% used"
+    );
+    assert!(
+        continued_request_count >= 1,
+        "continued turn should proceed while background compaction runs"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_background_auto_compact_falls_back_to_blocking_compaction_once() {
     skip_if_no_network!();
 
@@ -2484,7 +2588,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 
     let context_window = 100;
     let config_limit = 200;
-    let over_limit_tokens = context_window * 90 / 100 + 1;
+    let over_limit_tokens = context_window * 75 / 100 + 1;
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),

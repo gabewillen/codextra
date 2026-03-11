@@ -3554,15 +3554,40 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
+        request_token_usage_generation: u64,
     ) {
         if let Some(token_usage) = token_usage {
-            let mut state = self.state.lock().await;
-            state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
+            let should_refresh_last_usage_from_history = {
+                let mut state = self.state.lock().await;
+                state
+                    .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+                state.token_usage_generation() != request_token_usage_generation
+            };
+
+            if should_refresh_last_usage_from_history {
+                self.refresh_last_token_usage_from_history(turn_context)
+                    .await;
+            }
         }
         self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
+        {
+            let mut state = self.state.lock().await;
+            state.bump_token_usage_generation();
+        }
+        self.refresh_last_token_usage_from_history(turn_context)
+            .await;
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn token_usage_generation(&self) -> u64 {
+        let state = self.state.lock().await;
+        state.token_usage_generation()
+    }
+
+    async fn refresh_last_token_usage_from_history(&self, turn_context: &TurnContext) {
         let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
         let Some(estimated_total_tokens) =
@@ -3592,7 +3617,6 @@ impl Session {
 
             state.set_token_info(Some(info));
         }
-        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn update_rate_limits(
@@ -5373,7 +5397,9 @@ pub(crate) async fn run_turn(
     }
 
     let model_info = turn_context.model_info.clone();
-    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+    let background_auto_compact_limit = model_info
+        .background_auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
 
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -5717,7 +5743,7 @@ pub(crate) async fn run_turn(
                     break;
                 }
                 let total_usage_tokens = sess.get_total_token_usage().await;
-                let token_limit_reached = total_usage_tokens >= auto_compact_limit;
+                let token_limit_reached = total_usage_tokens >= background_auto_compact_limit;
 
                 let estimated_token_count =
                     sess.get_estimated_token_count(turn_context.as_ref()).await;
@@ -5726,10 +5752,10 @@ pub(crate) async fn run_turn(
                     turn_id = %turn_context.sub_id,
                     total_usage_tokens,
                     estimated_token_count = ?estimated_token_count,
-                    auto_compact_limit,
+                    background_auto_compact_limit,
                     token_limit_reached,
                     needs_follow_up,
-                    "post sampling token usage"
+                    "post sampling token usage for background auto compact"
                 );
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
@@ -6620,6 +6646,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
         )
         .await;
+    let request_token_usage_generation = sess.token_usage_generation().await;
     let mut retries = 0;
     loop {
         let err = match try_run_sampling_request(
@@ -6631,6 +6658,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             server_model_warning_emitted_for_turn,
             &prompt,
+            request_token_usage_generation,
             cancellation_token.child_token(),
         )
         .await
@@ -7386,6 +7414,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     server_model_warning_emitted_for_turn: &mut bool,
     prompt: &Prompt,
+    request_token_usage_generation: u64,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     feedback_tags!(
@@ -7592,8 +7621,12 @@ async fn try_run_sampling_request(
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
-                sess.update_token_usage_info(&turn_context, token_usage.as_ref())
-                    .await;
+                sess.update_token_usage_info(
+                    &turn_context,
+                    token_usage.as_ref(),
+                    request_token_usage_generation,
+                )
+                .await;
                 should_emit_turn_diff = true;
 
                 needs_follow_up |= sess.has_pending_input().await;
