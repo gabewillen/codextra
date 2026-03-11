@@ -110,6 +110,28 @@ pub enum MacOsPreferencesPermission {
     ReadWrite,
 }
 
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    TS,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MacOsContactsPermission {
+    #[default]
+    None,
+    ReadOnly,
+    ReadWrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case", try_from = "MacOsAutomationPermissionDe")]
 pub enum MacOsAutomationPermission {
@@ -170,10 +192,20 @@ impl TryFrom<MacOsAutomationPermissionDe> for MacOsAutomationPermission {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default)]
 pub struct MacOsSeatbeltProfileExtensions {
+    #[serde(alias = "preferences")]
     pub macos_preferences: MacOsPreferencesPermission,
+    #[serde(alias = "automations")]
     pub macos_automation: MacOsAutomationPermission,
+    #[serde(alias = "launch_services")]
+    pub macos_launch_services: bool,
+    #[serde(alias = "accessibility")]
     pub macos_accessibility: bool,
+    #[serde(alias = "calendar")]
     pub macos_calendar: bool,
+    #[serde(alias = "reminders")]
+    pub macos_reminders: bool,
+    #[serde(alias = "contacts")]
+    pub macos_contacts: MacOsContactsPermission,
 }
 
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -202,7 +234,7 @@ pub enum ResponseInputItem {
     },
     McpToolCallOutput {
         call_id: String,
-        result: Result<CallToolResult, String>,
+        output: CallToolResult,
     },
     CustomToolCallOutput {
         call_id: String,
@@ -404,8 +436,6 @@ const APPROVAL_POLICY_ON_REQUEST_RULE: &str =
     include_str!("prompts/permissions/approval_policy/on_request_rule.md");
 const APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION: &str =
     include_str!("prompts/permissions/approval_policy/on_request_rule_request_permission.md");
-const GUARDIAN_APPROVAL_FEATURE: &str =
-    include_str!("prompts/permissions/approval_policy/guardian.md");
 
 const SANDBOX_MODE_DANGER_FULL_ACCESS: &str =
     include_str!("prompts/permissions/sandbox_mode/danger_full_access.md");
@@ -423,7 +453,6 @@ impl DeveloperInstructions {
 
     pub fn from(
         approval_policy: AskForApproval,
-        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         request_permission_enabled: bool,
     ) -> DeveloperInstructions {
@@ -447,24 +476,21 @@ impl DeveloperInstructions {
             AskForApproval::Never => APPROVAL_POLICY_NEVER.to_string(),
             AskForApproval::UnlessTrusted => APPROVAL_POLICY_UNLESS_TRUSTED.to_string(),
             AskForApproval::OnFailure => APPROVAL_POLICY_ON_FAILURE.to_string(),
-            AskForApproval::OnRequest => {
-                let mut instructions = on_request_instructions();
-                if guardian_approval_enabled {
-                    instructions.push_str("\n\n");
-                    instructions.push_str(GUARDIAN_APPROVAL_FEATURE);
-                }
-                instructions
-            }
+            AskForApproval::OnRequest => on_request_instructions(),
             AskForApproval::Reject(reject_config) => {
                 let on_request_instructions = on_request_instructions();
                 let sandbox_approval = reject_config.sandbox_approval;
                 let rules = reject_config.rules;
+                let skill_approval = reject_config.skill_approval;
+                let request_permissions = reject_config.request_permissions;
                 let mcp_elicitations = reject_config.mcp_elicitations;
                 format!(
                     "{on_request_instructions}\n\n\
                      Approval policy is `reject`.\n\
                      - `sandbox_approval`: {sandbox_approval}\n\
                      - `rules`: {rules}\n\
+                     - `skill_approval`: {skill_approval}\n\
+                     - `request_permissions`: {request_permissions}\n\
                      - `mcp_elicitations`: {mcp_elicitations}\n\
                      When a category is `true`, requests in that category are auto-rejected instead of prompting the user."
                 )
@@ -494,9 +520,12 @@ impl DeveloperInstructions {
     }
 
     pub fn realtime_start_message() -> Self {
+        Self::realtime_start_message_with_instructions(REALTIME_START_INSTRUCTIONS.trim())
+    }
+
+    pub fn realtime_start_message_with_instructions(instructions: &str) -> Self {
         DeveloperInstructions::new(format!(
-            "{REALTIME_CONVERSATION_OPEN_TAG}\n{}\n{REALTIME_CONVERSATION_CLOSE_TAG}",
-            REALTIME_START_INSTRUCTIONS.trim()
+            "{REALTIME_CONVERSATION_OPEN_TAG}\n{instructions}\n{REALTIME_CONVERSATION_CLOSE_TAG}"
         ))
     }
 
@@ -517,7 +546,6 @@ impl DeveloperInstructions {
     pub fn from_policy(
         sandbox_policy: &SandboxPolicy,
         approval_policy: AskForApproval,
-        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         cwd: &Path,
         request_permission_enabled: bool,
@@ -542,7 +570,6 @@ impl DeveloperInstructions {
             sandbox_mode,
             network_access,
             approval_policy,
-            guardian_approval_enabled,
             exec_policy,
             writable_roots,
             request_permission_enabled,
@@ -567,7 +594,6 @@ impl DeveloperInstructions {
         sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         approval_policy: AskForApproval,
-        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         writable_roots: Option<Vec<WritableRoot>>,
         request_permission_enabled: bool,
@@ -581,7 +607,6 @@ impl DeveloperInstructions {
             ))
             .concat(DeveloperInstructions::from(
                 approval_policy,
-                guardian_approval_enabled,
                 exec_policy,
                 request_permission_enabled,
             ))
@@ -851,14 +876,8 @@ impl From<ResponseInputItem> for ResponseItem {
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }
             }
-            ResponseInputItem::McpToolCallOutput { call_id, result } => {
-                let output = match result {
-                    Ok(result) => FunctionCallOutputPayload::from(&result),
-                    Err(tool_call_err) => FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(format!("err: {tool_call_err:?}")),
-                        success: Some(false),
-                    },
-                };
+            ResponseInputItem::McpToolCallOutput { call_id, output } => {
+                let output = output.into_function_call_output_payload();
                 Self::FunctionCallOutput { call_id, output }
             }
             ResponseInputItem::CustomToolCallOutput { call_id, output } => {
@@ -1198,25 +1217,39 @@ impl<'de> Deserialize<'de> for FunctionCallOutputPayload {
     }
 }
 
-impl From<&CallToolResult> for FunctionCallOutputPayload {
-    fn from(call_tool_result: &CallToolResult) -> Self {
-        let CallToolResult {
-            content,
-            structured_content,
-            is_error,
-            meta: _,
-        } = call_tool_result;
+impl CallToolResult {
+    pub fn from_result(result: Result<Self, String>) -> Self {
+        match result {
+            Ok(result) => result,
+            Err(error) => Self::from_error_text(error),
+        }
+    }
 
-        let is_success = is_error != &Some(true);
+    pub fn from_error_text(text: String) -> Self {
+        Self {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": text,
+            })],
+            structured_content: None,
+            is_error: Some(true),
+            meta: None,
+        }
+    }
 
-        if let Some(structured_content) = structured_content
+    pub fn success(&self) -> bool {
+        self.is_error != Some(true)
+    }
+
+    pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
+        if let Some(structured_content) = &self.structured_content
             && !structured_content.is_null()
         {
             match serde_json::to_string(structured_content) {
                 Ok(serialized_structured_content) => {
                     return FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text(serialized_structured_content),
-                        success: Some(is_success),
+                        success: Some(self.success()),
                     };
                 }
                 Err(err) => {
@@ -1228,7 +1261,7 @@ impl From<&CallToolResult> for FunctionCallOutputPayload {
             }
         }
 
-        let serialized_content = match serde_json::to_string(content) {
+        let serialized_content = match serde_json::to_string(&self.content) {
             Ok(serialized_content) => serialized_content,
             Err(err) => {
                 return FunctionCallOutputPayload {
@@ -1238,7 +1271,7 @@ impl From<&CallToolResult> for FunctionCallOutputPayload {
             }
         };
 
-        let content_items = convert_mcp_content_to_items(content);
+        let content_items = convert_mcp_content_to_items(&self.content);
 
         let body = match content_items {
             Some(content_items) => FunctionCallOutputBody::ContentItems(content_items),
@@ -1247,8 +1280,12 @@ impl From<&CallToolResult> for FunctionCallOutputPayload {
 
         FunctionCallOutputPayload {
             body,
-            success: Some(is_success),
+            success: Some(self.success()),
         }
+    }
+
+    pub fn into_function_call_output_payload(self) -> FunctionCallOutputPayload {
+        self.as_function_call_output_payload()
     }
 }
 
@@ -1453,6 +1490,12 @@ mod tests {
     }
 
     #[test]
+    fn macos_contacts_permission_order_matches_permissiveness() {
+        assert!(MacOsContactsPermission::None < MacOsContactsPermission::ReadOnly);
+        assert!(MacOsContactsPermission::ReadOnly < MacOsContactsPermission::ReadWrite);
+    }
+
+    #[test]
     fn permission_profile_deserializes_macos_seatbelt_profile_extensions() {
         let permission_profile = serde_json::from_value::<PermissionProfile>(serde_json::json!({
             "network": null,
@@ -1460,6 +1503,7 @@ mod tests {
             "macos": {
                 "macos_preferences": "read_write",
                 "macos_automation": ["com.apple.Notes"],
+                "macos_launch_services": true,
                 "macos_accessibility": true,
                 "macos_calendar": true
             }
@@ -1476,8 +1520,38 @@ mod tests {
                     macos_automation: MacOsAutomationPermission::BundleIds(vec![
                         "com.apple.Notes".to_string(),
                     ]),
+                    macos_launch_services: true,
                     macos_accessibility: true,
                     macos_calendar: true,
+                    macos_reminders: false,
+                    macos_contacts: MacOsContactsPermission::None,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn permission_profile_deserializes_macos_reminders_permission() {
+        let permission_profile = serde_json::from_value::<PermissionProfile>(serde_json::json!({
+            "macos": {
+                "macos_reminders": true
+            }
+        }))
+        .expect("deserialize reminders permission profile");
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile {
+                network: None,
+                file_system: None,
+                macos: Some(MacOsSeatbeltProfileExtensions {
+                    macos_preferences: MacOsPreferencesPermission::ReadOnly,
+                    macos_automation: MacOsAutomationPermission::None,
+                    macos_launch_services: false,
+                    macos_accessibility: false,
+                    macos_calendar: false,
+                    macos_reminders: true,
+                    macos_contacts: MacOsContactsPermission::None,
                 }),
             }
         );
@@ -1498,8 +1572,41 @@ mod tests {
                 macos_automation: MacOsAutomationPermission::BundleIds(vec![
                     "com.apple.Notes".to_string(),
                 ]),
+                macos_launch_services: false,
                 macos_accessibility: false,
                 macos_calendar: false,
+                macos_reminders: false,
+                macos_contacts: MacOsContactsPermission::None,
+            }
+        );
+    }
+
+    #[test]
+    fn macos_seatbelt_profile_extensions_deserializes_tool_schema_aliases() {
+        let permissions =
+            serde_json::from_value::<MacOsSeatbeltProfileExtensions>(serde_json::json!({
+                "preferences": "read_write",
+                "automations": ["com.apple.Notes"],
+                "launch_services": true,
+                "accessibility": true,
+                "calendar": true,
+                "reminders": true,
+                "contacts": "read_only"
+            }))
+            .expect("deserialize macos permissions");
+
+        assert_eq!(
+            permissions,
+            MacOsSeatbeltProfileExtensions {
+                macos_preferences: MacOsPreferencesPermission::ReadWrite,
+                macos_automation: MacOsAutomationPermission::BundleIds(vec![
+                    "com.apple.Notes".to_string(),
+                ]),
+                macos_launch_services: true,
+                macos_accessibility: true,
+                macos_calendar: true,
+                macos_reminders: true,
+                macos_contacts: MacOsContactsPermission::ReadOnly,
             }
         );
     }
@@ -1639,7 +1746,6 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
-            false,
             &Policy::empty(),
             None,
             false,
@@ -1669,7 +1775,6 @@ mod tests {
         let instructions = DeveloperInstructions::from_policy(
             &policy,
             AskForApproval::UnlessTrusted,
-            false,
             &Policy::empty(),
             &PathBuf::from("/tmp"),
             false,
@@ -1692,7 +1797,6 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
-            false,
             &exec_policy,
             None,
             false,
@@ -1710,7 +1814,6 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
-            false,
             &Policy::empty(),
             None,
             true,
@@ -1719,23 +1822,6 @@ mod tests {
         let text = instructions.into_text();
         assert!(text.contains("with_additional_permissions"));
         assert!(text.contains("additional_permissions"));
-    }
-
-    #[test]
-    fn includes_guardian_feature_guidance_for_on_request_when_enabled() {
-        let instructions = DeveloperInstructions::from_permissions_with_network(
-            SandboxMode::WorkspaceWrite,
-            NetworkAccess::Enabled,
-            AskForApproval::OnRequest,
-            true,
-            &Policy::empty(),
-            None,
-            false,
-        );
-
-        let text = instructions.into_text();
-        assert!(text.contains("guardian subagent"));
-        assert!(text.contains("approval prompts"));
     }
 
     #[test]
@@ -1838,7 +1924,7 @@ mod tests {
             meta: None,
         };
 
-        let payload = FunctionCallOutputPayload::from(&call_tool_result);
+        let payload = call_tool_result.into_function_call_output_payload();
         assert_eq!(payload.success, Some(true));
         let Some(items) = payload.content_items() else {
             panic!("expected content items");
@@ -1905,7 +1991,7 @@ mod tests {
             meta: None,
         };
 
-        let payload = FunctionCallOutputPayload::from(&call_tool_result);
+        let payload = call_tool_result.into_function_call_output_payload();
         let Some(items) = payload.content_items() else {
             panic!("expected content items");
         };

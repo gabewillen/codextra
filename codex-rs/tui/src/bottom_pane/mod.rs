@@ -51,6 +51,7 @@ pub(crate) use app_link_view::AppLinkView;
 pub(crate) use app_link_view::AppLinkViewParams;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use approval_overlay::format_additional_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
@@ -802,6 +803,13 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn selected_index_for_active_view(&self, view_id: &'static str) -> Option<usize> {
+        self.view_stack
+            .last()
+            .filter(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.selected_index())
+    }
+
     /// Update the pending-input preview shown above the composer.
     pub(crate) fn set_pending_input_preview(
         &mut self,
@@ -1118,27 +1126,14 @@ impl BottomPane {
         }
     }
 
-    pub(crate) fn increment_context_compaction_activity(&mut self) {
-        if self.composer.increment_context_compaction_activity() {
+    /// Updates the contextual footer label and requests a redraw only when it changed.
+    ///
+    /// This keeps the footer plumbing cheap during thread transitions where `App` may recompute
+    /// the label several times while the visible thread settles.
+    pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) {
+        if self.composer.set_active_agent_label(active_agent_label) {
             self.request_redraw();
         }
-    }
-
-    pub(crate) fn decrement_context_compaction_activity(&mut self) {
-        if self.composer.decrement_context_compaction_activity() {
-            self.request_redraw();
-        }
-    }
-
-    pub(crate) fn clear_context_compaction_activity(&mut self) {
-        if self.composer.clear_context_compaction_activity() {
-            self.request_redraw();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn context_compaction_active(&self) -> bool {
-        self.composer.context_compaction_active()
     }
 }
 

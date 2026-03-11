@@ -159,7 +159,6 @@ use super::footer::FooterMode;
 use super::footer::FooterProps;
 use super::footer::SummaryLeft;
 use super::footer::can_show_left_with_context;
-use super::footer::compaction_indicator_line;
 use super::footer::context_window_line;
 use super::footer::esc_hint_mode;
 use super::footer::footer_height;
@@ -167,6 +166,7 @@ use super::footer::footer_hint_items_width;
 use super::footer::footer_line_width;
 use super::footer::inset_footer_hint_area;
 use super::footer::max_left_width_for_right;
+use super::footer::passive_footer_status_line;
 use super::footer::render_context_right;
 use super::footer::render_footer_from_props;
 use super::footer::render_footer_hint_items;
@@ -174,6 +174,7 @@ use super::footer::render_footer_line;
 use super::footer::reset_mode_after_activity;
 use super::footer::single_line_footer_layout;
 use super::footer::toggle_shortcut_mode;
+use super::footer::uses_passive_footer_status_layout;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use super::skill_popup::MentionItem;
@@ -407,9 +408,10 @@ pub(crate) struct ChatComposer {
     realtime_conversation_enabled: bool,
     audio_device_selection_enabled: bool,
     windows_degraded_sandbox_active: bool,
-    context_compaction_activity_count: usize,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
+    // Agent label injected into the footer's contextual row when multi-agent mode is active.
+    active_agent_label: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -528,9 +530,9 @@ impl ChatComposer {
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
-            context_compaction_activity_count: 0,
             status_line_value: None,
             status_line_enabled: false,
+            active_agent_label: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -655,7 +657,9 @@ impl ChatComposer {
     }
     fn layout_areas(&self, area: Rect) -> [Rect; 4] {
         let footer_props = self.footer_props();
-        let footer_hint_height = self.footer_hint_height(&footer_props);
+        let footer_hint_height = self
+            .custom_footer_height()
+            .unwrap_or_else(|| footer_height(&footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
         let popup_constraint = match &self.active_popup {
@@ -688,12 +692,6 @@ impl ChatComposer {
         textarea_rect.y = textarea_rect.y.saturating_add(consumed);
         textarea_rect.height = textarea_rect.height.saturating_sub(consumed);
         [composer_rect, remote_images_rect, textarea_rect, popup_rect]
-    }
-
-    fn footer_hint_height(&self, footer_props: &FooterProps) -> u16 {
-        self.custom_footer_height()
-            .unwrap_or_else(|| footer_height(footer_props))
-            .saturating_add(u16::from(self.context_compaction_active()))
     }
 
     fn footer_spacing(footer_hint_height: u16) -> u16 {
@@ -3196,6 +3194,7 @@ impl ChatComposer {
             context_window_used_tokens: self.context_window_used_tokens,
             status_line_value: self.status_line_value.clone(),
             status_line_enabled: self.status_line_enabled,
+            active_agent_label: self.active_agent_label.clone(),
         }
     }
 
@@ -3586,8 +3585,8 @@ impl ChatComposer {
                     insert_text: format!("${skill_name}"),
                     search_terms,
                     path: Some(skill.path_to_skills_md.to_string_lossy().into_owned()),
-                    category_tag: (skill.scope == codex_protocol::protocol::SkillScope::Repo)
-                        .then(|| "[Repo]".to_string()),
+                    category_tag: Some("[Skill]".to_string()),
+                    sort_rank: 1,
                 });
             }
         }
@@ -3638,8 +3637,8 @@ impl ChatComposer {
                     insert_text: format!("${plugin_name}"),
                     search_terms,
                     path: Some(format!("plugin://{}", plugin.config_name)),
-                    category_tag: (!marketplace_name.is_empty())
-                        .then(|| format!("[{marketplace_name}]")),
+                    category_tag: Some("[Plugin]".to_string()),
+                    sort_rank: 0,
                 });
             }
         }
@@ -3663,17 +3662,8 @@ impl ChatComposer {
                     search_terms,
                     path: Some(format!("app://{connector_id}")),
                     category_tag: Some("[App]".to_string()),
+                    sort_rank: 1,
                 });
-            }
-        }
-
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for mention in &mentions {
-            *counts.entry(mention.insert_text.clone()).or_insert(0) += 1;
-        }
-        for mention in &mut mentions {
-            if counts.get(&mention.insert_text).copied().unwrap_or(0) <= 1 {
-                mention.category_tag = None;
             }
         }
 
@@ -3777,30 +3767,17 @@ impl ChatComposer {
         true
     }
 
-    pub(crate) fn increment_context_compaction_activity(&mut self) -> bool {
-        let was_active = self.context_compaction_active();
-        self.context_compaction_activity_count =
-            self.context_compaction_activity_count.saturating_add(1);
-        !was_active
-    }
-
-    pub(crate) fn decrement_context_compaction_activity(&mut self) -> bool {
-        let was_active = self.context_compaction_active();
-        self.context_compaction_activity_count =
-            self.context_compaction_activity_count.saturating_sub(1);
-        was_active != self.context_compaction_active()
-    }
-
-    pub(crate) fn clear_context_compaction_activity(&mut self) -> bool {
-        if !self.context_compaction_active() {
+    /// Replaces the contextual footer label for the currently viewed agent.
+    ///
+    /// Returning `false` means the value was unchanged, so callers can skip redraw work. This
+    /// field is intentionally just cached presentation state; `ChatComposer` does not infer which
+    /// thread is active on its own.
+    pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) -> bool {
+        if self.active_agent_label == active_agent_label {
             return false;
         }
-        self.context_compaction_activity_count = 0;
+        self.active_agent_label = active_agent_label;
         true
-    }
-
-    pub(crate) fn context_compaction_active(&self) -> bool {
-        self.context_compaction_activity_count > 0
     }
 }
 
@@ -4157,7 +4134,9 @@ impl Renderable for ChatComposer {
 
     fn desired_height(&self, width: u16) -> u16 {
         let footer_props = self.footer_props();
-        let footer_hint_height = self.footer_hint_height(&footer_props);
+        let footer_hint_height = self
+            .custom_footer_height()
+            .unwrap_or_else(|| footer_height(&footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
@@ -4218,9 +4197,8 @@ impl ChatComposer {
                     | FooterMode::EscHint => false,
                 };
                 let custom_height = self.custom_footer_height();
-                let base_footer_height =
+                let footer_hint_height =
                     custom_height.unwrap_or_else(|| footer_height(&footer_props));
-                let footer_hint_height = self.footer_hint_height(&footer_props);
                 let footer_spacing = Self::footer_spacing(footer_hint_height);
                 let hint_rect = if footer_spacing > 0 && footer_hint_height > 0 {
                     let [_, hint_rect] = Layout::vertical([
@@ -4232,45 +4210,21 @@ impl ChatComposer {
                 } else {
                     popup_rect
                 };
-                let (base_hint_rect, compaction_rect) = if self.context_compaction_active()
-                    && base_footer_height > 0
-                    && hint_rect.height > 1
-                {
-                    let [base_hint_rect, compaction_rect] = Layout::vertical([
-                        Constraint::Length(base_footer_height),
-                        Constraint::Length(1),
-                    ])
-                    .areas(hint_rect);
-                    (base_hint_rect, Some(compaction_rect))
-                } else if self.context_compaction_active() {
-                    (Rect::default(), Some(hint_rect))
+                let available_width =
+                    hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                let status_line_active = uses_passive_footer_status_layout(&footer_props);
+                let combined_status_line = if status_line_active {
+                    passive_footer_status_line(&footer_props).map(ratatui::prelude::Stylize::dim)
                 } else {
-                    (hint_rect, None)
+                    None
                 };
-                let available_width = base_hint_rect
-                    .width
-                    .saturating_sub(FOOTER_INDENT_COLS as u16)
-                    as usize;
-                let status_line = footer_props
-                    .status_line_value
-                    .as_ref()
-                    .map(|line| line.clone().dim());
-                let status_line_candidate = footer_props.status_line_enabled
-                    && match footer_props.mode {
-                        FooterMode::ComposerEmpty => true,
-                        FooterMode::ComposerHasDraft => !footer_props.is_task_running,
-                        FooterMode::QuitShortcutReminder
-                        | FooterMode::ShortcutOverlay
-                        | FooterMode::EscHint => false,
-                    };
-                let mut truncated_status_line = if status_line_candidate {
-                    status_line.as_ref().map(|line| {
+                let mut truncated_status_line = if status_line_active {
+                    combined_status_line.as_ref().map(|line| {
                         truncate_line_with_ellipsis_if_overflow(line.clone(), available_width)
                     })
                 } else {
                     None
                 };
-                let status_line_active = status_line_candidate && truncated_status_line.is_some();
                 let left_mode_indicator = if status_line_active {
                     None
                 } else {
@@ -4302,7 +4256,7 @@ impl ChatComposer {
                         mode_indicator_line(self.collaboration_mode_indicator, show_cycle_hint);
                     let compact = mode_indicator_line(self.collaboration_mode_indicator, false);
                     let full_width = full.as_ref().map(|l| l.width() as u16).unwrap_or(0);
-                    if can_show_left_with_context(base_hint_rect, left_width, full_width) {
+                    if can_show_left_with_context(hint_rect, left_width, full_width) {
                         full
                     } else {
                         compact
@@ -4315,9 +4269,9 @@ impl ChatComposer {
                 };
                 let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
                 if status_line_active
-                    && let Some(max_left) = max_left_width_for_right(base_hint_rect, right_width)
+                    && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
                     && left_width > max_left
-                    && let Some(line) = status_line.as_ref().map(|line| {
+                    && let Some(line) = combined_status_line.as_ref().map(|line| {
                         truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
                     })
                 {
@@ -4325,40 +4279,38 @@ impl ChatComposer {
                     truncated_status_line = Some(line);
                 }
                 let can_show_left_and_context =
-                    can_show_left_with_context(base_hint_rect, left_width, right_width);
+                    can_show_left_with_context(hint_rect, left_width, right_width);
                 let has_override =
                     self.footer_flash_visible() || self.footer_hint_override.is_some();
-                let single_line_layout =
-                    if self.context_compaction_active() || has_override || status_line_active {
-                        None
-                    } else {
-                        match footer_props.mode {
-                            FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft => {
-                                // Both of these modes render the single-line footer style (with
-                                // either the shortcuts hint or the optional queue hint). We still
-                                // want the single-line collapse rules so the mode label can win over
-                                // the context indicator on narrow widths.
-                                Some(single_line_footer_layout(
-                                    base_hint_rect,
-                                    right_width,
-                                    left_mode_indicator,
-                                    show_cycle_hint,
-                                    show_shortcuts_hint,
-                                    show_queue_hint,
-                                ))
-                            }
-                            FooterMode::EscHint
-                            | FooterMode::QuitShortcutReminder
-                            | FooterMode::ShortcutOverlay => None,
+                let single_line_layout = if has_override || status_line_active {
+                    None
+                } else {
+                    match footer_props.mode {
+                        FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft => {
+                            // Both of these modes render the single-line footer style (with
+                            // either the shortcuts hint or the optional queue hint). We still
+                            // want the single-line collapse rules so the mode label can win over
+                            // the context indicator on narrow widths.
+                            Some(single_line_footer_layout(
+                                hint_rect,
+                                right_width,
+                                left_mode_indicator,
+                                show_cycle_hint,
+                                show_shortcuts_hint,
+                                show_queue_hint,
+                            ))
                         }
-                    };
+                        FooterMode::EscHint
+                        | FooterMode::QuitShortcutReminder
+                        | FooterMode::ShortcutOverlay => None,
+                    }
+                };
                 let show_right = if matches!(
                     footer_props.mode,
                     FooterMode::EscHint
                         | FooterMode::QuitShortcutReminder
                         | FooterMode::ShortcutOverlay
-                ) || self.context_compaction_active()
-                {
+                ) {
                     false
                 } else {
                     single_line_layout
@@ -4372,10 +4324,10 @@ impl ChatComposer {
                         SummaryLeft::Default => {
                             if status_line_active {
                                 if let Some(line) = truncated_status_line.clone() {
-                                    render_footer_line(base_hint_rect, buf, line);
-                                } else if !base_hint_rect.is_empty() {
+                                    render_footer_line(hint_rect, buf, line);
+                                } else {
                                     render_footer_from_props(
-                                        base_hint_rect,
+                                        hint_rect,
                                         buf,
                                         &footer_props,
                                         left_mode_indicator,
@@ -4384,9 +4336,9 @@ impl ChatComposer {
                                         show_queue_hint,
                                     );
                                 }
-                            } else if !base_hint_rect.is_empty() {
+                            } else {
                                 render_footer_from_props(
-                                    base_hint_rect,
+                                    hint_rect,
                                     buf,
                                     &footer_props,
                                     left_mode_indicator,
@@ -4397,25 +4349,23 @@ impl ChatComposer {
                             }
                         }
                         SummaryLeft::Custom(line) => {
-                            render_footer_line(base_hint_rect, buf, line);
+                            render_footer_line(hint_rect, buf, line);
                         }
                         SummaryLeft::None => {}
                     }
                 } else if self.footer_flash_visible() {
                     if let Some(flash) = self.footer_flash.as_ref() {
-                        flash
-                            .line
-                            .render(inset_footer_hint_area(base_hint_rect), buf);
+                        flash.line.render(inset_footer_hint_area(hint_rect), buf);
                     }
                 } else if let Some(items) = self.footer_hint_override.as_ref() {
-                    render_footer_hint_items(base_hint_rect, buf, items);
+                    render_footer_hint_items(hint_rect, buf, items);
                 } else if status_line_active {
                     if let Some(line) = truncated_status_line {
-                        render_footer_line(base_hint_rect, buf, line);
+                        render_footer_line(hint_rect, buf, line);
                     }
-                } else if !base_hint_rect.is_empty() {
+                } else {
                     render_footer_from_props(
-                        base_hint_rect,
+                        hint_rect,
                         buf,
                         &footer_props,
                         self.collaboration_mode_indicator,
@@ -4426,10 +4376,7 @@ impl ChatComposer {
                 }
 
                 if show_right && let Some(line) = &right_line {
-                    render_context_right(base_hint_rect, buf, line);
-                }
-                if let Some(compaction_rect) = compaction_rect {
-                    render_footer_line(compaction_rect, buf, compaction_indicator_line());
+                    render_context_right(hint_rect, buf, line);
                 }
             }
         }
@@ -4719,7 +4666,7 @@ mod tests {
         );
         setup(&mut composer);
         let footer_props = composer.footer_props();
-        let footer_lines = composer.footer_hint_height(&footer_props);
+        let footer_lines = footer_height(&footer_props);
         let footer_spacing = ChatComposer::footer_spacing(footer_lines);
         let height = footer_lines + footer_spacing + 8;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -4785,11 +4732,6 @@ mod tests {
 
         snapshot_composer_state("footer_mode_hidden_while_typing", true, |composer| {
             type_chars_humanlike(composer, &['h']);
-        });
-
-        snapshot_composer_state("footer_mode_context_compaction_active", true, |composer| {
-            composer.set_context_window(Some(72), None);
-            let _ = composer.increment_context_compaction_activity();
         });
     }
 
@@ -5401,6 +5343,60 @@ mod tests {
                     "calendar".to_string(),
                 )],
             }]));
+        });
+    }
+
+    #[test]
+    fn mention_popup_type_prefixes_snapshot() {
+        snapshot_composer_state_with_width("mention_popup_type_prefixes", 72, false, |composer| {
+            composer.set_connectors_enabled(true);
+            composer.set_text_content("$goog".to_string(), Vec::new(), Vec::new());
+            composer.set_skill_mentions(Some(vec![SkillMetadata {
+                name: "google-calendar-skill".to_string(),
+                description: "Find availability and plan event changes".to_string(),
+                short_description: None,
+                interface: Some(codex_core::skills::model::SkillInterface {
+                    display_name: Some("Google Calendar".to_string()),
+                    short_description: None,
+                    icon_small: None,
+                    icon_large: None,
+                    brand_color: None,
+                    default_prompt: None,
+                }),
+                dependencies: None,
+                policy: None,
+                permission_profile: None,
+                path_to_skills_md: PathBuf::from("/tmp/repo/google-calendar/SKILL.md"),
+                scope: codex_protocol::protocol::SkillScope::Repo,
+            }]));
+            composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
+                config_name: "google-calendar@debug".to_string(),
+                display_name: "Google Calendar".to_string(),
+                description: Some(
+                    "Connect Google Calendar for scheduling, availability, and event management."
+                        .to_string(),
+                ),
+                has_skills: false,
+                mcp_server_names: vec!["google-calendar".to_string()],
+                app_connector_ids: Vec::new(),
+            }]));
+            composer.set_connector_mentions(Some(ConnectorsSnapshot {
+                connectors: vec![AppInfo {
+                    id: "google_calendar".to_string(),
+                    name: "Google Calendar".to_string(),
+                    description: Some("Look up events and availability".to_string()),
+                    logo_url: None,
+                    logo_url_dark: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some("https://example.test/google-calendar".to_string()),
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }],
+            }));
         });
     }
 
