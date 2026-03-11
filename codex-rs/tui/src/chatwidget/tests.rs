@@ -9382,6 +9382,118 @@ async fn overlapping_context_compaction_items_keep_footer_indicator_active_until
 }
 
 #[tokio::test]
+async fn context_compaction_footer_remains_accurate_while_context_usage_changes() {
+    use ratatui::Terminal;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+
+    let render_contains_indicator = |chat: &ChatWidget| {
+        let width = 80;
+        let height = chat.desired_height(width);
+        let mut terminal =
+            Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
+        terminal
+            .draw(|f| chat.render(f.area(), f.buffer_mut()))
+            .expect("draw compaction footer");
+        terminal
+            .backend()
+            .vt100()
+            .screen()
+            .contents()
+            .contains("Compacting context...")
+    };
+
+    chat.handle_codex_event(Event {
+        id: "token-before".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_750, 13_000)),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(25));
+    assert!(
+        !render_contains_indicator(&chat),
+        "footer indicator should be hidden before compaction starts"
+    );
+
+    let first_item = TurnItem::ContextCompaction(ContextCompactionItem {
+        id: "compact-1".to_string(),
+    });
+    let second_item = TurnItem::ContextCompaction(ContextCompactionItem {
+        id: "compact-2".to_string(),
+    });
+
+    for (event_id, item) in [
+        ("compact-start-1", first_item.clone()),
+        ("compact-start-2", second_item.clone()),
+    ] {
+        chat.handle_codex_event(Event {
+            id: event_id.into(),
+            msg: EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-1".to_string(),
+                item,
+            }),
+        });
+    }
+
+    assert!(
+        render_contains_indicator(&chat),
+        "footer indicator should render while overlapping compactions are active"
+    );
+
+    chat.handle_codex_event(Event {
+        id: "token-after-compact".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_150, 13_000)),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(85));
+    assert!(
+        render_contains_indicator(&chat),
+        "footer indicator should stay visible while compaction is still active even after usage drops"
+    );
+
+    chat.handle_codex_event(Event {
+        id: "compact-done-1".into(),
+        msg: EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            item: first_item,
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "token-after-growth".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_250, 13_000)),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(75));
+    assert!(
+        render_contains_indicator(&chat),
+        "footer indicator should remain visible until the last overlapping compaction completes"
+    );
+
+    chat.handle_codex_event(Event {
+        id: "compact-done-2".into(),
+        msg: EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            item: second_item,
+        }),
+    });
+
+    assert!(
+        !render_contains_indicator(&chat),
+        "footer indicator should clear once all overlapping compactions complete"
+    );
+}
+
+#[tokio::test]
 async fn status_line_invalid_items_warn_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.config.tui_status_line = Some(vec![

@@ -457,6 +457,7 @@ async fn drain_to_completed(
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
 ) -> CodexResult<()> {
+    let request_token_usage_generation = sess.token_usage_generation().await;
     let mut stream = client_session
         .stream(
             prompt,
@@ -487,8 +488,12 @@ async fn drain_to_completed(
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
-                    .await;
+                sess.update_token_usage_info(
+                    turn_context,
+                    token_usage.as_ref(),
+                    request_token_usage_generation,
+                )
+                .await;
                 return Ok(());
             }
             Ok(_) => continue,

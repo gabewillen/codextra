@@ -947,6 +947,137 @@ async fn recompute_token_usage_updates_model_context_window() {
 }
 
 #[tokio::test]
+async fn recompute_token_usage_drops_after_compaction_then_grows_with_new_history() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.model_info.context_window = Some(20_000);
+    turn_context.model_info.effective_context_window_percent = 100;
+
+    let live_history = vec![
+        user_message(&"earlier user context ".repeat(600)),
+        assistant_message(&"assistant context ".repeat(600)),
+        user_message(&"more user context ".repeat(600)),
+        assistant_message(&"more assistant context ".repeat(600)),
+    ];
+    session
+        .replace_history(live_history, Some(turn_context.to_turn_context_item()))
+        .await;
+    session.recompute_token_usage(&turn_context).await;
+
+    let pre_compact_tokens = session
+        .state
+        .lock()
+        .await
+        .token_info()
+        .expect("token info before compaction")
+        .last_token_usage
+        .total_tokens;
+
+    let compacted_history = vec![user_message("compacted summary")];
+    session
+        .replace_compacted_history(
+            compacted_history.clone(),
+            Some(turn_context.to_turn_context_item()),
+            CompactedItem {
+                message: "compacted summary".to_string(),
+                replacement_history: Some(compacted_history),
+            },
+        )
+        .await;
+    session.recompute_token_usage(&turn_context).await;
+
+    let post_compact_tokens = session
+        .state
+        .lock()
+        .await
+        .token_info()
+        .expect("token info after compaction")
+        .last_token_usage
+        .total_tokens;
+
+    assert!(
+        post_compact_tokens < pre_compact_tokens,
+        "compaction should reduce the estimated context footprint"
+    );
+
+    let follow_up = user_message(&"new tail context ".repeat(300));
+    session
+        .record_into_history(std::slice::from_ref(&follow_up), &turn_context)
+        .await;
+    session.recompute_token_usage(&turn_context).await;
+
+    let grown_tokens = session
+        .state
+        .lock()
+        .await
+        .token_info()
+        .expect("token info after follow-up")
+        .last_token_usage
+        .total_tokens;
+
+    assert!(
+        grown_tokens > post_compact_tokens,
+        "context usage should grow again after new messages arrive"
+    );
+}
+
+#[tokio::test]
+async fn update_token_usage_info_keeps_last_usage_aligned_with_compacted_history() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.model_info.context_window = Some(20_000);
+    turn_context.model_info.effective_context_window_percent = 100;
+
+    let compacted_history = vec![user_message("compacted summary")];
+    session
+        .replace_compacted_history(
+            compacted_history.clone(),
+            Some(turn_context.to_turn_context_item()),
+            CompactedItem {
+                message: "compacted summary".to_string(),
+                replacement_history: Some(compacted_history),
+            },
+        )
+        .await;
+    session.recompute_token_usage(&turn_context).await;
+
+    let compacted_tokens = session
+        .state
+        .lock()
+        .await
+        .token_info()
+        .expect("token info after compaction")
+        .last_token_usage
+        .total_tokens;
+    let stale_generation = session.token_usage_generation().await.saturating_sub(1);
+
+    session
+        .update_token_usage_info(
+            &turn_context,
+            Some(&TokenUsage {
+                total_tokens: 18_000,
+                ..TokenUsage::default()
+            }),
+            stale_generation,
+        )
+        .await;
+
+    let info = session
+        .state
+        .lock()
+        .await
+        .token_info()
+        .expect("token info after usage update");
+
+    assert!(
+        info.total_token_usage.total_tokens >= 18_000,
+        "raw API usage should still accumulate into total token accounting"
+    );
+    assert_eq!(
+        info.last_token_usage.total_tokens, compacted_tokens,
+        "last token usage should remain aligned with the current compacted history, not the stale raw API usage"
+    );
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;

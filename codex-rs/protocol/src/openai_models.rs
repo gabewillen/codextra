@@ -261,9 +261,10 @@ pub struct ModelInfo {
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
-    /// Token threshold for automatic compaction. When omitted, core derives it
-    /// from `context_window` (90%). When provided, core clamps it to 90% of the
-    /// context window when available.
+    /// Token threshold for blocking automatic compaction. When omitted, core
+    /// derives it from `context_window` (75%). When provided, core clamps it to
+    /// 75% of the context window when available. Background async compaction
+    /// uses a separate earlier default trigger when this is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<i64>,
     /// Percentage of the context window considered usable for inputs, after
@@ -288,7 +289,7 @@ impl ModelInfo {
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
         let context_limit = self
             .context_window
-            .map(|context_window| (context_window * 9) / 10);
+            .map(|context_window| (context_window * 3) / 4);
         let config_limit = self.auto_compact_token_limit;
         if let Some(context_limit) = context_limit {
             return Some(
@@ -296,6 +297,14 @@ impl ModelInfo {
             );
         }
         config_limit
+    }
+
+    pub fn background_auto_compact_token_limit(&self) -> Option<i64> {
+        if self.auto_compact_token_limit.is_some() {
+            return self.auto_compact_token_limit();
+        }
+
+        self.context_window.map(|context_window| context_window / 2)
     }
 
     pub fn supports_personality(&self) -> bool {
@@ -622,6 +631,40 @@ mod tests {
         let instructions = model.get_model_instructions(Some(Personality::Friendly));
 
         assert_eq!(instructions, "base");
+    }
+
+    #[test]
+    fn auto_compact_token_limit_defaults_to_seventy_five_percent_of_context_window() {
+        let mut model = test_model(None);
+        model.context_window = Some(400);
+
+        assert_eq!(model.auto_compact_token_limit(), Some(300));
+    }
+
+    #[test]
+    fn auto_compact_token_limit_clamps_explicit_limit_to_seventy_five_percent() {
+        let mut model = test_model(None);
+        model.context_window = Some(400);
+        model.auto_compact_token_limit = Some(350);
+
+        assert_eq!(model.auto_compact_token_limit(), Some(300));
+    }
+
+    #[test]
+    fn background_auto_compact_token_limit_defaults_to_fifty_percent_of_context_window() {
+        let mut model = test_model(None);
+        model.context_window = Some(400);
+
+        assert_eq!(model.background_auto_compact_token_limit(), Some(200));
+    }
+
+    #[test]
+    fn background_auto_compact_token_limit_uses_explicit_limit_clamped_to_blocking_max() {
+        let mut model = test_model(None);
+        model.context_window = Some(400);
+        model.auto_compact_token_limit = Some(350);
+
+        assert_eq!(model.background_auto_compact_token_limit(), Some(300));
     }
 
     #[test]
