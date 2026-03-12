@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
@@ -367,6 +368,7 @@ pub struct UserSavedConfig {
     pub forced_chatgpt_workspace_id: Option<String>,
     pub forced_login_method: Option<ForcedLoginMethod>,
     pub model: Option<String>,
+    pub history_context_mode: Option<HistoryContextMode>,
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
@@ -381,6 +383,7 @@ pub struct Profile {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub approval_policy: Option<AskForApproval>,
+    pub history_context_mode: Option<HistoryContextMode>,
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,

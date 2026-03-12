@@ -1397,6 +1397,48 @@ fn web_search_mode_prefers_profile_over_legacy_flags() {
 }
 
 #[test]
+fn history_context_mode_defaults_to_compaction() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.history_context_mode, HistoryContextMode::Compaction);
+    Ok(())
+}
+
+#[test]
+fn history_context_mode_override_takes_precedence_over_profile_and_base() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut profiles = HashMap::new();
+    profiles.insert(
+        "scrolling".to_string(),
+        ConfigProfile {
+            history_context_mode: Some(HistoryContextMode::ScrollingWindow),
+            ..Default::default()
+        },
+    );
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            history_context_mode: Some(HistoryContextMode::Compaction),
+            profile: Some("scrolling".to_string()),
+            profiles,
+            ..Default::default()
+        },
+        ConfigOverrides {
+            history_context_mode: Some(HistoryContextMode::Compaction),
+            ..Default::default()
+        },
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.history_context_mode, HistoryContextMode::Compaction);
+    Ok(())
+}
+
+#[test]
 fn web_search_mode_disabled_overrides_legacy_request() {
     let cfg = ConfigToml {
         web_search: Some(WebSearchMode::Disabled),
@@ -3945,6 +3987,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            history_context_mode: HistoryContextMode::Compaction,
             service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
@@ -4081,6 +4124,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
+        history_context_mode: HistoryContextMode::Compaction,
         service_tier: None,
         model_provider_id: "openai-custom".to_string(),
         model_provider: fixture.openai_custom_provider.clone(),
@@ -4215,6 +4259,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
+        history_context_mode: HistoryContextMode::Compaction,
         service_tier: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),
@@ -4335,6 +4380,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
+        history_context_mode: HistoryContextMode::Compaction,
         service_tier: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),

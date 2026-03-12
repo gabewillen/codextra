@@ -9,6 +9,7 @@ use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::tools::code_mode::PUBLIC_TOOL_NAME;
 use crate::tools::code_mode_description::augment_tool_spec_for_code_mode;
+use crate::tools::handlers::CONVERSATION_HISTORY_TOOL_NAME;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
@@ -21,6 +22,7 @@ use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_permissions_tool_description;
 use crate::tools::handlers::request_user_input_tool_description;
 use crate::tools::registry::ToolRegistryBuilder;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -112,6 +114,7 @@ pub(crate) struct ToolsConfig {
     pub artifact_tools: bool,
     pub request_user_input: bool,
     pub default_mode_request_user_input: bool,
+    pub conversation_history: bool,
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
@@ -122,6 +125,7 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) available_models: &'a Vec<ModelPreset>,
     pub(crate) features: &'a Features,
     pub(crate) web_search_mode: Option<WebSearchMode>,
+    pub(crate) history_context_mode: HistoryContextMode,
     pub(crate) session_source: SessionSource,
 }
 
@@ -132,6 +136,7 @@ impl ToolsConfig {
             available_models: available_models_ref,
             features,
             web_search_mode,
+            history_context_mode,
             session_source,
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
@@ -220,6 +225,7 @@ impl ToolsConfig {
             artifact_tools: include_artifact_tools,
             request_user_input: include_request_user_input,
             default_mode_request_user_input: include_default_mode_request_user_input,
+            conversation_history: *history_context_mode == HistoryContextMode::ScrollingWindow,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
@@ -1234,6 +1240,65 @@ fn create_request_permissions_tool() -> ToolSpec {
     })
 }
 
+fn create_conversation_history_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "action".to_string(),
+            JsonSchema::String {
+                description: Some("Required. Use `scroll` to move through older transcript slices or `search` to find older content.".to_string()),
+            },
+        ),
+        (
+            "direction".to_string(),
+            JsonSchema::String {
+                description: Some("For `scroll` only. Use `backward` for older history or `forward` toward the live window.".to_string()),
+            },
+        ),
+        (
+            "pages".to_string(),
+            JsonSchema::Number {
+                description: Some("For `scroll` only. Number of pages to move. Defaults to 1 and is capped.".to_string()),
+            },
+        ),
+        (
+            "query".to_string(),
+            JsonSchema::String {
+                description: Some("For `search` only. Keyword or phrase to search for in older conversation history.".to_string()),
+            },
+        ),
+        (
+            "limit".to_string(),
+            JsonSchema::Number {
+                description: Some("For `search` only. Maximum number of matches to return. Defaults to a small capped value.".to_string()),
+            },
+        ),
+        (
+            "before_matches".to_string(),
+            JsonSchema::Number {
+                description: Some("For `search` only. How many items before each match to inject into the prompt.".to_string()),
+            },
+        ),
+        (
+            "after_matches".to_string(),
+            JsonSchema::Number {
+                description: Some("For `search` only. How many items after each match to inject into the prompt.".to_string()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: CONVERSATION_HISTORY_TOOL_NAME.to_string(),
+        description: "Inspect older conversation history when the live prompt only contains the newest window. Use `scroll` to move backward or forward through bounded slices, or `search` to find relevant older content and inject a small window around each match.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["action".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 fn create_close_agent_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -2030,6 +2095,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::ArtifactsHandler;
     use crate::tools::handlers::CodeModeHandler;
+    use crate::tools::handlers::ConversationHistoryHandler;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::JsReplHandler;
@@ -2065,6 +2131,7 @@ pub(crate) fn build_specs(
     let request_user_input_handler = Arc::new(RequestUserInputHandler {
         default_mode_request_user_input: config.default_mode_request_user_input,
     });
+    let conversation_history_handler = Arc::new(ConversationHistoryHandler);
     let search_tool_handler = Arc::new(SearchToolBm25Handler);
     let code_mode_handler = Arc::new(CodeModeHandler);
     let js_repl_handler = Arc::new(JsReplHandler);
@@ -2221,6 +2288,16 @@ pub(crate) fn build_specs(
             config.code_mode_enabled,
         );
         builder.register_handler("request_permissions", request_permissions_handler);
+    }
+
+    if config.conversation_history {
+        push_tool_spec(
+            &mut builder,
+            create_conversation_history_tool(),
+            false,
+            config.code_mode_enabled,
+        );
+        builder.register_handler(CONVERSATION_HISTORY_TOOL_NAME, conversation_history_handler);
     }
 
     if config.search_tool {
@@ -2778,6 +2855,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&config, None, None, &[]).build();
@@ -2851,6 +2929,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -2875,6 +2954,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -2905,6 +2985,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -2926,6 +3007,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::SubAgent(SubAgentSource::Other(
                 "agent_job:test".to_string(),
             )),
@@ -2958,6 +3040,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -2974,6 +3057,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -2998,6 +3082,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3011,6 +3096,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3034,6 +3120,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3054,6 +3141,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3076,6 +3164,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3104,6 +3193,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3128,6 +3218,7 @@ mod tests {
             available_models: &available_models,
             features: &default_features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (default_tools, _) = build_specs(&default_tools_config, None, None, &[]).build();
@@ -3143,6 +3234,7 @@ mod tests {
             available_models: &available_models,
             features: &image_generation_features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (supported_tools, _) = build_specs(&supported_tools_config, None, None, &[]).build();
@@ -3161,6 +3253,7 @@ mod tests {
             available_models: &available_models,
             features: &image_generation_features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3201,6 +3294,7 @@ mod tests {
             available_models: &available_models,
             features,
             web_search_mode,
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3237,6 +3331,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3267,6 +3362,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3310,6 +3406,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         })
         .with_web_search_config(Some(web_search_config.clone()));
@@ -3346,6 +3443,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3380,6 +3478,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3405,6 +3504,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
@@ -3598,6 +3698,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
@@ -3624,6 +3725,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -3652,6 +3754,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3680,6 +3783,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
@@ -3714,6 +3818,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(
@@ -3804,6 +3909,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -3852,6 +3958,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -3939,6 +4046,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, app_tools.clone(), &[]).build();
@@ -3952,10 +4060,42 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(&tools_config, None, app_tools, &[]).build();
         assert_contains_tool_names(&tools, &[SEARCH_TOOL_BM25_TOOL_NAME]);
+    }
+
+    #[test]
+    fn conversation_history_tool_only_appears_in_scrolling_window_mode() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let available_models = Vec::new();
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            available_models: &available_models,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
+            session_source: SessionSource::Cli,
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_lacks_tool_name(&tools, CONVERSATION_HISTORY_TOOL_NAME);
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            available_models: &available_models,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::ScrollingWindow,
+            session_source: SessionSource::Cli,
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_contains_tool_names(&tools, &[CONVERSATION_HISTORY_TOOL_NAME]);
     }
 
     #[test]
@@ -3971,6 +4111,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -3998,6 +4139,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -4056,6 +4198,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -4111,6 +4254,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -4168,6 +4312,7 @@ mod tests {
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -4377,6 +4522,7 @@ Examples of valid command strings:
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
         let (tools, _) = build_specs(
@@ -4486,6 +4632,7 @@ Examples of valid command strings:
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 
@@ -4516,6 +4663,7 @@ Examples of valid command strings:
             available_models: &available_models,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            history_context_mode: HistoryContextMode::Compaction,
             session_source: SessionSource::Cli,
         });
 

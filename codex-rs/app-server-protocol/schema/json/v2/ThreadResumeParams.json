@@ -233,6 +233,13 @@
       ],
       "type": "object"
     },
+    "HistoryContextMode": {
+      "enum": [
+        "compaction",
+        "scrolling_window"
+      ],
+      "type": "string"
+    },
     "ImageDetail": {
       "enum": [
         "auto",
@@ -943,6 +950,16 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "historyContextMode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/HistoryContextMode"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "model": {

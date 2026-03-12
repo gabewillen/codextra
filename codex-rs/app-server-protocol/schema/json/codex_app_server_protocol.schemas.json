@@ -10250,6 +10250,16 @@
               }
             ]
           },
+          "history_context_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/HistoryContextMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "instructions": {
             "type": [
               "string",
@@ -11607,6 +11617,13 @@
           "workspace-shared",
           "all-shared",
           "personal"
+        ],
+        "type": "string"
+      },
+      "HistoryContextMode": {
+        "enum": [
+          "compaction",
+          "scrolling_window"
         ],
         "type": "string"
       },
@@ -13098,6 +13115,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "history_context_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/HistoryContextMode"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "model": {
@@ -15260,6 +15287,16 @@
           "ephemeral": {
             "type": "boolean"
           },
+          "historyContextMode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/HistoryContextMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model": {
             "description": "Configuration overrides for the forked thread, if any.",
             "type": [
@@ -15319,6 +15356,9 @@
           "cwd": {
             "type": "string"
           },
+          "historyContextMode": {
+            "$ref": "#/definitions/v2/HistoryContextMode"
+          },
           "model": {
             "type": "string"
           },
@@ -15355,6 +15395,7 @@
         "required": [
           "approvalPolicy",
           "cwd",
+          "historyContextMode",
           "model",
           "modelProvider",
           "sandbox",
@@ -16357,6 +16398,16 @@
               "null"
             ]
           },
+          "historyContextMode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/HistoryContextMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model": {
             "description": "Configuration overrides for the resumed thread, if any.",
             "type": [
@@ -16426,6 +16477,9 @@
           "cwd": {
             "type": "string"
           },
+          "historyContextMode": {
+            "$ref": "#/definitions/v2/HistoryContextMode"
+          },
           "model": {
             "type": "string"
           },
@@ -16462,6 +16516,7 @@
         "required": [
           "approvalPolicy",
           "cwd",
+          "historyContextMode",
           "model",
           "modelProvider",
           "sandbox",
@@ -16596,6 +16651,16 @@
               "null"
             ]
           },
+          "historyContextMode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/HistoryContextMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model": {
             "type": [
               "string",
@@ -16664,6 +16729,9 @@
           "cwd": {
             "type": "string"
           },
+          "historyContextMode": {
+            "$ref": "#/definitions/v2/HistoryContextMode"
+          },
           "model": {
             "type": "string"
           },
@@ -16700,6 +16768,7 @@
         "required": [
           "approvalPolicy",
           "cwd",
+          "historyContextMode",
           "model",
           "modelProvider",
           "sandbox",

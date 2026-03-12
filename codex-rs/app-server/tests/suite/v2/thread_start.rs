@@ -12,6 +12,7 @@ use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_core::config::set_project_trust_level;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -206,6 +207,42 @@ async fn thread_start_accepts_flex_service_tier() -> Result<()> {
     let ThreadStartResponse { service_tier, .. } = to_response::<ThreadStartResponse>(resp)?;
 
     assert_eq!(service_tier, Some(ServiceTier::Flex));
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_returns_requested_history_context_mode() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            history_context_mode: Some(HistoryContextMode::ScrollingWindow),
+            ..Default::default()
+        })
+        .await?;
+
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let resp_result = resp.result.clone();
+    let ThreadStartResponse {
+        history_context_mode,
+        ..
+    } = to_response::<ThreadStartResponse>(resp)?;
+
+    assert_eq!(history_context_mode, HistoryContextMode::ScrollingWindow);
+    assert_eq!(
+        resp_result.get("historyContextMode"),
+        Some(&Value::String("scrolling_window".to_string()))
+    );
     Ok(())
 }
 

@@ -230,6 +230,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
         .send_thread_start_request(ThreadStartParams {
             model: None,
             model_provider: None,
+            history_context_mode: None,
             service_tier: None,
             cwd: None,
             approval_policy: None,

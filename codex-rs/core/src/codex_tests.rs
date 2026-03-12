@@ -952,9 +952,17 @@ async fn recompute_token_usage_uses_session_base_instructions() {
     let expected_tokens = history
         .estimate_token_count_with_base_instructions(&session_base_instructions)
         .expect("estimate with session base instructions");
-    let model_estimated_tokens = history
-        .estimate_token_count(&turn_context)
-        .expect("estimate with model instructions");
+    let personality = turn_context.personality.or(turn_context.config.personality);
+    let model_base_instructions = BaseInstructions {
+        text: turn_context.model_info.get_model_instructions(personality),
+    };
+    let model_estimated_tokens = crate::scrolling_context::estimate_prompt_token_count(
+        history.clone(),
+        &turn_context,
+        None,
+        &model_base_instructions,
+    )
+    .expect("estimate with model instructions");
     assert_ne!(expected_tokens, model_estimated_tokens);
 
     session.recompute_token_usage(&turn_context).await;
@@ -1584,7 +1592,7 @@ fn background_auto_compaction_for_test(
 }
 
 #[tokio::test]
-async fn background_auto_compactions_can_overlap_for_newer_snapshot_ranges_only() {
+async fn background_auto_compactions_are_single_flight_while_one_is_in_progress() {
     let mut active_turn = crate::state::ActiveTurn::default();
 
     assert!(active_turn.can_start_background_auto_compaction(2));
@@ -1608,26 +1616,17 @@ async fn background_auto_compactions_can_overlap_for_newer_snapshot_ranges_only(
         !active_turn.can_start_background_auto_compaction(1),
         "older-range launches should be skipped"
     );
-    assert!(active_turn.can_start_background_auto_compaction(3));
-    let second_launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
     assert!(
-        active_turn.set_background_auto_compaction(background_auto_compaction_for_test(
-            "snapshot-2",
-            vec![
-                user_message("captured user"),
-                assistant_message("captured reply"),
-                assistant_message("newer tail"),
-            ],
-            second_launch_ordinal,
-        ))
+        !active_turn.can_start_background_auto_compaction(3),
+        "newer-range launches should also be skipped while a background compaction is active"
     );
 }
 
 #[tokio::test]
-async fn completed_background_auto_compactions_stay_launch_ordered() {
+async fn completed_background_auto_compactions_keep_new_launches_closed_for_the_turn() {
     let mut active_turn = crate::state::ActiveTurn::default();
 
-    let first_launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
+    let launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
     assert!(
         active_turn.set_background_auto_compaction(background_auto_compaction_for_test(
             "snapshot-1",
@@ -1635,53 +1634,34 @@ async fn completed_background_auto_compactions_stay_launch_ordered() {
                 user_message("captured user"),
                 assistant_message("captured reply")
             ],
-            first_launch_ordinal,
-        ))
-    );
-    let second_launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
-    assert!(
-        active_turn.set_background_auto_compaction(background_auto_compaction_for_test(
-            "snapshot-2",
-            vec![
-                user_message("captured user"),
-                assistant_message("captured reply"),
-                assistant_message("newer tail"),
-            ],
-            second_launch_ordinal,
+            launch_ordinal,
         ))
     );
 
-    assert!(
-        active_turn
-            .finish_background_auto_compaction(
-                "snapshot-2",
-                crate::state::BackgroundAutoCompactionOutcome::Failed("later failed".to_string()),
-            )
-            .is_some()
-    );
     assert!(
         active_turn
             .finish_background_auto_compaction(
                 "snapshot-1",
-                crate::state::BackgroundAutoCompactionOutcome::Failed("earlier failed".to_string()),
+                crate::state::BackgroundAutoCompactionOutcome::Failed("failed".to_string()),
             )
             .is_some()
     );
 
-    let first_completed_background_auto_compaction = active_turn
-        .take_completed_background_auto_compaction()
-        .expect("first completed background auto compaction");
-    assert_eq!(
-        first_completed_background_auto_compaction.snapshot_marker,
-        "snapshot-1"
+    assert!(
+        !active_turn.can_start_background_auto_compaction(3),
+        "completed terminal state should keep background compaction closed until consumed"
     );
 
-    let second_completed_background_auto_compaction = active_turn
+    let completed_background_auto_compaction = active_turn
         .take_completed_background_auto_compaction()
-        .expect("second completed background auto compaction");
+        .expect("completed background auto compaction");
     assert_eq!(
-        second_completed_background_auto_compaction.snapshot_marker,
-        "snapshot-2"
+        completed_background_auto_compaction.snapshot_marker,
+        "snapshot-1"
+    );
+    assert!(
+        !active_turn.can_start_background_auto_compaction(3),
+        "consuming the terminal outcome should not reopen background compaction inside the same turn"
     );
 }
 
@@ -1894,94 +1874,6 @@ async fn apply_completed_background_auto_compaction_persists_spliced_history_for
 }
 
 #[tokio::test]
-async fn settle_completed_background_auto_compaction_defers_older_success_while_newer_run_exists() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        vec![UserInput::Text {
-            text: "hello".to_string(),
-            text_elements: Vec::new(),
-        }],
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
-
-    let older_snapshot_history = vec![
-        user_message("captured user"),
-        assistant_message("captured reply"),
-    ];
-    let newer_snapshot_history = vec![
-        user_message("captured user"),
-        assistant_message("captured reply"),
-        assistant_message("newer captured reply"),
-    ];
-    sess.replace_history(newer_snapshot_history.clone(), None)
-        .await;
-
-    {
-        let mut active = sess.active_turn.lock().await;
-        let active_turn = active.as_mut().expect("active turn");
-        let older_snapshot_marker = "snapshot-older".to_string();
-        let newer_snapshot_marker = "snapshot-newer".to_string();
-        assert!(
-            active_turn.set_background_auto_compaction(background_auto_compaction_for_test(
-                &older_snapshot_marker,
-                older_snapshot_history.clone(),
-                0,
-            ))
-        );
-        assert!(
-            active_turn.set_background_auto_compaction(background_auto_compaction_for_test(
-                &newer_snapshot_marker,
-                newer_snapshot_history.clone(),
-                1,
-            ))
-        );
-        let older_completed_item = active_turn.finish_background_auto_compaction(
-            &older_snapshot_marker,
-            crate::state::BackgroundAutoCompactionOutcome::Succeeded(Box::new(
-                crate::state::BackgroundAutoCompactionResult::Local(
-                    crate::compact::LocalCompactResult {
-                        replacement_history: vec![user_message("older replacement summary")],
-                        reference_context_item: None,
-                        compacted_item: CompactedItem {
-                            message: "older replacement summary".to_string(),
-                            replacement_history: None,
-                        },
-                    },
-                ),
-            )),
-        );
-        assert!(older_completed_item.is_some());
-    }
-
-    assert!(
-        !settle_completed_background_auto_compact_if_ready(&sess, &tc)
-            .await
-            .expect("older success should defer while newer run exists"),
-    );
-    assert_eq!(
-        sess.clone_history().await.raw_items(),
-        newer_snapshot_history
-    );
-    {
-        let mut active = sess.active_turn.lock().await;
-        let active_turn = active.as_mut().expect("active turn");
-        assert!(
-            active_turn
-                .take_completed_background_auto_compaction()
-                .is_some(),
-            "older success should remain queued while a newer run exists"
-        );
-    }
-
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
-
-#[tokio::test]
 async fn apply_completed_background_auto_compaction_skips_diverged_prefix() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     sess.spawn_task(
@@ -2117,8 +2009,8 @@ async fn failed_completed_background_auto_compaction_can_be_consumed_once() {
         }
 
         assert!(
-            active_turn.can_start_background_auto_compaction(3),
-            "consuming the failed terminal outcome should reopen background compaction"
+            !active_turn.can_start_background_auto_compaction(3),
+            "consuming the failed terminal outcome should still keep background compaction closed for the rest of the turn"
         );
         assert!(
             active_turn
@@ -2209,8 +2101,8 @@ async fn successful_completed_background_auto_compaction_can_be_consumed_once() 
         }
 
         assert!(
-            active_turn.can_start_background_auto_compaction(3),
-            "consuming the successful terminal outcome should reopen background compaction"
+            !active_turn.can_start_background_auto_compaction(3),
+            "consuming the successful terminal outcome should still keep background compaction closed for the rest of the turn"
         );
         assert!(
             active_turn
@@ -2260,8 +2152,8 @@ async fn aborted_background_auto_compaction_leaves_no_completed_terminal_state()
         background_auto_compaction.handle.abort();
 
         assert!(
-            active_turn.can_start_background_auto_compaction(3),
-            "aborting an in-flight background compaction should reopen background compaction"
+            !active_turn.can_start_background_auto_compaction(3),
+            "aborting an in-flight background compaction should still keep background compaction closed for the rest of the turn"
         );
         assert!(
             active_turn
@@ -4345,6 +4237,38 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     let mut expected_history = vec![compacted_summary];
     expected_history.extend(session.build_initial_context(&turn_context).await);
     assert_eq!(history.raw_items().to_vec(), expected_history);
+}
+
+#[tokio::test]
+async fn maybe_prime_subagent_context_before_pre_sampling_compaction_seeds_initial_context() {
+    let (session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn_context)
+        .expect("turn context should not be shared yet")
+        .session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::default(),
+        depth: 0,
+        agent_nickname: None,
+        agent_role: None,
+    });
+
+    let primed =
+        maybe_prime_subagent_context_before_pre_sampling_compaction(&session, &turn_context).await;
+
+    assert_eq!(primed, true);
+    assert_eq!(
+        session.clone_history().await.raw_items().to_vec(),
+        session.build_initial_context(&turn_context).await
+    );
+    assert_eq!(
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize primed context item"),
+        serde_json::to_value(Some(turn_context.to_turn_context_item()))
+            .expect("serialize expected context item")
+    );
+    assert!(
+        session.get_total_token_usage().await > 0,
+        "expected priming to seed estimated token usage before pre-sampling compaction"
+    );
 }
 
 #[tokio::test]

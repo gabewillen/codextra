@@ -68,6 +68,13 @@
       ],
       "type": "object"
     },
+    "HistoryContextMode": {
+      "enum": [
+        "compaction",
+        "scrolling_window"
+      ],
+      "type": "string"
+    },
     "Personality": {
       "enum": [
         "none",
@@ -132,6 +139,16 @@
       "type": [
         "boolean",
         "null"
+      ]
+    },
+    "historyContextMode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/HistoryContextMode"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "model": {

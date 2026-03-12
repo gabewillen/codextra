@@ -9,6 +9,7 @@ use crate::file_watcher::WatchRegistration;
 use crate::protocol::Event;
 use crate::protocol::Op;
 use crate::protocol::Submission;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ContentItem;
@@ -37,6 +38,7 @@ pub struct ThreadConfigSnapshot {
     pub ephemeral: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub personality: Option<Personality>,
+    pub history_context_mode: HistoryContextMode,
     pub session_source: SessionSource,
 }
 

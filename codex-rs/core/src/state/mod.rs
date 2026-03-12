@@ -9,4 +9,5 @@ pub(crate) use turn::BackgroundAutoCompaction;
 pub(crate) use turn::BackgroundAutoCompactionOutcome;
 pub(crate) use turn::BackgroundAutoCompactionResult;
 pub(crate) use turn::RunningTask;
+pub(crate) use turn::ScrollingContextState;
 pub(crate) use turn::TaskKind;

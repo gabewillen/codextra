@@ -5,6 +5,7 @@ use codex_core::built_in_model_providers;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -667,7 +668,7 @@ async fn manual_compact_emits_context_compaction_items() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
+async fn background_auto_compact_stays_single_flight_per_active_turn() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -783,12 +784,12 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let compact_requests = compact_mock.requests();
     assert!(
         !compact_requests.is_empty(),
-        "expected at least one compact request"
+        "expected at least one compact request from the single background compaction worker"
     );
     let compact_request = compact_requests
         .into_iter()
         .find(|request| request.body_contains_text(SUMMARIZATION_PROMPT))
-        .unwrap_or_else(|| compact_mock.single_request());
+        .expect("expected a compact request");
     assert!(
         compact_request
             .function_call_output_text(first_call_id)
@@ -935,6 +936,86 @@ async fn background_auto_compact_defaults_to_fifty_percent_used() {
 
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scrolling_window_mode_skips_background_auto_compaction() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_turn = sse(vec![
+        ev_function_call(
+            "call-scrolling-window-no-compact",
+            DUMMY_FUNCTION_NAME,
+            "{}",
+        ),
+        ev_completed_with_tokens("r1", 600),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", 50),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, continued_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(20);
+        config.history_context_mode = HistoryContextMode::ScrollingWindow;
+        set_test_compact_prompt(config);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "scrolling window mode should continue the turn without issuing a compaction request"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.body_contains_text(SUMMARIZATION_PROMPT)),
+        "scrolling window mode should not send the summarization prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_is_unavailable_in_scrolling_window_mode() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.history_context_mode = HistoryContextMode::ScrollingWindow;
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex.submit(Op::Compact).await.expect("submit /compact");
+
+    let error_message = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        error_message,
+        "/compact is unavailable when `history_context_mode = \"scrolling_window\"`"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

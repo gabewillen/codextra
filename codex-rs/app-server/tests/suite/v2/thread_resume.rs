@@ -37,6 +37,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -212,6 +213,51 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_accepts_history_context_mode_override() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            history_context_mode: Some(HistoryContextMode::ScrollingWindow),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume_result = resume_resp.result.clone();
+    let ThreadResumeResponse {
+        history_context_mode,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(history_context_mode, HistoryContextMode::ScrollingWindow);
+    assert_eq!(
+        resume_result.get("historyContextMode"),
+        Some(&json!("scrolling_window"))
+    );
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -35,6 +36,7 @@ pub(crate) struct ActiveTurn {
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
     background_auto_compactions: Vec<BackgroundAutoCompaction>,
     completed_background_auto_compactions: VecDeque<CompletedBackgroundAutoCompaction>,
+    background_auto_compaction_started: bool,
     next_background_auto_compaction_launch_ordinal: u64,
 }
 
@@ -45,6 +47,7 @@ impl Default for ActiveTurn {
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             background_auto_compactions: Vec::new(),
             completed_background_auto_compactions: VecDeque::new(),
+            background_auto_compaction_started: false,
             next_background_auto_compaction_launch_ordinal: 0,
         }
     }
@@ -115,27 +118,17 @@ impl ActiveTurn {
         self.tasks.drain(..).map(|(_, task)| task).collect()
     }
 
-    pub(crate) fn can_start_background_auto_compaction(&self, snapshot_history_len: usize) -> bool {
-        self.max_tracked_background_auto_compaction_snapshot_history_len()
-            .is_none_or(|max_snapshot_history_len| snapshot_history_len > max_snapshot_history_len)
+    pub(crate) fn can_start_background_auto_compaction(
+        &self,
+        _snapshot_history_len: usize,
+    ) -> bool {
+        !self.background_auto_compaction_started
     }
 
     pub(crate) fn next_background_auto_compaction_launch_ordinal(&mut self) -> u64 {
         let launch_ordinal = self.next_background_auto_compaction_launch_ordinal;
         self.next_background_auto_compaction_launch_ordinal += 1;
         launch_ordinal
-    }
-
-    fn max_tracked_background_auto_compaction_snapshot_history_len(&self) -> Option<usize> {
-        self.background_auto_compactions
-            .iter()
-            .map(|background_auto_compaction| background_auto_compaction.snapshot_history_len)
-            .chain(self.completed_background_auto_compactions.iter().map(
-                |completed_background_auto_compaction| {
-                    completed_background_auto_compaction.snapshot_history_len
-                },
-            ))
-            .max()
     }
 
     pub(crate) fn insert_completed_background_auto_compaction(
@@ -165,6 +158,7 @@ impl ActiveTurn {
         }
         self.background_auto_compactions
             .push(background_auto_compaction);
+        self.background_auto_compaction_started = true;
         true
     }
 
@@ -361,8 +355,15 @@ pub(crate) struct TurnState {
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<ResponseInputItem>,
     granted_permissions: Option<PermissionProfile>,
+    pub(crate) scrolling_context: Option<ScrollingContextState>,
     pub(crate) tool_calls: u64,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScrollingContextState {
+    pub(crate) injected_ranges: Vec<Range<usize>>,
+    pub(crate) scroll_range: Option<Range<usize>>,
 }
 
 impl TurnState {

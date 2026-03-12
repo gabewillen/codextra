@@ -64,6 +64,7 @@ use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::ContextCompactedEvent;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -2013,6 +2014,18 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
         s.push('\n');
     }
     s
+}
+
+#[tokio::test]
+async fn context_compacted_event_does_not_insert_chat_history() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "context-compacted".into(),
+        msg: EventMsg::ContextCompacted(ContextCompactedEvent),
+    });
+
+    assert!(drain_insert_history(&mut rx).is_empty());
 }
 
 #[tokio::test]

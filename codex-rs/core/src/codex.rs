@@ -264,6 +264,8 @@ use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
 use crate::rollout::metadata;
 use crate::rollout::policy::EventPersistenceMode;
+use crate::scrolling_context::build_prompt_items;
+use crate::scrolling_context::estimate_prompt_token_count;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
@@ -282,6 +284,7 @@ use crate::state::ActiveTurn;
 use crate::state::BackgroundAutoCompaction;
 use crate::state::BackgroundAutoCompactionOutcome;
 use crate::state::BackgroundAutoCompactionResult;
+use crate::state::ScrollingContextState;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -314,6 +317,7 @@ use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_otel::metrics::names::THREAD_STARTED_METRIC;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
@@ -716,6 +720,7 @@ pub(crate) struct TurnContext {
     pub(crate) user_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) personality: Option<Personality>,
+    pub(crate) history_context_mode: HistoryContextMode,
     pub(crate) approval_policy: Constrained<AskForApproval>,
     pub(crate) sandbox_policy: Constrained<SandboxPolicy>,
     pub(crate) file_system_sandbox_policy: FileSystemSandboxPolicy,
@@ -787,6 +792,7 @@ impl TurnContext {
                 .await,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
+            history_context_mode: self.history_context_mode,
             session_source: self.session_source.clone(),
         })
         .with_web_search_config(self.tools_config.web_search_config.clone())
@@ -817,6 +823,7 @@ impl TurnContext {
             user_instructions: self.user_instructions.clone(),
             collaboration_mode,
             personality: self.personality,
+            history_context_mode: self.history_context_mode,
             approval_policy: self.approval_policy.clone(),
             sandbox_policy: self.sandbox_policy.clone(),
             file_system_sandbox_policy: self.file_system_sandbox_policy.clone(),
@@ -971,6 +978,7 @@ impl SessionConfiguration {
             ephemeral: self.original_config_do_not_use.ephemeral,
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
             personality: self.personality,
+            history_context_mode: self.original_config_do_not_use.history_context_mode,
             session_source: self.session_source.clone(),
         }
     }
@@ -1197,6 +1205,7 @@ impl Session {
             available_models: &models_manager.try_list_models().unwrap_or_default(),
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
+            history_context_mode: per_turn_config.history_context_mode,
             session_source: session_source.clone(),
         })
         .with_web_search_config(per_turn_config.web_search_config.clone())
@@ -1235,6 +1244,9 @@ impl Session {
             user_instructions: session_configuration.user_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             personality: session_configuration.personality,
+            history_context_mode: session_configuration
+                .original_config_do_not_use
+                .history_context_mode,
             approval_policy: session_configuration.approval_policy.clone(),
             sandbox_policy: session_configuration.sandbox_policy.clone(),
             file_system_sandbox_policy: session_configuration.file_system_sandbox_policy.clone(),
@@ -1874,8 +1886,15 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Option<i64> {
-        let state = self.state.lock().await;
-        state.history.estimate_token_count(turn_context)
+        let history = self.clone_history().await;
+        let base_instructions = self.get_base_instructions().await;
+        let scrolling_context = self.scrolling_context_state(&turn_context.sub_id).await;
+        estimate_prompt_token_count(
+            history,
+            turn_context,
+            scrolling_context.as_ref(),
+            &base_instructions,
+        )
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
@@ -3487,6 +3506,15 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn prompt_items_for_turn(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Vec<ResponseItem> {
+        let history = self.clone_history().await;
+        let scrolling_context = self.scrolling_context_state(&turn_context.sub_id).await;
+        build_prompt_items(history, turn_context, scrolling_context.as_ref())
+    }
+
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
         let state = self.state.lock().await;
         state.reference_context_item()
@@ -3575,11 +3603,14 @@ impl Session {
     }
 
     async fn refresh_last_token_usage_from_history(&self, turn_context: &TurnContext) {
-        let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
-        let Some(estimated_total_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        else {
+        let scrolling_context = self.scrolling_context_state(&turn_context.sub_id).await;
+        let Some(estimated_total_tokens) = estimate_prompt_token_count(
+            self.clone_history().await,
+            turn_context,
+            scrolling_context.as_ref(),
+            &base_instructions,
+        ) else {
             return;
         };
         {
@@ -3604,6 +3635,35 @@ impl Session {
 
             state.set_token_info(Some(info));
         }
+    }
+
+    pub(crate) async fn scrolling_context_state(
+        &self,
+        sub_id: &str,
+    ) -> Option<ScrollingContextState> {
+        let active = self.active_turn.lock().await;
+        let active_turn = active.as_ref()?;
+        if !active_turn.tasks.contains_key(sub_id) {
+            return None;
+        }
+        let turn_state = active_turn.turn_state.lock().await;
+        turn_state.scrolling_context.clone()
+    }
+
+    pub(crate) async fn set_scrolling_context_state(
+        &self,
+        turn_context: &TurnContext,
+        scrolling_context: Option<ScrollingContextState>,
+    ) {
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.scrolling_context = scrolling_context;
     }
 
     pub(crate) async fn update_rate_limits(
@@ -4814,6 +4874,22 @@ mod handlers {
 
     pub async fn compact(sess: &Arc<Session>, sub_id: String) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        if matches!(
+            turn_context.history_context_mode,
+            codex_protocol::config_types::HistoryContextMode::ScrollingWindow
+        ) {
+            sess.send_event_raw(Event {
+                id: turn_context.sub_id.clone(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message:
+                        "/compact is unavailable when `history_context_mode = \"scrolling_window\"`"
+                            .to_string(),
+                    codex_error_info: None,
+                }),
+            })
+            .await;
+            return;
+        }
 
         sess.spawn_task(
             Arc::clone(&turn_context),
@@ -5178,6 +5254,7 @@ async fn spawn_review_thread(
             .await,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
+        history_context_mode: parent_turn_context.history_context_mode,
         session_source: parent_turn_context.session_source.clone(),
     })
     .with_web_search_config(None)
@@ -5251,6 +5328,7 @@ async fn spawn_review_thread(
         compact_prompt: parent_turn_context.compact_prompt.clone(),
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
+        history_context_mode: parent_turn_context.history_context_mode,
         approval_policy: parent_turn_context.approval_policy.clone(),
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         file_system_sandbox_policy: parent_turn_context.file_system_sandbox_policy.clone(),
@@ -5382,6 +5460,8 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
+    let preseeded_subagent_context =
+        maybe_prime_subagent_context_before_pre_sampling_compaction(&sess, &turn_context).await;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -5396,8 +5476,10 @@ pub(crate) async fn run_turn(
 
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
 
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
-        .await;
+    if !preseeded_subagent_context || sess.reference_context_item().await.is_none() {
+        sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+            .await;
+    }
 
     let loaded_plugins = sess
         .services
@@ -5569,6 +5651,9 @@ pub(crate) async fn run_turn(
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    if turn_context.config.history_context_mode == HistoryContextMode::ScrollingWindow {
+        sess.recompute_token_usage(turn_context.as_ref()).await;
+    }
 
     loop {
         if let Some(session_start_source) = sess.take_pending_session_start_source().await {
@@ -5661,11 +5746,8 @@ pub(crate) async fn run_turn(
         }
 
         // Construct the input that we will send to the model.
-        let mut sampling_request_input: Vec<ResponseItem> = {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
-        };
+        let mut sampling_request_input: Vec<ResponseItem> =
+            { sess.prompt_items_for_turn(turn_context.as_ref()).await };
         if let Some(stop_hook_message) = pending_stop_hook_message.take() {
             sampling_request_input.push(DeveloperInstructions::new(stop_hook_message).into());
         }
@@ -5725,7 +5807,8 @@ pub(crate) async fn run_turn(
                 );
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached
+                if turn_context.history_context_mode != HistoryContextMode::ScrollingWindow
+                    && token_limit_reached
                     && needs_follow_up
                     && start_background_auto_compact(
                         &sess,
@@ -5897,10 +5980,30 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
+async fn maybe_prime_subagent_context_before_pre_sampling_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> bool {
+    if !matches!(turn_context.session_source, SessionSource::SubAgent(_)) {
+        return false;
+    }
+    if sess.reference_context_item().await.is_some() {
+        return false;
+    }
+
+    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+        .await;
+    sess.recompute_token_usage(turn_context.as_ref()).await;
+    true
+}
+
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
+    if turn_context.history_context_mode == HistoryContextMode::ScrollingWindow {
+        return Ok(());
+    }
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     maybe_run_previous_model_inline_compact(
         sess,

@@ -188,6 +188,7 @@ Start a fresh thread when you need a new Codex conversation.
     // Optionally set config settings. If not specified, will use the user's
     // current config settings.
     "model": "gpt-5.1-codex",
+    "historyContextMode": "scrolling_window",
     "cwd": "/Users/me/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
@@ -214,12 +215,15 @@ Start a fresh thread when you need a new Codex conversation.
         "preview": "",
         "modelProvider": "openai",
         "createdAt": 1730910000
-    }
+    },
+    "historyContextMode": "scrolling_window"
 } }
 { "method": "thread/started", "params": { "thread": { … } } }
 ```
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
+
+Set `historyContextMode` to `"scrolling_window"` to disable compaction for that thread and let the model use the built-in `conversation_history` tool to scroll or search older transcript slices. Responses from `thread/start`, `thread/resume`, and `thread/fork` echo the resolved `historyContextMode`.
 
 To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, such as `personality`:
 

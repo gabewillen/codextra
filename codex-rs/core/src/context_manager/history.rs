@@ -1,4 +1,3 @@
-use crate::codex::TurnContext;
 use crate::context_manager::normalize;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::truncate::TruncationPolicy;
@@ -117,17 +116,6 @@ impl ContextManager {
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
-    }
-
-    // Estimate token usage using byte-based heuristics from the truncation helpers.
-    // This is a coarse lower bound, not a tokenizer-accurate count.
-    pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
-        let model_info = &turn_context.model_info;
-        let personality = turn_context.personality.or(turn_context.config.personality);
-        let base_instructions = BaseInstructions {
-            text: model_info.get_model_instructions(personality),
-        };
-        self.estimate_token_count_with_base_instructions(&base_instructions)
     }
 
     pub(crate) fn estimate_token_count_with_base_instructions(

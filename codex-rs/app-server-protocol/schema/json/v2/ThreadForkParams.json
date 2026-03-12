@@ -51,6 +51,13 @@
         }
       ]
     },
+    "HistoryContextMode": {
+      "enum": [
+        "compaction",
+        "scrolling_window"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -106,6 +113,16 @@
     },
     "ephemeral": {
       "type": "boolean"
+    },
+    "historyContextMode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/HistoryContextMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "model": {
       "description": "Configuration overrides for the forked thread, if any.",
