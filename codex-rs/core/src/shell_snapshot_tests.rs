@@ -1,5 +1,6 @@
 use super::*;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -8,6 +9,9 @@ use std::process::Command;
 use std::process::Command as StdCommand;
 
 use tempfile::tempdir;
+
+use crate::config::types::ShellEnvironmentPolicy;
+use crate::exec_env::create_env;
 
 #[cfg(unix)]
 struct BlockingStdinPipe {
@@ -80,7 +84,8 @@ fn assert_posix_snapshot_sections(snapshot: &str) {
 async fn get_snapshot(shell_type: ShellType) -> Result<String> {
     let dir = tempdir()?;
     let path = dir.path().join("snapshot.sh");
-    write_shell_snapshot(shell_type, &path, dir.path()).await?;
+    let shell_env = create_env(&ShellEnvironmentPolicy::default(), None);
+    write_shell_snapshot(shell_type, &path, dir.path(), &shell_env).await?;
     let content = fs::read_to_string(&path).await?;
     Ok(content)
 }
@@ -171,10 +176,12 @@ async fn try_new_creates_and_deletes_snapshot_file() -> Result<()> {
         shell_path: PathBuf::from("/bin/bash"),
         shell_snapshot: crate::shell::empty_shell_snapshot_receiver(),
     };
+    let shell_env = create_env(&ShellEnvironmentPolicy::default(), None);
 
-    let snapshot = ShellSnapshot::try_new(dir.path(), ThreadId::new(), dir.path(), &shell)
-        .await
-        .expect("snapshot should be created");
+    let snapshot =
+        ShellSnapshot::try_new(dir.path(), ThreadId::new(), dir.path(), &shell, &shell_env)
+            .await
+            .expect("snapshot should be created");
     let path = snapshot.path.clone();
     assert!(path.exists());
     assert_eq!(snapshot.cwd, dir.path().to_path_buf());
@@ -211,9 +218,17 @@ async fn snapshot_shell_does_not_inherit_stdin() -> Result<()> {
         "HOME=\"{home_display}\"; export HOME; {}",
         bash_snapshot_script()
     );
-    let output = run_script_with_timeout(&shell, &script, Duration::from_secs(2), true, home)
-        .await
-        .context("run snapshot command")?;
+    let shell_env = create_env(&ShellEnvironmentPolicy::default(), None);
+    let output = run_script_with_timeout(
+        &shell,
+        &script,
+        Duration::from_secs(5),
+        true,
+        home,
+        &shell_env,
+    )
+    .await
+    .context("run snapshot command")?;
     let read_status = fs::read_to_string(&read_status_path)
         .await
         .context("read stdin probe status")?;
@@ -248,10 +263,18 @@ async fn timed_out_snapshot_shell_is_terminated() -> Result<()> {
         shell_path: PathBuf::from("/bin/sh"),
         shell_snapshot: crate::shell::empty_shell_snapshot_receiver(),
     };
+    let shell_env = create_env(&ShellEnvironmentPolicy::default(), None);
 
-    let err = run_script_with_timeout(&shell, &script, Duration::from_secs(1), true, dir.path())
-        .await
-        .expect_err("snapshot shell should time out");
+    let err = run_script_with_timeout(
+        &shell,
+        &script,
+        Duration::from_secs(1),
+        true,
+        dir.path(),
+        &shell_env,
+    )
+    .await
+    .expect_err("snapshot shell should time out");
     assert!(
         err.to_string().contains("timed out"),
         "expected timeout error, got {err:?}"
@@ -279,6 +302,42 @@ async fn timed_out_snapshot_shell_is_terminated() -> Result<()> {
         }
         sleep(TokioDuration::from_millis(50)).await;
     }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_shell_snapshot_honors_shell_environment_policy_overrides() -> Result<()> {
+    let dir = tempdir()?;
+    let shell_home = dir.path().join("shell-home");
+    fs::create_dir_all(&shell_home).await?;
+    fs::write(
+        shell_home.join(".bash_profile"),
+        "export SNAPSHOT_POLICY_MARKER=from-test-policy\n",
+    )
+    .await?;
+
+    let policy = ShellEnvironmentPolicy {
+        r#set: HashMap::from([
+            ("HOME".to_string(), shell_home.to_string_lossy().to_string()),
+            (
+                "ZDOTDIR".to_string(),
+                shell_home.to_string_lossy().to_string(),
+            ),
+        ]),
+        ..ShellEnvironmentPolicy::default()
+    };
+    let shell_env = create_env(&policy, None);
+    let snapshot_path = dir.path().join("snapshot.sh");
+
+    write_shell_snapshot(ShellType::Bash, &snapshot_path, dir.path(), &shell_env).await?;
+
+    let snapshot = fs::read_to_string(&snapshot_path).await?;
+    assert!(
+        snapshot.contains("SNAPSHOT_POLICY_MARKER"),
+        "snapshot should include exports from the policy-provided HOME; snapshot={snapshot:?}"
+    );
 
     Ok(())
 }

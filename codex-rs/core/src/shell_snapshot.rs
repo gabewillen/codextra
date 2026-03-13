@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use crate::config::types::ShellEnvironmentPolicy;
+use crate::exec_env::create_env;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -16,6 +18,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use std::collections::HashMap;
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -40,6 +43,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: PathBuf,
         shell: &mut Shell,
+        shell_environment_policy: ShellEnvironmentPolicy,
         session_telemetry: SessionTelemetry,
     ) -> watch::Sender<Option<Arc<ShellSnapshot>>> {
         let (shell_snapshot_tx, shell_snapshot_rx) = watch::channel(None);
@@ -50,6 +54,7 @@ impl ShellSnapshot {
             session_id,
             session_cwd,
             shell.clone(),
+            shell_environment_policy,
             shell_snapshot_tx.clone(),
             session_telemetry,
         );
@@ -62,6 +67,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: PathBuf,
         shell: Shell,
+        shell_environment_policy: ShellEnvironmentPolicy,
         shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
         session_telemetry: SessionTelemetry,
     ) {
@@ -70,6 +76,7 @@ impl ShellSnapshot {
             session_id,
             session_cwd,
             shell,
+            shell_environment_policy,
             shell_snapshot_tx,
             session_telemetry,
         );
@@ -80,6 +87,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: PathBuf,
         snapshot_shell: Shell,
+        shell_environment_policy: ShellEnvironmentPolicy,
         shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
         session_telemetry: SessionTelemetry,
     ) {
@@ -87,11 +95,13 @@ impl ShellSnapshot {
         tokio::spawn(
             async move {
                 let timer = session_telemetry.start_timer("codex.shell_snapshot.duration_ms", &[]);
+                let shell_env = create_env(&shell_environment_policy, None);
                 let snapshot = ShellSnapshot::try_new(
                     &codex_home,
                     session_id,
                     session_cwd.as_path(),
                     &snapshot_shell,
+                    &shell_env,
                 )
                 .await
                 .map(Arc::new);
@@ -114,6 +124,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: &Path,
         shell: &Shell,
+        shell_env: &HashMap<String, String>,
     ) -> std::result::Result<Self, &'static str> {
         // File to store the snapshot
         let extension = match shell.shell_type {
@@ -141,27 +152,35 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        let temp_path =
-            match write_shell_snapshot(shell.shell_type.clone(), &temp_path, session_cwd).await {
-                Ok(path) => {
-                    tracing::info!("Shell snapshot successfully created: {}", path.display());
-                    path
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to create shell snapshot for {}: {err:?}",
-                        shell.name()
-                    );
-                    return Err("write_failed");
-                }
-            };
+        let temp_path = match write_shell_snapshot(
+            shell.shell_type.clone(),
+            &temp_path,
+            session_cwd,
+            shell_env,
+        )
+        .await
+        {
+            Ok(path) => {
+                tracing::info!("Shell snapshot successfully created: {}", path.display());
+                path
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to create shell snapshot for {}: {err:?}",
+                    shell.name()
+                );
+                return Err("write_failed");
+            }
+        };
 
         let temp_snapshot = Self {
             path: temp_path.clone(),
             cwd: session_cwd.to_path_buf(),
         };
 
-        if let Err(err) = validate_snapshot(shell, &temp_snapshot.path, session_cwd).await {
+        if let Err(err) =
+            validate_snapshot(shell, &temp_snapshot.path, session_cwd, shell_env).await
+        {
             tracing::error!("Shell snapshot validation failed: {err:?}");
             remove_snapshot_file(&temp_snapshot.path).await;
             return Err("validation_failed");
@@ -195,6 +214,7 @@ async fn write_shell_snapshot(
     shell_type: ShellType,
     output_path: &Path,
     cwd: &Path,
+    shell_env: &HashMap<String, String>,
 ) -> Result<PathBuf> {
     if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
         bail!("Shell snapshot not supported yet for {shell_type:?}");
@@ -202,7 +222,7 @@ async fn write_shell_snapshot(
     let shell = get_shell(shell_type.clone(), None)
         .with_context(|| format!("No available shell for {shell_type:?}"))?;
 
-    let raw_snapshot = capture_snapshot(&shell, cwd).await?;
+    let raw_snapshot = capture_snapshot(&shell, cwd, shell_env).await?;
     let snapshot = strip_snapshot_preamble(&raw_snapshot)?;
 
     if let Some(parent) = output_path.parent() {
@@ -220,13 +240,19 @@ async fn write_shell_snapshot(
     Ok(output_path.to_path_buf())
 }
 
-async fn capture_snapshot(shell: &Shell, cwd: &Path) -> Result<String> {
+async fn capture_snapshot(
+    shell: &Shell,
+    cwd: &Path,
+    shell_env: &HashMap<String, String>,
+) -> Result<String> {
     let shell_type = shell.shell_type.clone();
     match shell_type {
-        ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd).await,
-        ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd).await,
-        ShellType::Sh => run_shell_script(shell, &sh_snapshot_script(), cwd).await,
-        ShellType::PowerShell => run_shell_script(shell, powershell_snapshot_script(), cwd).await,
+        ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd, shell_env).await,
+        ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd, shell_env).await,
+        ShellType::Sh => run_shell_script(shell, &sh_snapshot_script(), cwd, shell_env).await,
+        ShellType::PowerShell => {
+            run_shell_script(shell, powershell_snapshot_script(), cwd, shell_env).await
+        }
         ShellType::Cmd => bail!("Shell snapshotting is not yet supported for {shell_type:?}"),
     }
 }
@@ -240,16 +266,26 @@ fn strip_snapshot_preamble(snapshot: &str) -> Result<String> {
     Ok(snapshot[start..].to_string())
 }
 
-async fn validate_snapshot(shell: &Shell, snapshot_path: &Path, cwd: &Path) -> Result<()> {
+async fn validate_snapshot(
+    shell: &Shell,
+    snapshot_path: &Path,
+    cwd: &Path,
+    shell_env: &HashMap<String, String>,
+) -> Result<()> {
     let snapshot_path_display = snapshot_path.display();
     let script = format!("set -e; . \"{snapshot_path_display}\"");
-    run_script_with_timeout(shell, &script, SNAPSHOT_TIMEOUT, false, cwd)
+    run_script_with_timeout(shell, &script, SNAPSHOT_TIMEOUT, false, cwd, shell_env)
         .await
         .map(|_| ())
 }
 
-async fn run_shell_script(shell: &Shell, script: &str, cwd: &Path) -> Result<String> {
-    run_script_with_timeout(shell, script, SNAPSHOT_TIMEOUT, true, cwd).await
+async fn run_shell_script(
+    shell: &Shell,
+    script: &str,
+    cwd: &Path,
+    shell_env: &HashMap<String, String>,
+) -> Result<String> {
+    run_script_with_timeout(shell, script, SNAPSHOT_TIMEOUT, true, cwd, shell_env).await
 }
 
 async fn run_script_with_timeout(
@@ -258,6 +294,7 @@ async fn run_script_with_timeout(
     snapshot_timeout: Duration,
     use_login_shell: bool,
     cwd: &Path,
+    shell_env: &HashMap<String, String>,
 ) -> Result<String> {
     let args = shell.derive_exec_args(script, use_login_shell);
     let shell_name = shell.name();
@@ -268,6 +305,8 @@ async fn run_script_with_timeout(
     handler.args(&args[1..]);
     handler.stdin(Stdio::null());
     handler.current_dir(cwd);
+    handler.env_clear();
+    handler.envs(shell_env);
     #[cfg(unix)]
     unsafe {
         handler.pre_exec(|| {

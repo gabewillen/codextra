@@ -2,6 +2,7 @@ use super::*;
 use crate::CodexAuth;
 use crate::config::ConfigBuilder;
 use crate::config::test_config;
+use crate::config::types::ShellEnvironmentPolicy;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigLayerStackOrdering;
 use crate::config_loader::NetworkConstraints;
@@ -3003,6 +3004,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
+        shell_environment_policy: ShellEnvironmentPolicy::default(),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
@@ -3645,6 +3647,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
+        shell_environment_policy: ShellEnvironmentPolicy::default(),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,

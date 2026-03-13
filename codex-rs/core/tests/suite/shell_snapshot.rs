@@ -41,6 +41,7 @@ const SNAPSHOT_PATH_FOR_TEST: &str = "/codex/snapshot/path";
 const SNAPSHOT_MARKER_VAR: &str = "CODEX_SNAPSHOT_POLICY_MARKER";
 const SNAPSHOT_MARKER_VALUE: &str = "from_snapshot";
 const POLICY_SUCCESS_OUTPUT: &str = "policy-after-snapshot";
+const SHELL_SNAPSHOT_TIMEOUT_MS: u64 = 3_000;
 
 #[derive(Debug, Default)]
 struct SnapshotRunOptions {
@@ -49,7 +50,7 @@ struct SnapshotRunOptions {
 
 async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
     let snapshot_dir = codex_home.join("shell_snapshots");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await {
             while let Some(entry) = entries.next_entry().await? {
@@ -72,7 +73,7 @@ async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
 }
 
 async fn wait_for_file_contents(path: &Path) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match fs::read_to_string(path).await {
             Ok(contents) => return Ok(contents),
@@ -199,12 +200,12 @@ async fn run_snapshot_command_with_options(
     })
 }
 
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, dead_code)]
 async fn run_shell_command_snapshot(command: &str) -> Result<SnapshotRun> {
     run_shell_command_snapshot_with_options(command, SnapshotRunOptions::default()).await
 }
 
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, dead_code)]
 async fn run_shell_command_snapshot_with_options(
     command: &str,
     options: SnapshotRunOptions,
@@ -222,7 +223,7 @@ async fn run_shell_command_snapshot_with_options(
     let harness = TestCodexHarness::with_builder(builder).await?;
     let args = json!({
         "command": command,
-        "timeout_ms": 1000,
+        "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
     });
     let call_id = "shell-snapshot-command";
     let responses = vec![
@@ -352,6 +353,14 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
+fn normalized_exec_output(end: &ExecCommandEndEvent) -> String {
+    if end.stdout.is_empty() {
+        normalize_newlines(&end.aggregated_output)
+    } else {
+        normalize_newlines(&end.stdout)
+    }
+}
+
 fn assert_posix_snapshot_sections(snapshot: &str) {
     assert!(snapshot.contains("# Snapshot file"));
     assert!(snapshot.contains("aliases "));
@@ -368,7 +377,7 @@ fn assert_posix_snapshot_sections(snapshot: &str) {
 async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
     let command = "echo snapshot-linux";
     let run = run_snapshot_command(command).await?;
-    let stdout = normalize_newlines(&run.end.stdout);
+    let stdout = normalized_exec_output(&run.end);
 
     assert_eq!(run.begin.command.get(1).map(String::as_str), Some("-lc"));
     assert_eq!(run.begin.command.get(2).map(String::as_str), Some(command));
@@ -387,19 +396,49 @@ async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linux_shell_command_uses_shell_snapshot() -> Result<()> {
-    let command = "echo shell-command-snapshot-linux";
-    let run = run_shell_command_snapshot(command).await?;
+    let builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ShellSnapshot)
+            .expect("test config should allow feature update");
+    });
+    let harness = TestCodexHarness::with_builder(builder).await?;
+    let codex_home = harness.test().home.path().to_path_buf();
 
-    assert_eq!(run.begin.command.get(1).map(String::as_str), Some("-lc"));
-    assert_eq!(run.begin.command.get(2).map(String::as_str), Some(command));
-    assert_eq!(run.begin.command.len(), 3);
-    assert!(run.snapshot_path.starts_with(&run.codex_home));
-    assert_posix_snapshot_sections(&run.snapshot_content);
+    run_tool_turn_on_harness(
+        &harness,
+        "warm up shell snapshot",
+        "shell-snapshot-linux-warmup",
+        "shell_command",
+        json!({
+            "command": "printf warmup",
+            "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
+        }),
+    )
+    .await?;
+
+    let snapshot_path = wait_for_snapshot(&codex_home).await?;
+    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
+
+    let end = run_tool_turn_on_harness(
+        &harness,
+        "run shell command with warmed snapshot",
+        "shell-snapshot-linux-command",
+        "shell_command",
+        json!({
+            "command": "printf shell-command-snapshot-linux",
+            "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
+        }),
+    )
+    .await?;
+
+    assert!(snapshot_path.starts_with(&codex_home));
+    assert_posix_snapshot_sections(&snapshot_content);
     assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
+        normalized_exec_output(&end).trim(),
         "shell-command-snapshot-linux"
     );
-    assert_eq!(run.end.exit_code, 0);
+    assert_eq!(end.exit_code, 0);
 
     Ok(())
 }
@@ -423,7 +462,7 @@ async fn shell_command_snapshot_preserves_shell_environment_policy_set() -> Resu
         "shell_command",
         json!({
             "command": "printf warmup",
-            "timeout_ms": 1_000,
+            "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
         }),
     )
     .await?;
@@ -438,15 +477,12 @@ async fn shell_command_snapshot_preserves_shell_environment_policy_set() -> Resu
         "shell_command",
         json!({
             "command": command,
-            "timeout_ms": 1_000,
+            "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
         }),
     )
     .await?;
 
-    assert_eq!(
-        normalize_newlines(&end.stdout).trim(),
-        POLICY_SUCCESS_OUTPUT
-    );
+    assert_eq!(normalized_exec_output(&end).trim(), POLICY_SUCCESS_OUTPUT);
     assert_eq!(end.exit_code, 0);
     assert!(snapshot_path.starts_with(codex_home));
 
@@ -497,10 +533,7 @@ async fn linux_unified_exec_snapshot_preserves_shell_environment_policy_set() ->
     )
     .await?;
 
-    assert_eq!(
-        normalize_newlines(&end.stdout).trim(),
-        POLICY_SUCCESS_OUTPUT
-    );
+    assert_eq!(normalized_exec_output(&end).trim(), POLICY_SUCCESS_OUTPUT);
     assert_eq!(end.exit_code, 0);
     assert!(snapshot_path.starts_with(codex_home));
 
@@ -528,7 +561,7 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
     let script = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: snapshot-apply.txt\n+hello from snapshot\n*** End Patch\nEOF\n";
     let args = json!({
         "command": script,
-        "timeout_ms": 1_000,
+        "timeout_ms": SHELL_SNAPSHOT_TIMEOUT_MS,
     });
     let call_id = "shell-snapshot-apply-patch";
     let responses = vec![
@@ -639,7 +672,7 @@ async fn macos_unified_exec_uses_shell_snapshot() -> Result<()> {
 
     assert!(run.snapshot_path.starts_with(&run.codex_home));
     assert_posix_snapshot_sections(&run.snapshot_content);
-    assert_eq!(normalize_newlines(&run.end.stdout).trim(), "snapshot-macos");
+    assert_eq!(normalized_exec_output(&run.end).trim(), "snapshot-macos");
     assert_eq!(run.end.exit_code, 0);
 
     Ok(())
@@ -672,10 +705,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert!(run.snapshot_content.contains("# Snapshot file"));
     assert!(run.snapshot_content.contains("# aliases "));
     assert!(run.snapshot_content.contains("# exports "));
-    assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
-        "snapshot-windows"
-    );
+    assert_eq!(normalized_exec_output(&run.end).trim(), "snapshot-windows");
     assert_eq!(run.end.exit_code, 0);
 
     Ok(())

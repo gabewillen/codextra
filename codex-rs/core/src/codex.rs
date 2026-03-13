@@ -1621,6 +1621,7 @@ impl Session {
                     conversation_id,
                     session_configuration.cwd.clone(),
                     &mut default_shell,
+                    config.permissions.shell_environment_policy.clone(),
                     session_telemetry.clone(),
                 )
             }
@@ -1729,6 +1730,7 @@ impl Session {
             hooks,
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
+            shell_environment_policy: config.permissions.shell_environment_policy.clone(),
             shell_snapshot_tx,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             exec_policy,
@@ -2185,6 +2187,7 @@ impl Session {
             self.conversation_id,
             next_cwd.to_path_buf(),
             self.services.user_shell.as_ref().clone(),
+            self.services.shell_environment_policy.clone(),
             self.services.shell_snapshot_tx.clone(),
             self.services.session_telemetry.clone(),
         );
