@@ -16,6 +16,7 @@ use codex_protocol::approvals::NetworkPolicyRuleAction as CoreNetworkPolicyRuleA
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask as CoreCollaborationModeMask;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
@@ -519,6 +520,7 @@ pub struct ProfileV2 {
     pub model_provider: Option<String>,
     #[experimental(nested)]
     pub approval_policy: Option<AskForApproval>,
+    pub history_context_mode: Option<HistoryContextMode>,
     pub service_tier: Option<ServiceTier>,
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
@@ -615,6 +617,7 @@ pub struct Config {
     pub review_model: Option<String>,
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
+    pub history_context_mode: Option<HistoryContextMode>,
     pub model_provider: Option<String>,
     #[experimental(nested)]
     pub approval_policy: Option<AskForApproval>,
@@ -2258,6 +2261,8 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
+    pub history_context_mode: Option<HistoryContextMode>,
     #[serde(
         default,
         deserialize_with = "super::serde_helpers::deserialize_double_option",
@@ -2330,6 +2335,7 @@ pub struct ThreadStartResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub history_context_mode: HistoryContextMode,
     pub cwd: PathBuf,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
@@ -2372,6 +2378,8 @@ pub struct ThreadResumeParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
+    pub history_context_mode: Option<HistoryContextMode>,
     #[serde(
         default,
         deserialize_with = "super::serde_helpers::deserialize_double_option",
@@ -2410,6 +2418,7 @@ pub struct ThreadResumeResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub history_context_mode: HistoryContextMode,
     pub cwd: PathBuf,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
@@ -2443,6 +2452,8 @@ pub struct ThreadForkParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
+    pub history_context_mode: Option<HistoryContextMode>,
     #[serde(
         default,
         deserialize_with = "super::serde_helpers::deserialize_double_option",
@@ -2481,6 +2492,7 @@ pub struct ThreadForkResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub history_context_mode: HistoryContextMode,
     pub cwd: PathBuf,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
@@ -6269,6 +6281,7 @@ mod tests {
                 request_permissions: true,
                 mcp_elicitations: false,
             }),
+            history_context_mode: None,
             service_tier: None,
             model_reasoning_effort: None,
             model_reasoning_summary: None,
@@ -6289,6 +6302,7 @@ mod tests {
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            history_context_mode: None,
             model_provider: None,
             approval_policy: Some(AskForApproval::Reject {
                 sandbox_approval: false,
@@ -6327,6 +6341,7 @@ mod tests {
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            history_context_mode: None,
             model_provider: None,
             approval_policy: None,
             sandbox_mode: None,
@@ -6348,6 +6363,7 @@ mod tests {
                         request_permissions: false,
                         mcp_elicitations: true,
                     }),
+                    history_context_mode: None,
                     service_tier: None,
                     model_reasoning_effort: None,
                     model_reasoning_summary: None,

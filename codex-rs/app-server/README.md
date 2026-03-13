@@ -138,6 +138,7 @@ Example with notification opt-out:
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
+- Automatic background compaction during `turn/start` also uses standard `item/started` / `item/completed` notifications with `contextCompaction` items on the active turn. Clients should surface those as lightweight progress UI rather than as transcript messages.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
 - `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
@@ -187,6 +188,7 @@ Start a fresh thread when you need a new Codex conversation.
     // Optionally set config settings. If not specified, will use the user's
     // current config settings.
     "model": "gpt-5.1-codex",
+    "historyContextMode": "scrolling_window",
     "cwd": "/Users/me/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
@@ -213,12 +215,15 @@ Start a fresh thread when you need a new Codex conversation.
         "preview": "",
         "modelProvider": "openai",
         "createdAt": 1730910000
-    }
+    },
+    "historyContextMode": "scrolling_window"
 } }
 { "method": "thread/started", "params": { "thread": { … } } }
 ```
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
+
+Set `historyContextMode` to `"scrolling_window"` to disable compaction for that thread and let the model use the built-in `conversation_history` tool to scroll or search older transcript slices. Responses from `thread/start`, `thread/resume`, and `thread/fork` echo the resolved `historyContextMode`.
 
 To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, such as `personality`:
 
@@ -323,6 +328,8 @@ If this was the last subscriber, the server unloads the thread and emits `thread
 
 Use `thread/read` to fetch a stored thread by id without resuming it. Pass `includeTurns` when you want the rollout history loaded into `thread.turns`. The returned thread includes `agentNickname` and `agentRole` for AgentControl-spawned thread sub-agents when available.
 
+When a rollout contains compaction checkpoints, `thread.turns` reflects the persisted turn-item stream and compaction markers (`ContextCompaction` items / compaction-only turns). It does not synthesize extra thread items from compacted `replacementHistory` payloads.
+
 ```json
 { "method": "thread/read", "id": 22, "params": { "threadId": "thr_123" } }
 { "id": 22, "result": {
@@ -397,6 +404,7 @@ Progress is emitted as standard `turn/*` and `item/*` notifications on the same 
 - `item/completed` with the same `contextCompaction` item id
 
 While compaction is running, the thread is effectively in a turn so clients should surface progress UI based on the notifications.
+Although the RPC responds immediately, compaction itself still occupies the thread as a blocking turn; wait for the matching `turn/completed` before starting dependent turn work on that thread.
 
 ```json
 { "method": "thread/compact/start", "id": 25, "params": { "threadId": "thr_b" } }

@@ -31,6 +31,7 @@ use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
 use crate::state::ActiveTurn;
+use crate::state::BackgroundAutoCompaction;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_otel::SessionTelemetry;
@@ -246,6 +247,7 @@ impl Session {
         let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
         let mut turn_tool_calls = 0_u64;
+        let mut background_auto_compactions = Vec::new();
         if let Some(at) = active.as_mut()
             && at.remove_task(&turn_context.sub_id)
         {
@@ -253,12 +255,19 @@ impl Session {
             pending_input = ts.take_pending_input();
             turn_tool_calls = ts.tool_calls;
             token_usage_at_turn_start = Some(ts.token_usage_at_turn_start.clone());
+            drop(ts);
+            background_auto_compactions = at.take_all_background_auto_compactions();
+            at.clear_completed_background_auto_compactions();
             should_clear_active_turn = true;
         }
         if should_clear_active_turn {
             *active = None;
         }
         drop(active);
+        for background_auto_compaction in background_auto_compactions {
+            self.cancel_background_auto_compaction(background_auto_compaction)
+                .await;
+        }
         if !pending_input.is_empty() {
             let pending_response_items = pending_input
                 .into_iter()
@@ -386,7 +395,15 @@ impl Session {
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
-        active.take()
+        let mut active_turn = active.take()?;
+        let background_auto_compactions = active_turn.take_all_background_auto_compactions();
+        active_turn.clear_completed_background_auto_compactions();
+        drop(active);
+        for background_auto_compaction in background_auto_compactions {
+            self.cancel_background_auto_compaction(background_auto_compaction)
+                .await;
+        }
+        Some(active_turn)
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {
@@ -450,6 +467,41 @@ impl Session {
             reason,
         });
         self.send_event(task.turn_context.as_ref(), event).await;
+    }
+
+    async fn cancel_background_auto_compaction(
+        &self,
+        mut background_auto_compaction: BackgroundAutoCompaction,
+    ) {
+        if background_auto_compaction.cancellation_token.is_cancelled() {
+            return;
+        }
+
+        trace!(
+            snapshot_marker = %background_auto_compaction.snapshot_marker,
+            "aborting background auto compaction",
+        );
+        background_auto_compaction.cancellation_token.cancel();
+
+        select! {
+            result = &mut background_auto_compaction.handle => {
+                if let Err(err) = result {
+                    trace!(
+                        snapshot_marker = %background_auto_compaction.snapshot_marker,
+                        error = %err,
+                        "background auto compaction join failed after cancellation",
+                    );
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
+                warn!(
+                    "background auto compaction {} didn't complete gracefully after {}ms",
+                    background_auto_compaction.snapshot_marker,
+                    GRACEFULL_INTERRUPTION_TIMEOUT_MS,
+                );
+                background_auto_compaction.handle.abort();
+            }
+        }
     }
 }
 

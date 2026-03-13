@@ -168,6 +168,49 @@ fn filters_non_api_messages() {
 }
 
 #[test]
+fn splice_compacted_prefix_preserves_appended_tail_items() {
+    let captured_snapshot = vec![user_msg("first"), assistant_msg("before compact")];
+    let live_history = vec![
+        user_msg("first"),
+        assistant_msg("before compact"),
+        assistant_msg("after compact started"),
+        user_msg("newer user message"),
+    ];
+    let replacement_history = vec![user_msg("summary"), assistant_msg("compacted top section")];
+
+    let spliced = ContextManager::splice_compacted_prefix(
+        &live_history,
+        &captured_snapshot,
+        &replacement_history,
+    );
+
+    assert_eq!(
+        spliced,
+        Some(vec![
+            user_msg("summary"),
+            assistant_msg("compacted top section"),
+            assistant_msg("after compact started"),
+            user_msg("newer user message"),
+        ])
+    );
+}
+
+#[test]
+fn splice_compacted_prefix_returns_none_when_live_history_diverged() {
+    let captured_snapshot = vec![user_msg("first"), assistant_msg("before compact")];
+    let live_history = vec![user_msg("first"), assistant_msg("different middle item")];
+    let replacement_history = vec![user_msg("summary")];
+
+    let spliced = ContextManager::splice_compacted_prefix(
+        &live_history,
+        &captured_snapshot,
+        &replacement_history,
+    );
+
+    assert_eq!(spliced, None);
+}
+
+#[test]
 fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
     let history = create_history_with_items(vec![reasoning_with_encrypted_content(800)]);
 

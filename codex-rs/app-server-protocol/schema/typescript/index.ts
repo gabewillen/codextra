@@ -84,6 +84,7 @@ export type { GhostCommit } from "./GhostCommit";
 export type { GitDiffToRemoteParams } from "./GitDiffToRemoteParams";
 export type { GitDiffToRemoteResponse } from "./GitDiffToRemoteResponse";
 export type { GitSha } from "./GitSha";
+export type { HistoryContextMode } from "./HistoryContextMode";
 export type { HistoryEntry } from "./HistoryEntry";
 export type { HookCompletedEvent } from "./HookCompletedEvent";
 export type { HookEventName } from "./HookEventName";

@@ -105,6 +105,7 @@ pub mod default_client;
 pub mod project_doc;
 mod rollout;
 pub(crate) mod safety;
+mod scrolling_context;
 pub mod seatbelt;
 pub mod shell;
 pub mod shell_snapshot;

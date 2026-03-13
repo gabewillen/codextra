@@ -230,6 +230,16 @@
             }
           ]
         },
+        "history_context_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HistoryContextMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "instructions": {
           "type": [
             "string",
@@ -565,6 +575,13 @@
       ],
       "type": "string"
     },
+    "HistoryContextMode": {
+      "enum": [
+        "compaction",
+        "scrolling_window"
+      ],
+      "type": "string"
+    },
     "ProfileV2": {
       "additionalProperties": true,
       "properties": {
@@ -582,6 +599,16 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "history_context_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HistoryContextMode"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "model": {

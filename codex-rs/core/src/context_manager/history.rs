@@ -1,4 +1,3 @@
-use crate::codex::TurnContext;
 use crate::context_manager::normalize;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::truncate::TruncationPolicy;
@@ -119,17 +118,6 @@ impl ContextManager {
         &self.items
     }
 
-    // Estimate token usage using byte-based heuristics from the truncation helpers.
-    // This is a coarse lower bound, not a tokenizer-accurate count.
-    pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
-        let model_info = &turn_context.model_info;
-        let personality = turn_context.personality.or(turn_context.config.personality);
-        let base_instructions = BaseInstructions {
-            text: model_info.get_model_instructions(personality),
-        };
-        self.estimate_token_count_with_base_instructions(&base_instructions)
-    }
-
     pub(crate) fn estimate_token_count_with_base_instructions(
         &self,
         base_instructions: &BaseInstructions,
@@ -169,6 +157,18 @@ impl ContextManager {
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
+    }
+
+    pub(crate) fn splice_compacted_prefix(
+        live_history: &[ResponseItem],
+        captured_snapshot: &[ResponseItem],
+        replacement_history: &[ResponseItem],
+    ) -> Option<Vec<ResponseItem>> {
+        let tail = live_history.strip_prefix(captured_snapshot)?;
+        let mut spliced_history = Vec::with_capacity(replacement_history.len() + tail.len());
+        spliced_history.extend_from_slice(replacement_history);
+        spliced_history.extend_from_slice(tail);
+        Some(spliced_history)
     }
 
     /// Replace image content in the last turn if it originated from a tool output.

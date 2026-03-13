@@ -447,6 +447,13 @@
       },
       "type": "object"
     },
+    "HistoryContextMode": {
+      "enum": [
+        "compaction",
+        "scrolling_window"
+      ],
+      "type": "string"
+    },
     "McpToolCallError": {
       "properties": {
         "message": {
@@ -1940,6 +1947,9 @@
     "cwd": {
       "type": "string"
     },
+    "historyContextMode": {
+      "$ref": "#/definitions/HistoryContextMode"
+    },
     "model": {
       "type": "string"
     },
@@ -1976,6 +1986,7 @@
   "required": [
     "approvalPolicy",
     "cwd",
+    "historyContextMode",
     "model",
     "modelProvider",
     "sandbox",

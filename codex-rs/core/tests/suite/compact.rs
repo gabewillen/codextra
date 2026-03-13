@@ -5,6 +5,7 @@ use codex_core::built_in_model_providers;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -21,7 +22,6 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
-use core_test_support::responses::ev_local_shell_call;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
 use core_test_support::skip_if_no_network;
@@ -36,6 +36,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_response_sequence;
+use core_test_support::responses::mount_response_sequence_match;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -44,7 +45,8 @@ use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
-use serde_json::json;
+use std::time::Duration;
+use tokio::time::timeout;
 use wiremock::MockServer;
 // --- Test helpers -----------------------------------------------------------
 
@@ -83,6 +85,36 @@ fn set_test_compact_prompt(config: &mut Config) {
 
 fn body_contains_text(body: &str, text: &str) -> bool {
     body.contains(&json_fragment(text))
+}
+
+fn request_json(req: &wiremock::Request) -> serde_json::Value {
+    serde_json::from_slice(&req.body).expect("valid request json")
+}
+
+fn request_has_user_text(req: &wiremock::Request, expected: &str) -> bool {
+    request_json(req)["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("message"))
+        .filter(|item| item.get("role").and_then(|value| value.as_str()) == Some("user"))
+        .filter_map(|item| item.get("content").and_then(|value| value.as_array()))
+        .flatten()
+        .filter(|entry| entry.get("type").and_then(|value| value.as_str()) == Some("input_text"))
+        .filter_map(|entry| entry.get("text").and_then(|value| value.as_str()))
+        .any(|text| text == expected)
+}
+
+fn request_function_output_contains(req: &wiremock::Request, expected: &str) -> bool {
+    request_json(req)["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("type").and_then(|value| value.as_str()) == Some("function_call_output")
+        })
+        .filter_map(|item| item.get("output").and_then(|value| value.as_str()))
+        .any(|output| output.contains(expected))
 }
 
 fn json_fragment(text: &str) -> String {
@@ -222,7 +254,8 @@ async fn summarize_context_three_requests_and_instructions() {
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
 
     // Build config pointing to the mock server and spawn Codex.
-    let model_provider = non_openai_model_provider(&server);
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
@@ -593,6 +626,7 @@ async fn manual_compact_emits_context_compaction_items() {
     let mut completed_item = None;
     let mut legacy_event = false;
     let mut saw_turn_complete = false;
+    let mut turn_complete_before_item_completed = false;
 
     while !saw_turn_complete || started_item.is_none() || completed_item.is_none() || !legacy_event
     {
@@ -614,6 +648,9 @@ async fn manual_compact_emits_context_compaction_items() {
                 legacy_event = true;
             }
             EventMsg::TurnComplete(_) => {
+                if completed_item.is_none() {
+                    turn_complete_before_item_completed = true;
+                }
                 saw_turn_complete = true;
             }
             _ => {}
@@ -624,124 +661,316 @@ async fn manual_compact_emits_context_compaction_items() {
     let completed_item = completed_item.expect("context compaction item completed");
     assert_eq!(started_item.id, completed_item.id);
     assert!(legacy_event);
+    assert!(
+        !turn_complete_before_item_completed,
+        "manual compaction should remain blocking until the compaction item completes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
+async fn background_auto_compact_stays_single_flight_per_active_turn() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
 
-    let non_openai_provider_name = non_openai_model_provider(&server).name;
-    let codex = test_codex()
-        .with_config(move |config| {
-            config.model_provider.name = non_openai_provider_name;
-        })
-        .build(&server)
-        .await
-        .expect("build codex")
-        .codex;
-
-    // user message
-    let user_message = "create an app";
-
-    // Prepare the mock responses from the model
-
-    // summary texts from model
-    let first_summary_text = "The task is to create an app. I started to create a react app.";
-    let second_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app.";
-    let third_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app. then I realized that I need to create a python app.";
-    // summary texts with prefix
-    let prefixed_first_summary = summary_with_prefix(first_summary_text);
-    let prefixed_second_summary = summary_with_prefix(second_summary_text);
-    let prefixed_third_summary = summary_with_prefix(third_summary_text);
-    // token used count after long work
-    let token_count_used = 270_000;
-    // token used count after compaction
-    let token_count_used_after_compaction = 80000;
-
-    // mock responses from the model
-
-    let reasoning_response_1 = ev_reasoning_item("m1", &["I will create a react app"], &[]);
-    let encrypted_content_1 = reasoning_response_1["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
-
-    // first chunk of work
-    let model_reasoning_response_1_sse = sse(vec![
-        reasoning_response_1.clone(),
-        ev_local_shell_call("r1-shell", "completed", vec!["echo", "make-react"]),
-        ev_completed_with_tokens("r1", token_count_used),
+    let first_function_name = "test_tool_one";
+    let first_call_id = "call-single-flight-1";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, first_function_name, "{}"),
+        ev_completed_with_tokens("r1", 500),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 50),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
     ]);
 
-    // first compaction response
-    let model_compact_response_1_sse = sse(vec![
-        ev_assistant_message("m2", first_summary_text),
-        ev_completed_with_tokens("r2", token_count_used_after_compaction),
-    ]);
+    let first_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && !request_function_output_contains(req, first_function_name)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
 
-    let reasoning_response_2 = ev_reasoning_item("m3", &["I will create a node app"], &[]);
-    let encrypted_content_2 = reasoning_response_2["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
+    let compact_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, first_function_name)
+    };
+    let compact_mock = mount_sse_once_match(&server, compact_matcher, compact_turn).await;
 
-    // second chunk of work
-    let model_reasoning_response_2_sse = sse(vec![
-        reasoning_response_2.clone(),
-        ev_local_shell_call("r3-shell", "completed", vec!["echo", "make-node"]),
-        ev_completed_with_tokens("r3", token_count_used),
-    ]);
+    let continued_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let continued_turn_mock =
+        mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
 
-    // second compaction response
-    let model_compact_response_2_sse = sse(vec![
-        ev_assistant_message("m4", second_summary_text),
-        ev_completed_with_tokens("r4", token_count_used_after_compaction),
-    ]);
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
 
-    let reasoning_response_3 = ev_reasoning_item("m6", &["I will create a python app"], &[]);
-    let encrypted_content_3 = reasoning_response_3["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
-
-    // third chunk of work
-    let model_reasoning_response_3_sse = sse(vec![
-        ev_reasoning_item("m6", &["I will create a python app"], &[]),
-        ev_local_shell_call("r6-shell", "completed", vec!["echo", "make-python"]),
-        ev_completed_with_tokens("r6", token_count_used),
-    ]);
-
-    // third compaction response
-    let model_compact_response_3_sse = sse(vec![
-        ev_assistant_message("m7", third_summary_text),
-        ev_completed_with_tokens("r7", token_count_used_after_compaction),
-    ]);
-
-    // final response
-    let model_final_response_sse = sse(vec![
-        ev_assistant_message(
-            "m8",
-            "The task is to create an app. I started to create a react app. then I realized that I need to create a node app. then I realized that I need to create a python app.",
-        ),
-        ev_completed_with_tokens("r8", token_count_used_after_compaction + 1000),
-    ]);
-
-    // mount the mock responses from the model
-    let bodies = vec![
-        model_reasoning_response_1_sse,
-        model_compact_response_1_sse,
-        model_reasoning_response_2_sse,
-        model_compact_response_2_sse,
-        model_reasoning_response_3_sse,
-        model_compact_response_3_sse,
-        model_final_response_sse,
-    ];
-    let request_log = mount_sse_sequence(&server, bodies).await;
-
-    // Start the conversation with the user message
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: user_message.into(),
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    let (compact_started, compact_completed, replaced_abort) =
+        timeout(Duration::from_secs(20), async {
+            let mut compact_started = 0usize;
+            let mut compact_completed = 0usize;
+            let mut replaced_abort = 0usize;
+            loop {
+                if compact_started > 0
+                    && !compact_mock.requests().is_empty()
+                    && !continued_turn_mock.requests().is_empty()
+                {
+                    break;
+                }
+                let event = codex.next_event().await.expect("next event");
+                match event.msg {
+                    EventMsg::ItemStarted(ItemStartedEvent {
+                        item: TurnItem::ContextCompaction(_),
+                        ..
+                    }) => {
+                        compact_started += 1;
+                    }
+                    EventMsg::ItemCompleted(ItemCompletedEvent {
+                        item: TurnItem::ContextCompaction(_),
+                        ..
+                    }) => {
+                        compact_completed += 1;
+                    }
+                    EventMsg::TurnAborted(ev)
+                        if ev.reason == codex_protocol::protocol::TurnAbortReason::Replaced =>
+                    {
+                        replaced_abort += 1;
+                    }
+                    _ => {}
+                }
+            }
+            (compact_started, compact_completed, replaced_abort)
+        })
+        .await
+        .expect("timed out waiting for local background compaction activity");
+
+    assert_eq!(first_turn_mock.requests().len(), 1);
+    assert_eq!(
+        compact_started, 1,
+        "expected one background compaction start"
+    );
+    assert_eq!(
+        compact_completed, 0,
+        "continued turn should remain observable before background compaction completion"
+    );
+    assert_eq!(
+        replaced_abort, 0,
+        "background compaction should not replace the active turn"
+    );
+
+    let compact_requests = compact_mock.requests();
+    assert!(
+        !compact_requests.is_empty(),
+        "expected at least one compact request from the single background compaction worker"
+    );
+    let compact_request = compact_requests
+        .into_iter()
+        .find(|request| request.body_contains_text(SUMMARIZATION_PROMPT))
+        .expect("expected a compact request");
+    assert!(
+        compact_request
+            .function_call_output_text(first_call_id)
+            .unwrap_or_default()
+            .contains(first_function_name),
+        "background compaction should snapshot the first tool output"
+    );
+
+    let second_request = continued_turn_mock
+        .requests()
+        .into_iter()
+        .find(|request| !request.body_contains_text(SUMMARIZATION_PROMPT))
+        .expect("expected a continued turn request");
+    assert!(
+        second_request
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == MULTI_AUTO_MSG),
+        "continued turn should keep the active user message below the compacted prefix"
+    );
+    assert!(
+        !second_request.body_contains_text(SUMMARIZATION_PROMPT),
+        "continued turn request should not become another compaction request"
+    );
+    assert!(
+        !second_request.body_contains_text(AUTO_SUMMARY_TEXT),
+        "completed background compaction should not race into the immediate continuation request"
+    );
+    assert!(
+        !second_request.body_contains_text(SUMMARY_PREFIX),
+        "immediate continuation request should not inject a compaction summary before apply"
+    );
+    assert!(
+        second_request
+            .function_call_output_text(first_call_id)
+            .unwrap_or_default()
+            .contains(first_function_name),
+        "continued turn should still send the active turn tool output before background apply completes"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_auto_compact_defaults_to_fifty_percent_used() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_function_name = "test_tool_one";
+    let first_call_id = "call-default-async-threshold-1";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, first_function_name, "{}"),
+        ev_completed_with_tokens("r1", 600),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 50),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+
+    let first_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && !request_function_output_contains(req, first_function_name)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
+
+    let compact_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, first_function_name)
+    };
+    let compact_mock = mount_sse_once_match(&server, compact_matcher, compact_turn).await;
+
+    let continued_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let continued_turn_mock =
+        mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(20);
+        set_test_compact_prompt(config);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    let (compact_started, compact_request_count, continued_request_count) =
+        timeout(Duration::from_secs(20), async {
+            let mut compact_started = false;
+            loop {
+                if !compact_mock.requests().is_empty() && !continued_turn_mock.requests().is_empty()
+                {
+                    break (
+                        compact_started,
+                        compact_mock.requests().len(),
+                        continued_turn_mock.requests().len(),
+                    );
+                }
+
+                let event = codex.next_event().await.expect("next event");
+                if matches!(
+                    event.msg,
+                    EventMsg::ItemStarted(ItemStartedEvent {
+                        item: TurnItem::ContextCompaction(_),
+                        ..
+                    })
+                ) {
+                    compact_started = true;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for background compaction activity");
+
+    assert!(compact_started, "expected background compaction to start");
+    assert_eq!(first_turn_mock.requests().len(), 1);
+    assert!(
+        compact_request_count >= 1,
+        "default async threshold should trigger compaction at 50% used"
+    );
+    assert!(
+        continued_request_count >= 1,
+        "continued turn should proceed while background compaction runs"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scrolling_window_mode_skips_background_auto_compaction() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_turn = sse(vec![
+        ev_function_call(
+            "call-scrolling-window-no-compact",
+            DUMMY_FUNCTION_NAME,
+            "{}",
+        ),
+        ev_completed_with_tokens("r1", 600),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", 50),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, continued_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(20);
+        config.history_context_mode = HistoryContextMode::ScrollingWindow;
+        set_test_compact_prompt(config);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -750,452 +979,154 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         .expect("submit user input");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // collect the requests payloads from the model
-    let requests_payloads = request_log.requests();
-    let body = requests_payloads[0].body_json();
-    let input = body.get("input").and_then(|v| v.as_array()).unwrap();
-
-    fn strip_agents_parts_from_user_message(
-        value: &serde_json::Value,
-    ) -> Option<serde_json::Value> {
-        let content = value
-            .get("content")
-            .and_then(|content| content.as_array())?;
-        let filtered_content = content
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "scrolling window mode should continue the turn without issuing a compaction request"
+    );
+    assert!(
+        requests
             .iter()
-            .filter(|item| {
-                !item
-                    .get("text")
-                    .and_then(|text| text.as_str())
-                    .is_some_and(|text| text.starts_with("# AGENTS.md instructions for "))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if filtered_content.is_empty() {
-            return None;
-        }
-        let mut normalized = value.clone();
-        normalized["content"] = serde_json::Value::Array(filtered_content);
-        Some(normalized)
-    }
+            .all(|request| !request.body_contains_text(SUMMARIZATION_PROMPT)),
+        "scrolling window mode should not send the summarization prompt"
+    );
+}
 
-    fn normalize_inputs(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
-        values
-            .iter()
-            .filter_map(|value| {
-                if value
-                    .get("type")
-                    .and_then(|ty| ty.as_str())
-                    .is_some_and(|ty| ty == "function_call_output")
-                {
-                    return None;
-                }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_is_unavailable_in_scrolling_window_mode() {
+    skip_if_no_network!();
 
-                let text = value
-                    .get("content")
-                    .and_then(|content| content.as_array())
-                    .and_then(|content| content.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|text| text.as_str());
+    let server = start_mock_server().await;
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.history_context_mode = HistoryContextMode::ScrollingWindow;
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
 
-                // Ignore cached prefix messages (project docs + permissions) since they are not
-                // relevant to compaction behavior and can change as bundled prompts evolve.
-                let role = value.get("role").and_then(|role| role.as_str());
-                if role == Some("developer")
-                    && text.is_some_and(|text| text.contains("`sandbox_mode`"))
-                {
-                    return None;
-                }
-                if role == Some("user") {
-                    return strip_agents_parts_from_user_message(value);
-                }
-                Some(value.clone())
-            })
-            .collect()
-    }
+    codex.submit(Op::Compact).await.expect("submit /compact");
 
-    let initial_input = normalize_inputs(input);
-    let environment_message = initial_input[0]["content"][0]["text"].as_str().unwrap();
+    let error_message = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        error_message,
+        "/compact is unavailable when `history_context_mode = \"scrolling_window\"`"
+    );
+}
 
-    // test 1: after compaction, we should have one environment message, one user message, and one user message with summary prefix
-    let compaction_indices = [2, 4, 6];
-    let expected_summaries = [
-        prefixed_first_summary.as_str(),
-        prefixed_second_summary.as_str(),
-        prefixed_third_summary.as_str(),
-    ];
-    for (i, expected_summary) in compaction_indices.into_iter().zip(expected_summaries) {
-        let body = requests_payloads.clone()[i].body_json();
-        let input = body.get("input").and_then(|v| v.as_array()).unwrap();
-        let input = normalize_inputs(input);
-        assert_eq!(input.len(), 3);
-        let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
-        let user_message_received = input[1]["content"][0]["text"].as_str().unwrap();
-        let summary_message = input[2]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(environment_message, environment_message);
-        assert_eq!(user_message_received, user_message);
-        assert_eq!(
-            summary_message, expected_summary,
-            "compaction request at index {i} should include the prefixed summary"
-        );
-    }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_background_auto_compact_falls_back_to_blocking_compaction_once() {
+    skip_if_no_network!();
 
-    // test 2: the expected requests inputs should be as follows:
-    let expected_requests_inputs = json!([
-    [
-        // 0: first request of the user message.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-        // 1: first automatic compaction request.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_1,
-        "summary": [
-          {
-            "text": "I will create a react app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-react"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r1-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r1-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      // 2: request after first automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_first_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-        // 3: request for second automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_first_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_2,
-        "summary": [
-          {
-            "text": "I will create a node app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-node"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r3-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r3-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    // 4: request after second automatic compaction.
-    [
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_second_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      // 5: request for third automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_second_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_3,
-        "summary": [
-          {
-            "text": "I will create a python app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-python"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r6-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r6-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      {
-        // 6: request after third automatic compaction.
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_third_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
+    let server = start_mock_server().await;
+
+    let first_function_name = "test_tool_one";
+    let first_call_id = "call-background-failure-1";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, first_function_name, "{}"),
+        ev_completed_with_tokens("r1", 500),
+    ]);
+    let continued_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 50),
+    ]);
+    let failed_compact_turn =
+        sse_failed("resp-fail-1", "server_error", "background compact failed");
+    let fallback_compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
     ]);
 
-    for (i, request) in requests_payloads.iter().enumerate() {
-        let body = request.body_json();
-        let input = body.get("input").and_then(|v| v.as_array()).unwrap();
-        let expected_input = expected_requests_inputs[i].as_array().unwrap();
-        assert_eq!(normalize_inputs(input), normalize_inputs(expected_input));
-    }
+    let first_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && !request_function_output_contains(req, first_function_name)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
 
-    // test 3: the number of requests should be 7
-    assert_eq!(requests_payloads.len(), 7);
+    let continued_turn_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, first_function_name)
+    };
+    let continued_turn_mock =
+        mount_sse_once_match(&server, continued_turn_matcher, continued_turn).await;
+
+    let compaction_matcher = move |req: &wiremock::Request| {
+        request_has_user_text(req, MULTI_AUTO_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let compaction_mock = mount_response_sequence_match(
+        &server,
+        compaction_matcher,
+        vec![
+            sse_response(failed_compact_turn),
+            sse_response(fallback_compact_turn),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    let event_result = timeout(Duration::from_secs(20), async {
+        let mut saw_turn_complete = false;
+        let mut saw_turn_aborted = false;
+        while !saw_turn_complete {
+            let event = codex.next_event().await.expect("next event");
+            match event.msg {
+                EventMsg::TurnComplete(_) => saw_turn_complete = true,
+                EventMsg::TurnAborted(_) => saw_turn_aborted = true,
+                _ => {}
+            }
+        }
+        (saw_turn_complete, saw_turn_aborted)
+    })
+    .await;
+    let (_saw_turn_complete, saw_turn_aborted) = match event_result {
+        Ok(result) => result,
+        Err(_) => panic!(
+            "timed out waiting for failed background compaction fallback: first={}, continued={}, compactions={}",
+            first_turn_mock.requests().len(),
+            continued_turn_mock.requests().len(),
+            compaction_mock.requests().len(),
+        ),
+    };
+
+    assert_eq!(first_turn_mock.requests().len(), 1);
+    assert_eq!(continued_turn_mock.requests().len(), 1);
+    assert_eq!(
+        compaction_mock.requests().len(),
+        2,
+        "expected one failed background compaction attempt and one blocking fallback compaction"
+    );
+    assert!(
+        !saw_turn_aborted,
+        "failed background compaction fallback should end the turn without a separate abort event"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -2601,9 +2532,8 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
         ev_completed_with_tokens("r1", over_limit_tokens),
     ]);
-    let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
-        ev_assistant_message("m2", &auto_summary_payload),
+        ev_assistant_message("m2", &auto_summary(AUTO_SUMMARY_TEXT)),
         ev_completed_with_tokens("r3", 10),
     ]);
     let post_auto_compact_turn = sse(vec![
@@ -2611,10 +2541,27 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         ev_completed_with_tokens("r4", 10),
     ]);
 
-    // Mount responses in order and keep mocks only for the ones we assert on.
-    let first_turn_mock = mount_sse_once(&server, first_turn).await;
-    let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
-    let post_auto_compact_mock = mount_sse_once(&server, post_auto_compact_turn).await;
+    let first_turn_matcher = |req: &wiremock::Request| {
+        request_has_user_text(req, FUNCTION_CALL_LIMIT_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+    };
+    let first_turn_mock = mount_sse_once_match(&server, first_turn_matcher, first_turn).await;
+
+    let auto_compact_matcher = |req: &wiremock::Request| {
+        request_has_user_text(req, FUNCTION_CALL_LIMIT_MSG)
+            && request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, DUMMY_FUNCTION_NAME)
+    };
+    let auto_compact_mock =
+        mount_sse_once_match(&server, auto_compact_matcher, auto_compact_turn).await;
+
+    let post_auto_compact_matcher = |req: &wiremock::Request| {
+        request_has_user_text(req, FUNCTION_CALL_LIMIT_MSG)
+            && !request_has_user_text(req, SUMMARIZATION_PROMPT)
+            && request_function_output_contains(req, DUMMY_FUNCTION_NAME)
+    };
+    let post_auto_compact_mock =
+        mount_sse_once_match(&server, post_auto_compact_matcher, post_auto_compact_turn).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2654,10 +2601,17 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         }),
         "first request should include the user message that triggers the function call"
     );
-
-    let function_call_output = auto_compact_mock
-        .single_request()
-        .function_call_output(DUMMY_CALL_ID);
+    let auto_compact_request = auto_compact_mock
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .message_input_texts("user")
+                .iter()
+                .any(|text| text == SUMMARIZATION_PROMPT)
+        })
+        .expect("expected auto compact request");
+    let function_call_output = auto_compact_request.function_call_output(DUMMY_CALL_ID);
     let output_text = function_call_output
         .get("output")
         .and_then(|value| value.as_str())
@@ -2667,28 +2621,44 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         "function call output should be sent before auto compact"
     );
 
-    let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
     assert!(
-        body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
+        auto_compact_request.body_contains_text(SUMMARIZATION_PROMPT),
         "mid-turn auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
     );
-
-    insta::assert_snapshot!(
-        "mid_turn_compaction_shapes",
-        format_labeled_requests_snapshot(
-            "True mid-turn continuation compaction after tool output: compact request includes tool artifacts, and the continuation request includes the summary in the same turn.",
-            &[
-                (
-                    "Local Compaction Request",
-                    &auto_compact_mock.single_request()
-                ),
-                (
-                    "Local Post-Compaction History Layout",
-                    &post_auto_compact_mock.single_request()
-                ),
-            ]
-        )
+    let post_auto_compact_request = post_auto_compact_mock
+        .requests()
+        .into_iter()
+        .find(|request| !request.body_contains_text(SUMMARIZATION_PROMPT))
+        .expect("expected post-auto-compact continuation request");
+    assert!(
+        post_auto_compact_request
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == FUNCTION_CALL_LIMIT_MSG),
+        "continuation request should keep the active user message below the compacted prefix"
     );
+    assert!(
+        !post_auto_compact_request.body_contains_text(SUMMARIZATION_PROMPT),
+        "continuation request should stay on the main turn instead of issuing a second compaction request"
+    );
+    assert!(
+        !post_auto_compact_request.body_contains_text(AUTO_SUMMARY_TEXT),
+        "immediate continuation request should not inject a compaction summary before background apply completes"
+    );
+    assert!(
+        !post_auto_compact_request.body_contains_text(SUMMARY_PREFIX),
+        "immediate continuation request should not inject a compaction summary prefix before apply"
+    );
+    assert!(
+        post_auto_compact_request
+            .function_call_output_text(DUMMY_CALL_ID)
+            .unwrap_or_default()
+            .contains(DUMMY_FUNCTION_NAME),
+        "continuation request should still include the tool output before background apply completes"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2699,7 +2669,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 
     let context_window = 100;
     let config_limit = 200;
-    let over_limit_tokens = context_window * 90 / 100 + 1;
+    let over_limit_tokens = context_window * 75 / 100 + 1;
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -3262,12 +3232,19 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         })
         .await
         .expect("submit second user");
-    let error_message = wait_for_event_match(&codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let mut error_message = None;
+    let mut saw_turn_complete = false;
+    let mut saw_turn_aborted = false;
+    while error_message.is_none() || !saw_turn_complete {
+        let event = codex.next_event().await.expect("next event");
+        match event.msg {
+            EventMsg::Error(err) => error_message = Some(err.message),
+            EventMsg::TurnComplete(_) => saw_turn_complete = true,
+            EventMsg::TurnAborted(_) => saw_turn_aborted = true,
+            _ => {}
+        }
+    }
+    let error_message = error_message.expect("expected compact failure error");
 
     let requests = request_log.requests();
     assert!(
@@ -3289,6 +3266,10 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     assert!(
         error_message.contains("ran out of room in the model's context window"),
         "expected context window exceeded message, got {error_message}"
+    );
+    assert!(
+        !saw_turn_aborted,
+        "pre-turn compaction failure should still end through error + turn completion, not a turn abort marker"
     );
 }
 

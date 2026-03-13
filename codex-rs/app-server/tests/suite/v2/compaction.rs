@@ -22,6 +22,10 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -46,6 +50,7 @@ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    const LOCAL_AUTO_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     let server = responses::start_mock_server().await;
     let sse1 = responses::sse(vec![
@@ -81,12 +86,34 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
-    for message in ["first", "second", "third"] {
-        send_turn_and_wait(&mut mcp, &thread_id, message).await?;
-    }
+    send_turn_and_wait(&mut mcp, &thread_id, "first").await?;
+    send_turn_and_wait(&mut mcp, &thread_id, "second").await?;
+    send_turn_and_wait(&mut mcp, &thread_id, "third").await?;
 
-    let started = wait_for_context_compaction_started(&mut mcp).await?;
-    let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+    let started = loop {
+        let notification: JSONRPCNotification = timeout(
+            LOCAL_AUTO_COMPACTION_TIMEOUT,
+            mcp.read_stream_until_notification_message("item/started"),
+        )
+        .await??;
+        let started: ItemStartedNotification =
+            serde_json::from_value(notification.params.clone().expect("item/started params"))?;
+        if let ThreadItem::ContextCompaction { .. } = started.item {
+            break started;
+        }
+    };
+    let completed = loop {
+        let notification: JSONRPCNotification = timeout(
+            LOCAL_AUTO_COMPACTION_TIMEOUT,
+            mcp.read_stream_until_notification_message("item/completed"),
+        )
+        .await??;
+        let completed: ItemCompletedNotification =
+            serde_json::from_value(notification.params.clone().expect("item/completed params"))?;
+        if let ThreadItem::ContextCompaction { .. } = completed.item {
+            break completed;
+        }
+    };
 
     let ThreadItem::ContextCompaction { id: started_id } = started.item else {
         unreachable!("started item should be context compaction");
@@ -94,9 +121,9 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
     let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
         unreachable!("completed item should be context compaction");
     };
-
     assert_eq!(started.thread_id, thread_id);
     assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(started.turn_id, completed.turn_id);
     assert_eq!(started_id, completed_id);
 
     Ok(())
@@ -170,9 +197,9 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
-    for message in ["first", "second", "third"] {
-        send_turn_and_wait(&mut mcp, &thread_id, message).await?;
-    }
+    send_turn_and_wait(&mut mcp, &thread_id, "first").await?;
+    send_turn_and_wait(&mut mcp, &thread_id, "second").await?;
+    let third_turn_id = send_turn_and_wait(&mut mcp, &thread_id, "third").await?;
 
     let started = wait_for_context_compaction_started(&mut mcp).await?;
     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
@@ -186,6 +213,8 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
 
     assert_eq!(started.thread_id, thread_id);
     assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(started.turn_id, third_turn_id);
+    assert_eq!(completed.turn_id, third_turn_id);
     assert_eq!(started_id, completed_id);
 
     let compact_requests = compact_mock.requests();
@@ -326,6 +355,87 @@ async fn thread_compact_start_rejects_unknown_thread_id() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compaction_thread_read_and_resume_preserve_context_compaction_items() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "FIRST_REPLY"),
+        responses::ev_completed_with_tokens("r1", 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", "SECOND_REPLY"),
+        responses::ev_completed_with_tokens("r2", 330_000),
+    ]);
+    let sse3 = responses::sse(vec![
+        responses::ev_assistant_message("m3", "LOCAL_SUMMARY"),
+        responses::ev_completed_with_tokens("r3", 200),
+    ]);
+    let sse4 = responses::sse(vec![
+        responses::ev_assistant_message("m4", "FINAL_REPLY"),
+        responses::ev_completed_with_tokens("r4", 120),
+    ]);
+    responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        &BTreeMap::default(),
+        AUTO_COMPACT_LIMIT,
+        None,
+        "mock_provider",
+        COMPACT_PROMPT,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    for message in ["first", "second", "third"] {
+        send_turn_and_wait(&mut mcp, &thread_id, message).await?;
+    }
+
+    let _started = wait_for_context_compaction_started(&mut mcp).await?;
+    let _completed = wait_for_context_compaction_completed(&mut mcp).await?;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(thread_contains_context_compaction(&read_thread.turns));
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed_thread,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert!(thread_contains_context_compaction(&resumed_thread.turns));
+
+    Ok(())
+}
+
 async fn start_thread(mcp: &mut McpProcess) -> Result<String> {
     let thread_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -410,4 +520,12 @@ async fn wait_for_context_compaction_completed(
             return Ok(completed);
         }
     }
+}
+
+fn thread_contains_context_compaction(turns: &[codex_app_server_protocol::Turn]) -> bool {
+    turns.iter().any(|turn| {
+        turn.items
+            .iter()
+            .any(|item| matches!(item, ThreadItem::ContextCompaction { .. }))
+    })
 }

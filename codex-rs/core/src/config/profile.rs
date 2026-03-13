@@ -7,6 +7,7 @@ use crate::config::ToolsToml;
 use crate::config::types::Personality;
 use crate::config::types::WindowsToml;
 use crate::protocol::AskForApproval;
+use codex_protocol::config_types::HistoryContextMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
@@ -30,6 +31,7 @@ pub struct ConfigProfile {
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub history_context_mode: Option<HistoryContextMode>,
     /// Optional path to a JSON model catalog (applied on startup only).
     pub model_catalog_json: Option<AbsolutePathBuf>,
     pub personality: Option<Personality>,
@@ -68,6 +70,7 @@ impl From<ConfigProfile> for codex_app_server_protocol::Profile {
             model: config_profile.model,
             model_provider: config_profile.model_provider,
             approval_policy: config_profile.approval_policy,
+            history_context_mode: config_profile.history_context_mode,
             model_reasoning_effort: config_profile.model_reasoning_effort,
             model_reasoning_summary: config_profile.model_reasoning_summary,
             model_verbosity: config_profile.model_verbosity,
