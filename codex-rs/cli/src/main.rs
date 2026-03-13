@@ -11,7 +11,9 @@ use codex_cli::LandlockCommand;
 use codex_cli::SeatbeltCommand;
 use codex_cli::WindowsCommand;
 use codex_cli::login::read_api_key_from_stdin;
+use codex_cli::login::run_login_list;
 use codex_cli::login::run_login_status;
+use codex_cli::login::run_login_use;
 use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
@@ -265,6 +267,9 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
+    #[arg(value_name = "LOGIN_ALIAS")]
+    alias: Option<String>,
+
     #[arg(
         long = "with-api-key",
         help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
@@ -299,12 +304,22 @@ struct LoginCommand {
 enum LoginSubcommand {
     /// Show login status.
     Status,
+    /// List stored login aliases.
+    List,
+    /// Switch the active login alias.
+    Use {
+        #[arg(value_name = "LOGIN_ALIAS")]
+        alias: String,
+    },
 }
 
 #[derive(Debug, Parser)]
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
+
+    #[arg(value_name = "LOGIN_ALIAS")]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -679,10 +694,17 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 Some(LoginSubcommand::Status) => {
                     run_login_status(login_cli.config_overrides).await;
                 }
+                Some(LoginSubcommand::List) => {
+                    run_login_list(login_cli.config_overrides).await;
+                }
+                Some(LoginSubcommand::Use { alias }) => {
+                    run_login_use(login_cli.config_overrides, alias).await;
+                }
                 None => {
                     if login_cli.use_device_code {
                         run_login_with_device_code(
                             login_cli.config_overrides,
+                            login_cli.alias,
                             login_cli.issuer_base_url,
                             login_cli.client_id,
                         )
@@ -694,9 +716,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
                         let api_key = read_api_key_from_stdin();
-                        run_login_with_api_key(login_cli.config_overrides, api_key).await;
+                        run_login_with_api_key(
+                            login_cli.config_overrides,
+                            login_cli.alias,
+                            api_key,
+                        )
+                        .await;
                     } else {
-                        run_login_with_chatgpt(login_cli.config_overrides).await;
+                        run_login_with_chatgpt(login_cli.config_overrides, login_cli.alias).await;
                     }
                 }
             }
@@ -706,7 +733,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides).await;
+            run_logout(logout_cli.config_overrides, logout_cli.alias).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);

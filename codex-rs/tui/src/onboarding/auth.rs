@@ -725,6 +725,7 @@ impl AuthModeWidget {
         self.error = None;
         let opts = ServerOptions::new(
             self.codex_home.clone(),
+            codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
             CLIENT_ID.to_string(),
             self.forced_chatgpt_workspace_id.clone(),
             self.cli_auth_credentials_store_mode,
@@ -778,6 +779,7 @@ impl AuthModeWidget {
         self.error = None;
         let opts = ServerOptions::new(
             self.codex_home.clone(),
+            codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
             CLIENT_ID.to_string(),
             self.forced_chatgpt_workspace_id.clone(),
             self.cli_auth_credentials_store_mode,

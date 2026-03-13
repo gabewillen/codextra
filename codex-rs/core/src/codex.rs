@@ -6728,7 +6728,44 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
+                if let Some(failover) = sess
+                    .services
+                    .auth_manager
+                    .failover_from_usage_limit(e.resets_at)
+                    .map_err(CodexErr::Io)?
+                {
+                    client_session.reset_transport_state();
+                    sess.notify_background_event(
+                        &turn_context,
+                        format!(
+                            "Switched login from `{}` to `{}` after usage limit reached",
+                            failover.previous_alias, failover.next_alias
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
                 return Err(CodexErr::UsageLimitReached(e));
+            }
+            Err(err @ CodexErr::QuotaExceeded) | Err(err @ CodexErr::UsageNotIncluded) => {
+                if let Some(failover) = sess
+                    .services
+                    .auth_manager
+                    .failover_from_usage_limit(None)
+                    .map_err(CodexErr::Io)?
+                {
+                    client_session.reset_transport_state();
+                    sess.notify_background_event(
+                        &turn_context,
+                        format!(
+                            "Switched login from `{}` to `{}` after quota was exhausted",
+                            failover.previous_alias, failover.next_alias
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                return Err(err);
             }
             Err(err) => err,
         };

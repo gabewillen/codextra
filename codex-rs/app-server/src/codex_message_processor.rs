@@ -1030,6 +1030,7 @@ impl CodexMessageProcessor {
             open_browser: false,
             ..LoginServerOptions::new(
                 config.codex_home.clone(),
+                codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
                 CLIENT_ID.to_string(),
                 config.forced_chatgpt_workspace_id.clone(),
                 config.cli_auth_credentials_store_mode,

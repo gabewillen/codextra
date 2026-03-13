@@ -426,14 +426,14 @@ impl HistoryCell for StatusHistoryCell {
         }
 
         let account_value = self.account.as_ref().map(|account| match account {
-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
-                (Some(email), Some(plan)) => format!("{email} ({plan})"),
-                (Some(email), None) => email.clone(),
-                (None, Some(plan)) => plan.clone(),
-                (None, None) => "ChatGPT".to_string(),
+            StatusAccountDisplay::ChatGpt { alias, email, plan } => match (email, plan) {
+                (Some(email), Some(plan)) => format!("{email} ({plan}, alias: {alias})"),
+                (Some(email), None) => format!("{email} (alias: {alias})"),
+                (None, Some(plan)) => format!("{plan} (alias: {alias})"),
+                (None, None) => format!("ChatGPT (alias: {alias})"),
             },
-            StatusAccountDisplay::ApiKey => {
-                "API key configured (run codex login to use ChatGPT)".to_string()
+            StatusAccountDisplay::ApiKey { alias } => {
+                format!("API key configured (alias: {alias}; run codex login to use ChatGPT)")
             }
         });
 

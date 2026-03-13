@@ -1050,6 +1050,12 @@ impl ModelClientSession {
         }
         activated
     }
+
+    pub(crate) fn reset_transport_state(&mut self) {
+        self.websocket_session.connection = None;
+        self.websocket_session.last_request = None;
+        self.websocket_session.last_response_rx = None;
+    }
 }
 
 /// Parses per-turn metadata into an HTTP header value.

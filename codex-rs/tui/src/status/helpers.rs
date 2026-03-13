@@ -89,15 +89,16 @@ pub(crate) fn compose_account_display(
     plan: Option<PlanType>,
 ) -> Option<StatusAccountDisplay> {
     let auth = auth_manager.auth_cached()?;
+    let alias = auth_manager.active_alias();
 
     match auth.auth_mode() {
-        CoreAuthMode::ApiKey => Some(StatusAccountDisplay::ApiKey),
+        CoreAuthMode::ApiKey => Some(StatusAccountDisplay::ApiKey { alias }),
         CoreAuthMode::Chatgpt => {
             let email = auth.get_account_email();
             let plan = plan
                 .map(|plan_type| title_case(format!("{plan_type:?}").as_str()))
                 .or_else(|| Some("Unknown".to_string()));
-            Some(StatusAccountDisplay::ChatGpt { email, plan })
+            Some(StatusAccountDisplay::ChatGpt { alias, email, plan })
         }
     }
 }

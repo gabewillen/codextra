@@ -104,6 +104,7 @@ fn server_opts(
 ) -> ServerOptions {
     let mut opts = ServerOptions::new(
         codex_home.path().to_path_buf(),
+        codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         "client-id".to_string(),
         None,
         cli_auth_credentials_store_mode,
@@ -241,6 +242,7 @@ async fn device_code_login_integration_persists_without_api_key_on_exchange_fail
 
     let mut opts = ServerOptions::new(
         codex_home.path().to_path_buf(),
+        codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         "client-id".to_string(),
         None,
         AuthCredentialsStoreMode::File,
@@ -291,6 +293,7 @@ async fn device_code_login_integration_handles_error_payload() -> anyhow::Result
 
     let mut opts = ServerOptions::new(
         codex_home.path().to_path_buf(),
+        codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         "client-id".to_string(),
         None,
         AuthCredentialsStoreMode::File,

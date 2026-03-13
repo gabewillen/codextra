@@ -111,6 +111,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 
     let opts = ServerOptions {
         codex_home: server_home,
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
@@ -172,6 +173,7 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
     let server_home = codex_home.clone();
     let opts = ServerOptions {
         codex_home: server_home,
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
@@ -211,6 +213,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
 
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
@@ -268,6 +271,7 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
 
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
@@ -335,6 +339,7 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
 
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
@@ -413,6 +418,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
 
     let first_opts = ServerOptions {
         codex_home: first_codex_home,
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer: issuer.clone(),
@@ -433,6 +439,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
 
     let second_opts = ServerOptions {
         codex_home: second_codex_home,
+        auth_alias: codex_core::auth::DEFAULT_AUTH_ALIAS.to_string(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,

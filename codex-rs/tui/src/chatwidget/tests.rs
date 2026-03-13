@@ -2029,7 +2029,7 @@ async fn context_compacted_event_does_not_insert_chat_history() {
 }
 
 #[tokio::test]
-async fn collab_spawn_end_shows_requested_model_and_effort() {
+async fn collab_spawn_end_shows_resolved_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
     let sender_thread_id = ThreadId::new();
     let spawned_thread_id = ThreadId::new();
@@ -2066,7 +2066,7 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
 
     assert!(
         rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
-        "expected spawn line to include agent metadata and requested model, got {rendered:?}"
+        "expected spawn line to include agent metadata and resolved model, got {rendered:?}"
     );
 }
 

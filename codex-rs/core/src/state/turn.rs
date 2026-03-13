@@ -36,7 +36,6 @@ pub(crate) struct ActiveTurn {
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
     background_auto_compactions: Vec<BackgroundAutoCompaction>,
     completed_background_auto_compactions: VecDeque<CompletedBackgroundAutoCompaction>,
-    background_auto_compaction_started: bool,
     next_background_auto_compaction_launch_ordinal: u64,
 }
 
@@ -47,7 +46,6 @@ impl Default for ActiveTurn {
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             background_auto_compactions: Vec::new(),
             completed_background_auto_compactions: VecDeque::new(),
-            background_auto_compaction_started: false,
             next_background_auto_compaction_launch_ordinal: 0,
         }
     }
@@ -122,7 +120,8 @@ impl ActiveTurn {
         &self,
         _snapshot_history_len: usize,
     ) -> bool {
-        !self.background_auto_compaction_started
+        self.background_auto_compactions.is_empty()
+            && self.completed_background_auto_compactions.is_empty()
     }
 
     pub(crate) fn next_background_auto_compaction_launch_ordinal(&mut self) -> u64 {
@@ -158,7 +157,6 @@ impl ActiveTurn {
         }
         self.background_auto_compactions
             .push(background_auto_compaction);
-        self.background_auto_compaction_started = true;
         true
     }
 

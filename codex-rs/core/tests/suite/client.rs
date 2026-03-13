@@ -7,6 +7,10 @@ use codex_core::ResponseEvent;
 use codex_core::ThreadManager;
 use codex_core::WireApi;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::DEFAULT_AUTH_ALIAS;
+use codex_core::auth::login_with_api_key;
+use codex_core::auth::login_with_api_key_for_alias;
+use codex_core::auth::set_active_auth_alias;
 use codex_core::built_in_model_providers;
 use codex_core::default_client::originator;
 use codex_core::error::CodexErr;
@@ -49,6 +53,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -2187,6 +2192,80 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         error_event.message.to_lowercase().contains("usage limit"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limit_failover_retries_same_turn_with_backup_alias() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let first = ResponseTemplate::new(429).set_body_json(json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "message": "limit reached",
+            "plan_type": "pro"
+        }
+    }));
+    let second = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(sse(vec![
+            ev_response_created("resp-1"),
+            ev_completed("resp-1"),
+        ]));
+    let mock = mount_response_sequence(&server, vec![first, second]).await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    login_with_api_key(
+        codex_home.path(),
+        "sk-primary",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("primary login should succeed");
+    login_with_api_key_for_alias(
+        codex_home.path(),
+        "backup",
+        "sk-backup",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("backup login should succeed");
+    set_active_auth_alias(
+        codex_home.path(),
+        DEFAULT_AUTH_ALIAS,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("default alias should become active");
+    let auth = CodexAuth::from_auth_storage(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should exist");
+
+    let mut builder = test_codex().with_home(codex_home.clone()).with_auth(auth);
+    let codex_fixture = builder.build(&server).await?;
+    let codex = codex_fixture.codex.clone();
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submission should succeed after failover");
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("authorization").as_deref(),
+        Some("Bearer sk-primary")
+    );
+    assert_eq!(
+        requests[1].header("authorization").as_deref(),
+        Some("Bearer sk-backup")
     );
 
     Ok(())

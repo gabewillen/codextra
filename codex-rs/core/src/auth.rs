@@ -1,12 +1,14 @@
 mod storage;
 
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Debug;
 use std::path::Path;
@@ -21,8 +23,15 @@ use codex_protocol::config_types::ForcedLoginMethod;
 
 pub use crate::auth::storage::AuthCredentialsStoreMode;
 pub use crate::auth::storage::AuthDotJson;
+pub use crate::auth::storage::AuthRegistry;
 use crate::auth::storage::AuthStorageBackend;
+pub use crate::auth::storage::DEFAULT_AUTH_ALIAS;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::create_auth_storage_for_alias;
+pub use crate::auth::storage::is_valid_auth_alias;
+use crate::auth::storage::load_auth_alias_names;
+use crate::auth::storage::load_auth_registry;
+use crate::auth::storage::save_auth_registry;
 use crate::config::Config;
 use crate::error::RefreshTokenFailedError;
 use crate::error::RefreshTokenFailedReason;
@@ -35,6 +44,23 @@ use codex_client::CodexHttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
 use serde_json::Value;
 use thiserror::Error;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthAliasStatus {
+    pub alias: String,
+    pub is_active: bool,
+    pub auth_mode: Option<ApiAuthMode>,
+    pub account_id: Option<String>,
+    pub account_email: Option<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub exhausted_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthFailover {
+    pub previous_alias: String,
+    pub next_alias: String,
+}
 
 /// Account type for the current user.
 ///
@@ -159,6 +185,7 @@ impl From<RefreshTokenError> for std::io::Error {
 impl CodexAuth {
     fn from_auth_dot_json(
         codex_home: &Path,
+        alias: &str,
         auth_dot_json: AuthDotJson,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         client: CodexHttpClient,
@@ -179,7 +206,11 @@ impl CodexAuth {
 
         match auth_mode {
             ApiAuthMode::Chatgpt => {
-                let storage = create_auth_storage(codex_home.to_path_buf(), storage_mode);
+                let storage = create_auth_storage_for_alias(
+                    codex_home.to_path_buf(),
+                    alias.to_string(),
+                    storage_mode,
+                );
                 Ok(Self::Chatgpt(ChatgptAuth { state, storage }))
             }
             ApiAuthMode::ChatgptAuthTokens => {
@@ -393,13 +424,31 @@ pub fn logout(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<bool> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
-    storage.delete()
+    let active_alias = resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?;
+    logout_alias(
+        codex_home,
+        active_alias.as_deref(),
+        auth_credentials_store_mode,
+    )
 }
 
 /// Writes an `auth.json` that contains only the API key.
 pub fn login_with_api_key(
     codex_home: &Path,
+    api_key: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    login_with_api_key_for_alias(
+        codex_home,
+        DEFAULT_AUTH_ALIAS,
+        api_key,
+        auth_credentials_store_mode,
+    )
+}
+
+pub fn login_with_api_key_for_alias(
+    codex_home: &Path,
+    alias: &str,
     api_key: &str,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<()> {
@@ -409,7 +458,12 @@ pub fn login_with_api_key(
         tokens: None,
         last_refresh: None,
     };
-    save_auth(codex_home, &auth_dot_json, auth_credentials_store_mode)
+    save_auth_for_alias(
+        codex_home,
+        alias,
+        &auth_dot_json,
+        auth_credentials_store_mode,
+    )
 }
 
 /// Writes an in-memory auth payload for externally managed ChatGPT tokens.
@@ -437,8 +491,12 @@ pub fn save_auth(
     auth: &AuthDotJson,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<()> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
-    storage.save(auth)
+    save_auth_for_alias(
+        codex_home,
+        DEFAULT_AUTH_ALIAS,
+        auth,
+        auth_credentials_store_mode,
+    )
 }
 
 /// Load CLI auth data using the configured credential store backend.
@@ -450,8 +508,215 @@ pub fn load_auth_dot_json(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<AuthDotJson>> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let alias = resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?
+        .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
+    load_auth_dot_json_for_alias(codex_home, alias.as_str(), auth_credentials_store_mode)
+}
+
+pub fn save_auth_for_alias(
+    codex_home: &Path,
+    alias: &str,
+    auth: &AuthDotJson,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    validate_auth_alias(alias)?;
+    let storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        alias.to_string(),
+        auth_credentials_store_mode,
+    );
+    storage.save(auth)?;
+    upsert_auth_alias_metadata(codex_home, alias, auth, true)
+}
+
+pub fn load_auth_dot_json_for_alias(
+    codex_home: &Path,
+    alias: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<Option<AuthDotJson>> {
+    validate_auth_alias(alias)?;
+    let storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        alias.to_string(),
+        auth_credentials_store_mode,
+    );
     storage.load()
+}
+
+pub fn list_auth_aliases(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<Vec<AuthAliasStatus>> {
+    let mut registry = load_auth_registry(codex_home)?;
+    let mut aliases: Vec<String> = registry.aliases.keys().cloned().collect();
+    aliases.extend(load_auth_alias_names(codex_home)?);
+    if create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        DEFAULT_AUTH_ALIAS.to_string(),
+        auth_credentials_store_mode,
+    )
+    .load()?
+    .is_some()
+    {
+        aliases.push(DEFAULT_AUTH_ALIAS.to_string());
+    }
+    aliases.sort();
+    aliases.dedup();
+
+    let active_alias = resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?;
+    let now = Utc::now();
+    let mut changed = false;
+    let mut statuses = Vec::new();
+    for alias in aliases {
+        let auth =
+            load_auth_dot_json_for_alias(codex_home, alias.as_str(), auth_credentials_store_mode)?;
+        let Some(auth) = auth else {
+            continue;
+        };
+        let metadata = registry.aliases.entry(alias.clone()).or_default();
+        if metadata.auth_mode != Some(auth.resolved_mode()) {
+            metadata.auth_mode = Some(auth.resolved_mode());
+            changed = true;
+        }
+        if metadata.account_email.is_none() {
+            metadata.account_email = auth.account_email();
+            changed = true;
+        }
+        if metadata.account_id.is_none() {
+            metadata.account_id = auth.account_id();
+            changed = true;
+        }
+        if metadata
+            .exhausted_until
+            .is_some_and(|timestamp| timestamp <= now)
+        {
+            metadata.exhausted_until = None;
+            changed = true;
+        }
+        statuses.push(AuthAliasStatus {
+            alias: alias.clone(),
+            is_active: active_alias.as_deref() == Some(alias.as_str()),
+            auth_mode: Some(auth.resolved_mode()),
+            account_id: metadata.account_id.clone().or_else(|| auth.account_id()),
+            account_email: metadata
+                .account_email
+                .clone()
+                .or_else(|| auth.account_email()),
+            last_used_at: metadata.last_used_at,
+            exhausted_until: metadata.exhausted_until,
+        });
+    }
+
+    if changed {
+        save_auth_registry(codex_home, &registry)?;
+    }
+
+    statuses.sort_by(|left, right| {
+        right
+            .last_used_at
+            .cmp(&left.last_used_at)
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    Ok(statuses)
+}
+
+pub fn resolve_active_auth_alias(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<Option<String>> {
+    let registry = load_auth_registry(codex_home)?;
+    if let Some(active_alias) = registry.active_alias
+        && alias_has_auth(
+            codex_home,
+            active_alias.as_str(),
+            auth_credentials_store_mode,
+        )?
+    {
+        return Ok(Some(active_alias));
+    }
+
+    if alias_has_auth(codex_home, DEFAULT_AUTH_ALIAS, auth_credentials_store_mode)? {
+        return Ok(Some(DEFAULT_AUTH_ALIAS.to_string()));
+    }
+
+    let mut aliases: Vec<String> = registry.aliases.keys().cloned().collect();
+    aliases.extend(load_auth_alias_names(codex_home)?);
+    aliases.sort();
+    aliases.dedup();
+
+    for alias in aliases {
+        if alias_has_auth(codex_home, alias.as_str(), auth_credentials_store_mode)? {
+            return Ok(Some(alias));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn set_active_auth_alias(
+    codex_home: &Path,
+    alias: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    validate_auth_alias(alias)?;
+    if !alias_has_auth(codex_home, alias, auth_credentials_store_mode)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no login found for alias `{alias}`"),
+        ));
+    }
+    let mut registry = load_auth_registry(codex_home)?;
+    let auth = load_auth_dot_json_for_alias(codex_home, alias, auth_credentials_store_mode)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "alias auth missing"))?;
+    registry.active_alias = Some(alias.to_string());
+    let metadata = registry.aliases.entry(alias.to_string()).or_default();
+    metadata.auth_mode = Some(auth.resolved_mode());
+    metadata.account_id = metadata.account_id.clone().or_else(|| auth.account_id());
+    metadata.account_email = metadata
+        .account_email
+        .clone()
+        .or_else(|| auth.account_email());
+    metadata.last_used_at = Some(Utc::now());
+    save_auth_registry(codex_home, &registry)
+}
+
+pub fn logout_alias(
+    codex_home: &Path,
+    alias: Option<&str>,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<bool> {
+    let alias = match alias {
+        Some(alias) => {
+            validate_auth_alias(alias)?;
+            alias.to_string()
+        }
+        None => resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?
+            .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string()),
+    };
+    let removed = if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+        logout_alias_from_mode(
+            codex_home,
+            alias.as_str(),
+            AuthCredentialsStoreMode::Ephemeral,
+        )?
+    } else {
+        let removed_ephemeral = logout_alias_from_mode(
+            codex_home,
+            alias.as_str(),
+            AuthCredentialsStoreMode::Ephemeral,
+        )?;
+        let removed_managed =
+            logout_alias_from_mode(codex_home, alias.as_str(), auth_credentials_store_mode)?;
+        removed_ephemeral || removed_managed
+    };
+    let mut registry = load_auth_registry(codex_home)?;
+    registry.aliases.remove(alias.as_str());
+    if registry.active_alias.as_deref() == Some(alias.as_str()) {
+        registry.active_alias =
+            pick_replacement_active_alias(codex_home, auth_credentials_store_mode, &registry)?;
+    }
+    save_auth_registry(codex_home, &registry)?;
+    Ok(removed)
 }
 
 pub fn enforce_login_restrictions(config: &Config) -> std::io::Result<()> {
@@ -547,10 +812,26 @@ fn logout_all_stores(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<bool> {
     if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-        return logout(codex_home, AuthCredentialsStoreMode::Ephemeral);
+        let alias = resolve_active_auth_alias(codex_home, AuthCredentialsStoreMode::Ephemeral)?
+            .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
+        return logout_alias_from_mode(
+            codex_home,
+            alias.as_str(),
+            AuthCredentialsStoreMode::Ephemeral,
+        );
     }
-    let removed_ephemeral = logout(codex_home, AuthCredentialsStoreMode::Ephemeral)?;
-    let removed_managed = logout(codex_home, auth_credentials_store_mode)?;
+    let active_alias = resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?
+        .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
+    let removed_ephemeral = logout_alias_from_mode(
+        codex_home,
+        active_alias.as_str(),
+        AuthCredentialsStoreMode::Ephemeral,
+    )?;
+    let removed_managed = logout_alias_from_mode(
+        codex_home,
+        active_alias.as_str(),
+        auth_credentials_store_mode,
+    )?;
     Ok(removed_ephemeral || removed_managed)
 }
 
@@ -559,11 +840,6 @@ fn load_auth(
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<CodexAuth>> {
-    let build_auth = |auth_dot_json: AuthDotJson, storage_mode| {
-        let client = crate::default_client::create_client();
-        CodexAuth::from_auth_dot_json(codex_home, auth_dot_json, storage_mode, client)
-    };
-
     // API key via env var takes precedence over any other auth method.
     if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
         let client = crate::default_client::create_client();
@@ -572,6 +848,19 @@ fn load_auth(
             client,
         )));
     }
+
+    let active_alias = resolve_active_auth_alias(codex_home, auth_credentials_store_mode)?
+        .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
+    let build_auth = |auth_dot_json: AuthDotJson, storage_mode| {
+        let client = crate::default_client::create_client();
+        CodexAuth::from_auth_dot_json(
+            codex_home,
+            active_alias.as_str(),
+            auth_dot_json,
+            storage_mode,
+            client,
+        )
+    };
 
     // External ChatGPT auth tokens live in the in-memory (ephemeral) store. Always check this
     // first so external auth takes precedence over any persisted credentials.
@@ -583,6 +872,17 @@ fn load_auth(
         let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
         return Ok(Some(auth));
     }
+    if active_alias != DEFAULT_AUTH_ALIAS {
+        let ephemeral_storage = create_auth_storage_for_alias(
+            codex_home.to_path_buf(),
+            active_alias.clone(),
+            AuthCredentialsStoreMode::Ephemeral,
+        );
+        if let Some(auth_dot_json) = ephemeral_storage.load()? {
+            let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
+            return Ok(Some(auth));
+        }
+    }
 
     // If the caller explicitly requested ephemeral auth, there is no persisted fallback.
     if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
@@ -590,7 +890,11 @@ fn load_auth(
     }
 
     // Fall back to the configured persistent store (file/keyring/auto) for managed auth.
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        active_alias.clone(),
+        auth_credentials_store_mode,
+    );
     let auth_dot_json = match storage.load()? {
         Some(auth) => auth,
         None => return Ok(None),
@@ -598,6 +902,99 @@ fn load_auth(
 
     let auth = build_auth(auth_dot_json, auth_credentials_store_mode)?;
     Ok(Some(auth))
+}
+
+fn validate_auth_alias(alias: &str) -> std::io::Result<()> {
+    if is_valid_auth_alias(alias) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid login alias `{alias}`"),
+    ))
+}
+
+fn alias_has_auth(
+    codex_home: &Path,
+    alias: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<bool> {
+    let managed_storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        alias.to_string(),
+        auth_credentials_store_mode,
+    );
+    if managed_storage.load()?.is_some() {
+        return Ok(true);
+    }
+    let ephemeral_storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        alias.to_string(),
+        AuthCredentialsStoreMode::Ephemeral,
+    );
+    Ok(ephemeral_storage.load()?.is_some())
+}
+
+fn logout_alias_from_mode(
+    codex_home: &Path,
+    alias: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<bool> {
+    let storage = create_auth_storage_for_alias(
+        codex_home.to_path_buf(),
+        alias.to_string(),
+        auth_credentials_store_mode,
+    );
+    storage.delete()
+}
+
+fn pick_replacement_active_alias(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    registry: &AuthRegistry,
+) -> std::io::Result<Option<String>> {
+    let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = registry
+        .aliases
+        .iter()
+        .map(|(alias, metadata)| (alias.clone(), metadata.last_used_at))
+        .collect();
+    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (alias, _) in candidates {
+        if alias_has_auth(codex_home, alias.as_str(), auth_credentials_store_mode)? {
+            return Ok(Some(alias));
+        }
+    }
+    if alias_has_auth(codex_home, DEFAULT_AUTH_ALIAS, auth_credentials_store_mode)? {
+        return Ok(Some(DEFAULT_AUTH_ALIAS.to_string()));
+    }
+    Ok(None)
+}
+
+fn upsert_auth_alias_metadata(
+    codex_home: &Path,
+    alias: &str,
+    auth: &AuthDotJson,
+    make_active: bool,
+) -> std::io::Result<()> {
+    let mut registry = load_auth_registry(codex_home)?;
+    let metadata = registry.aliases.entry(alias.to_string()).or_default();
+    metadata.auth_mode = Some(auth.resolved_mode());
+    metadata.account_id = auth.account_id();
+    metadata.account_email = auth.account_email();
+    metadata.last_used_at = Some(Utc::now());
+    if make_active {
+        registry.active_alias = Some(alias.to_string());
+    }
+    save_auth_registry(codex_home, &registry)
+}
+
+fn alias_matches_auth_mode(alias_mode: Option<ApiAuthMode>, current_mode: AuthMode) -> bool {
+    matches!(
+        (alias_mode, current_mode),
+        (Some(ApiAuthMode::ApiKey), AuthMode::ApiKey)
+            | (Some(ApiAuthMode::Chatgpt), AuthMode::Chatgpt)
+            | (Some(ApiAuthMode::ChatgptAuthTokens), AuthMode::Chatgpt)
+    )
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
@@ -749,6 +1146,21 @@ fn refresh_token_endpoint() -> String {
 }
 
 impl AuthDotJson {
+    fn account_id(&self) -> Option<String> {
+        self.tokens.as_ref().and_then(|tokens| {
+            tokens
+                .account_id
+                .clone()
+                .or_else(|| tokens.id_token.chatgpt_account_id.clone())
+        })
+    }
+
+    fn account_email(&self) -> Option<String> {
+        self.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.id_token.email.clone())
+    }
+
     fn from_external_tokens(external: &ExternalAuthTokens) -> std::io::Result<Self> {
         let mut token_info =
             parse_chatgpt_jwt_claims(&external.access_token).map_err(std::io::Error::other)?;
@@ -971,6 +1383,7 @@ impl UnauthorizedRecovery {
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
+    runtime_exhausted_aliases: RwLock<HashMap<String, Option<DateTime<Utc>>>>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: RwLock<Option<String>>,
@@ -999,6 +1412,7 @@ impl AuthManager {
                 auth: managed_auth,
                 external_refresher: None,
             }),
+            runtime_exhausted_aliases: RwLock::new(HashMap::new()),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             forced_chatgpt_workspace_id: RwLock::new(None),
@@ -1015,6 +1429,7 @@ impl AuthManager {
         Arc::new(Self {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
+            runtime_exhausted_aliases: RwLock::new(HashMap::new()),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
@@ -1033,6 +1448,7 @@ impl AuthManager {
         Arc::new(Self {
             codex_home,
             inner: RwLock::new(cached),
+            runtime_exhausted_aliases: RwLock::new(HashMap::new()),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
@@ -1146,6 +1562,12 @@ impl AuthManager {
         }
     }
 
+    pub fn clear_external_auth_refresher(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.external_refresher = None;
+        }
+    }
+
     pub fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<String>) {
         if let Ok(mut guard) = self.forced_chatgpt_workspace_id.write() {
             *guard = workspace_id;
@@ -1165,6 +1587,23 @@ impl AuthManager {
             .ok()
             .map(|guard| guard.external_refresher.is_some())
             .unwrap_or(false)
+    }
+
+    pub fn active_alias(&self) -> String {
+        resolve_active_auth_alias(&self.codex_home, self.auth_credentials_store_mode)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string())
+    }
+
+    pub fn list_aliases(&self) -> std::io::Result<Vec<AuthAliasStatus>> {
+        list_auth_aliases(&self.codex_home, self.auth_credentials_store_mode)
+    }
+
+    pub fn switch_active_alias(&self, alias: &str) -> std::io::Result<()> {
+        set_active_auth_alias(&self.codex_home, alias, self.auth_credentials_store_mode)?;
+        self.reload();
+        Ok(())
     }
 
     pub fn is_external_auth_active(&self) -> bool {
@@ -1251,8 +1690,18 @@ impl AuthManager {
     /// reloads the in‑memory auth cache so callers immediately observe the
     /// unauthenticated state.
     pub fn logout(&self) -> std::io::Result<bool> {
-        let removed = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
+        let removed = logout_alias(&self.codex_home, None, self.auth_credentials_store_mode)?;
         // Always reload to clear any cached auth (even if file absent).
+        self.reload();
+        Ok(removed)
+    }
+
+    pub fn logout_alias(&self, alias: &str) -> std::io::Result<bool> {
+        let removed = logout_alias(
+            &self.codex_home,
+            Some(alias),
+            self.auth_credentials_store_mode,
+        )?;
         self.reload();
         Ok(removed)
     }
@@ -1263,6 +1712,82 @@ impl AuthManager {
 
     pub fn auth_mode(&self) -> Option<AuthMode> {
         self.auth_cached().as_ref().map(CodexAuth::auth_mode)
+    }
+
+    pub fn failover_from_usage_limit(
+        &self,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> std::io::Result<Option<AuthFailover>> {
+        let current_auth = match self.auth_cached() {
+            Some(auth) => auth,
+            None => return Ok(None),
+        };
+        let current_alias = self.active_alias();
+        self.mark_alias_exhausted(current_alias.as_str(), resets_at)?;
+        let current_mode = current_auth.auth_mode();
+        let mut aliases = self.list_aliases()?;
+        aliases.sort_by(|left, right| {
+            right
+                .last_used_at
+                .cmp(&left.last_used_at)
+                .then_with(|| left.alias.cmp(&right.alias))
+        });
+
+        let now = Utc::now();
+        for alias in aliases {
+            if alias.alias == current_alias
+                || !alias_matches_auth_mode(alias.auth_mode, current_mode)
+            {
+                continue;
+            }
+            let exhausted_until =
+                self.effective_exhausted_until(alias.alias.as_str(), alias.exhausted_until);
+            if exhausted_until.is_some_and(|timestamp| timestamp > now) {
+                continue;
+            }
+            self.switch_active_alias(alias.alias.as_str())?;
+            return Ok(Some(AuthFailover {
+                previous_alias: current_alias,
+                next_alias: alias.alias,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn effective_exhausted_until(
+        &self,
+        alias: &str,
+        persisted_exhausted_until: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let runtime = self
+            .runtime_exhausted_aliases
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(alias).copied())
+            .flatten();
+        match (runtime, persisted_exhausted_until) {
+            (Some(runtime), Some(persisted)) => Some(runtime.max(persisted)),
+            (Some(runtime), None) => Some(runtime),
+            (None, Some(persisted)) => Some(persisted),
+            (None, None) => None,
+        }
+    }
+
+    fn mark_alias_exhausted(
+        &self,
+        alias: &str,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> std::io::Result<()> {
+        if let Ok(mut guard) = self.runtime_exhausted_aliases.write() {
+            guard.insert(alias.to_string(), resets_at);
+        }
+        if let Some(resets_at) = resets_at {
+            let mut registry = load_auth_registry(&self.codex_home)?;
+            let metadata = registry.aliases.entry(alias.to_string()).or_default();
+            metadata.exhausted_until = Some(resets_at);
+            save_auth_registry(&self.codex_home, &registry)?;
+        }
+        Ok(())
     }
 
     async fn refresh_if_stale(&self, auth: &CodexAuth) -> Result<bool, RefreshTokenError> {
@@ -1437,12 +1962,98 @@ mod tests {
         super::login_with_api_key(dir.path(), "sk-new", AuthCredentialsStoreMode::File)
             .expect("login_with_api_key should succeed");
 
-        let storage = FileAuthStorage::new(dir.path().to_path_buf());
+        let storage =
+            FileAuthStorage::new(dir.path().to_path_buf(), DEFAULT_AUTH_ALIAS.to_string());
         let auth = storage
             .try_read_auth_json(&auth_path)
             .expect("auth.json should parse");
         assert_eq!(auth.openai_api_key.as_deref(), Some("sk-new"));
         assert!(auth.tokens.is_none(), "tokens should be cleared");
+    }
+
+    #[test]
+    fn named_alias_round_trips_and_can_become_active() {
+        let dir = tempdir().unwrap();
+
+        super::login_with_api_key(dir.path(), "sk-default", AuthCredentialsStoreMode::File)
+            .expect("default login should succeed");
+        super::login_with_api_key_for_alias(
+            dir.path(),
+            "foo",
+            "sk-foo",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("named login should succeed");
+
+        let aliases = super::list_auth_aliases(dir.path(), AuthCredentialsStoreMode::File)
+            .expect("aliases should load");
+        assert_eq!(
+            aliases
+                .iter()
+                .map(|alias| alias.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foo", "default"]
+        );
+        assert!(
+            aliases
+                .iter()
+                .any(|alias| alias.alias == "foo" && alias.is_active),
+            "named login should become active"
+        );
+
+        super::set_active_auth_alias(
+            dir.path(),
+            DEFAULT_AUTH_ALIAS,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("switching active alias should succeed");
+        let auth = CodexAuth::from_auth_storage(dir.path(), AuthCredentialsStoreMode::File)
+            .expect("load auth should succeed")
+            .expect("active auth should exist");
+        assert_eq!(auth.api_key(), Some("sk-default"));
+    }
+
+    #[test]
+    fn auth_manager_failover_switches_to_next_same_kind_alias() {
+        let dir = tempdir().unwrap();
+
+        super::login_with_api_key(dir.path(), "sk-default", AuthCredentialsStoreMode::File)
+            .expect("default login should succeed");
+        super::login_with_api_key_for_alias(
+            dir.path(),
+            "backup",
+            "sk-backup",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("backup login should succeed");
+        super::set_active_auth_alias(
+            dir.path(),
+            DEFAULT_AUTH_ALIAS,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("default should become active");
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let failover = manager
+            .failover_from_usage_limit(None)
+            .expect("failover should succeed")
+            .expect("failover should find a backup alias");
+        assert_eq!(
+            failover,
+            AuthFailover {
+                previous_alias: DEFAULT_AUTH_ALIAS.to_string(),
+                next_alias: "backup".to_string(),
+            }
+        );
+        assert_eq!(manager.active_alias(), "backup".to_string());
+        assert_eq!(
+            manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
+            Some("sk-backup")
+        );
     }
 
     #[test]

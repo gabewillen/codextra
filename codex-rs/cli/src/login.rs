@@ -11,8 +11,13 @@ use codex_core::CodexAuth;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthMode;
 use codex_core::auth::CLIENT_ID;
-use codex_core::auth::login_with_api_key;
-use codex_core::auth::logout;
+use codex_core::auth::DEFAULT_AUTH_ALIAS;
+use codex_core::auth::is_valid_auth_alias;
+use codex_core::auth::list_auth_aliases;
+use codex_core::auth::login_with_api_key_for_alias;
+use codex_core::auth::logout_alias;
+use codex_core::auth::resolve_active_auth_alias;
+use codex_core::auth::set_active_auth_alias;
 use codex_core::config::Config;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
@@ -112,11 +117,13 @@ fn print_login_server_start(actual_port: u16, auth_url: &str) {
 
 pub async fn login_with_chatgpt(
     codex_home: PathBuf,
+    alias: String,
     forced_chatgpt_workspace_id: Option<String>,
     cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<()> {
     let opts = ServerOptions::new(
         codex_home,
+        alias,
         CLIENT_ID.to_string(),
         forced_chatgpt_workspace_id,
         cli_auth_credentials_store_mode,
@@ -128,7 +135,10 @@ pub async fn login_with_chatgpt(
     server.block_until_done().await
 }
 
-pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_login_with_chatgpt(
+    cli_config_overrides: CliConfigOverrides,
+    alias: Option<String>,
+) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
     let _login_log_guard = init_login_file_logging(&config);
     tracing::info!("starting browser login flow");
@@ -139,9 +149,11 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
     }
 
     let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
+    let alias = normalize_alias_or_exit(alias);
 
     match login_with_chatgpt(
         config.codex_home,
+        alias,
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
     )
@@ -160,6 +172,7 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
 
 pub async fn run_login_with_api_key(
     cli_config_overrides: CliConfigOverrides,
+    alias: Option<String>,
     api_key: String,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
@@ -170,9 +183,11 @@ pub async fn run_login_with_api_key(
         eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
     }
+    let alias = normalize_alias_or_exit(alias);
 
-    match login_with_api_key(
+    match login_with_api_key_for_alias(
         &config.codex_home,
+        alias.as_str(),
         &api_key,
         config.cli_auth_credentials_store_mode,
     ) {
@@ -217,6 +232,7 @@ pub fn read_api_key_from_stdin() -> String {
 /// Login using the OAuth device code flow.
 pub async fn run_login_with_device_code(
     cli_config_overrides: CliConfigOverrides,
+    alias: Option<String>,
     issuer_base_url: Option<String>,
     client_id: Option<String>,
 ) -> ! {
@@ -228,8 +244,10 @@ pub async fn run_login_with_device_code(
         std::process::exit(1);
     }
     let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
+    let alias = normalize_alias_or_exit(alias);
     let mut opts = ServerOptions::new(
         config.codex_home,
+        alias,
         client_id.unwrap_or(CLIENT_ID.to_string()),
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
@@ -255,6 +273,7 @@ pub async fn run_login_with_device_code(
 /// falls back to starting the local browser login server.
 pub async fn run_login_with_device_code_fallback_to_browser(
     cli_config_overrides: CliConfigOverrides,
+    alias: Option<String>,
     issuer_base_url: Option<String>,
     client_id: Option<String>,
 ) -> ! {
@@ -267,8 +286,10 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     }
 
     let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
+    let alias = normalize_alias_or_exit(alias);
     let mut opts = ServerOptions::new(
         config.codex_home,
+        alias,
         client_id.unwrap_or(CLIENT_ID.to_string()),
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
@@ -315,12 +336,20 @@ pub async fn run_login_with_device_code_fallback_to_browser(
 
 pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
+    let active_alias =
+        resolve_active_auth_alias(&config.codex_home, config.cli_auth_credentials_store_mode)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
 
     match CodexAuth::from_auth_storage(&config.codex_home, config.cli_auth_credentials_store_mode) {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
-                    eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
+                    eprintln!(
+                        "Logged in as `{active_alias}` using an API key - {}",
+                        safe_format_key(&api_key)
+                    );
                     std::process::exit(0);
                 }
                 Err(e) => {
@@ -329,7 +358,7 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
                 }
             },
             AuthMode::Chatgpt => {
-                eprintln!("Logged in using ChatGPT");
+                eprintln!("Logged in as `{active_alias}` using ChatGPT");
                 std::process::exit(0);
             }
         },
@@ -344,10 +373,70 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     }
 }
 
-pub async fn run_logout(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_login_list(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
+    match list_auth_aliases(&config.codex_home, config.cli_auth_credentials_store_mode) {
+        Ok(statuses) if statuses.is_empty() => {
+            eprintln!("No stored logins");
+            std::process::exit(1);
+        }
+        Ok(statuses) => {
+            for status in statuses {
+                let active = if status.is_active { "*" } else { " " };
+                let mode = match status.auth_mode {
+                    Some(codex_app_server_protocol::AuthMode::ApiKey) => "api-key",
+                    Some(codex_app_server_protocol::AuthMode::Chatgpt) => "chatgpt",
+                    Some(codex_app_server_protocol::AuthMode::ChatgptAuthTokens) => {
+                        "chatgpt-external"
+                    }
+                    None => "unknown",
+                };
+                let mut parts = vec![format!("{active} {}", status.alias), format!("({mode})")];
+                if let Some(email) = status.account_email {
+                    parts.push(email);
+                }
+                if let Some(exhausted_until) = status.exhausted_until {
+                    parts.push(format!("exhausted until {exhausted_until}"));
+                }
+                eprintln!("{}", parts.join(" "));
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("Error listing logins: {err}");
+            std::process::exit(1);
+        }
+    }
+}
 
-    match logout(&config.codex_home, config.cli_auth_credentials_store_mode) {
+pub async fn run_login_use(cli_config_overrides: CliConfigOverrides, alias: String) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let alias = normalize_alias_or_exit(Some(alias));
+    match set_active_auth_alias(
+        &config.codex_home,
+        alias.as_str(),
+        config.cli_auth_credentials_store_mode,
+    ) {
+        Ok(()) => {
+            eprintln!("Switched active login to `{alias}`");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("Error switching login: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn run_logout(cli_config_overrides: CliConfigOverrides, alias: Option<String>) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let alias = alias.map(|alias| normalize_alias_or_exit(Some(alias)));
+
+    match logout_alias(
+        &config.codex_home,
+        alias.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    ) {
         Ok(true) => {
             eprintln!("Successfully logged out");
             std::process::exit(0);
@@ -388,6 +477,15 @@ fn safe_format_key(key: &str) -> String {
     let prefix = &key[..8];
     let suffix = &key[key.len() - 5..];
     format!("{prefix}***{suffix}")
+}
+
+fn normalize_alias_or_exit(alias: Option<String>) -> String {
+    let alias = alias.unwrap_or_else(|| DEFAULT_AUTH_ALIAS.to_string());
+    if is_valid_auth_alias(alias.as_str()) {
+        return alias;
+    }
+    eprintln!("Invalid login alias `{alias}`. Use only letters, numbers, '.', '-', and '_'.");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

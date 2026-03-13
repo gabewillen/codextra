@@ -1623,7 +1623,7 @@ async fn background_auto_compactions_are_single_flight_while_one_is_in_progress(
 }
 
 #[tokio::test]
-async fn completed_background_auto_compactions_keep_new_launches_closed_for_the_turn() {
+async fn completed_background_auto_compactions_block_new_launches_until_consumed() {
     let mut active_turn = crate::state::ActiveTurn::default();
 
     let launch_ordinal = active_turn.next_background_auto_compaction_launch_ordinal();
@@ -1660,8 +1660,8 @@ async fn completed_background_auto_compactions_keep_new_launches_closed_for_the_
         "snapshot-1"
     );
     assert!(
-        !active_turn.can_start_background_auto_compaction(3),
-        "consuming the terminal outcome should not reopen background compaction inside the same turn"
+        active_turn.can_start_background_auto_compaction(3),
+        "consuming the terminal outcome should reopen background compaction for later work in the same turn"
     );
 }
 
@@ -2009,8 +2009,8 @@ async fn failed_completed_background_auto_compaction_can_be_consumed_once() {
         }
 
         assert!(
-            !active_turn.can_start_background_auto_compaction(3),
-            "consuming the failed terminal outcome should still keep background compaction closed for the rest of the turn"
+            active_turn.can_start_background_auto_compaction(3),
+            "consuming the failed terminal outcome should reopen background compaction for later work in the same turn"
         );
         assert!(
             active_turn
@@ -2101,8 +2101,8 @@ async fn successful_completed_background_auto_compaction_can_be_consumed_once() 
         }
 
         assert!(
-            !active_turn.can_start_background_auto_compaction(3),
-            "consuming the successful terminal outcome should still keep background compaction closed for the rest of the turn"
+            active_turn.can_start_background_auto_compaction(3),
+            "consuming the successful terminal outcome should reopen background compaction for later work in the same turn"
         );
         assert!(
             active_turn
@@ -2152,8 +2152,8 @@ async fn aborted_background_auto_compaction_leaves_no_completed_terminal_state()
         background_auto_compaction.handle.abort();
 
         assert!(
-            !active_turn.can_start_background_auto_compaction(3),
-            "aborting an in-flight background compaction should still keep background compaction closed for the rest of the turn"
+            active_turn.can_start_background_auto_compaction(3),
+            "aborting an in-flight background compaction should reopen background compaction once nothing is tracked"
         );
         assert!(
             active_turn

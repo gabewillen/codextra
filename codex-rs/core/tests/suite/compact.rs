@@ -668,7 +668,7 @@ async fn manual_compact_emits_context_compaction_items() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_auto_compact_stays_single_flight_per_active_turn() {
+async fn background_auto_compact_stays_single_flight_while_in_flight() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -828,6 +828,111 @@ async fn background_auto_compact_stays_single_flight_per_active_turn() {
             .unwrap_or_default()
             .contains(first_function_name),
         "continued turn should still send the active turn tool output before background apply completes"
+    );
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_auto_compact_can_run_multiple_times_sequentially_in_one_turn() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_call_id = "call-sequential-1";
+    let second_call_id = "call-sequential-2";
+    let third_call_id = "call-sequential-3";
+    let first_turn = sse(vec![
+        ev_function_call(first_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 500),
+    ]);
+    let second_turn = sse(vec![
+        ev_function_call(second_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r2", 500),
+    ]);
+    let first_compact_turn = sse(vec![
+        ev_assistant_message("m3", &auto_summary(FIRST_AUTO_SUMMARY)),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+    let third_turn = sse(vec![
+        ev_function_call(third_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r4", 450),
+    ]);
+    let second_compact_turn = sse(vec![
+        ev_assistant_message("m5", &auto_summary(SECOND_AUTO_SUMMARY)),
+        ev_completed_with_tokens("r5", 10),
+    ]);
+    let final_turn = sse(vec![
+        ev_assistant_message("m6", FINAL_REPLY),
+        ev_completed_with_tokens("r6", 50),
+    ]);
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            first_turn,
+            second_turn,
+            first_compact_turn,
+            third_turn,
+            second_compact_turn,
+            final_turn,
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200);
+    });
+    let codex = builder.build(&server).await.expect("build codex").codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MULTI_AUTO_MSG.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    let request_bodies = requests
+        .iter()
+        .map(|request| request.body_json().to_string())
+        .collect::<Vec<_>>();
+    let request_shapes = requests
+        .iter()
+        .map(|request| {
+            format!(
+                "summarize={} user={:?} first_call_output={} second_call_output={}",
+                request.body_contains_text(SUMMARIZATION_PROMPT),
+                request.message_input_texts("user"),
+                request.function_call_output_text(first_call_id).is_some(),
+                request.function_call_output_text(second_call_id).is_some()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_bodies.len(),
+        6,
+        "unexpected request flow: {request_shapes:#?}"
+    );
+    let compaction_request_indices = request_bodies
+        .iter()
+        .enumerate()
+        .filter_map(|(index, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compaction_request_indices,
+        vec![2, 5],
+        "expected one long-running turn to issue two sequential background compactions; got request shapes: {request_shapes:#?}"
     );
 
     codex.submit(Op::Shutdown).await.unwrap();
