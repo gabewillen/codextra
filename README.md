@@ -3,8 +3,9 @@
 `codextra` is a thin wrapper around `codex`.
 
 It starts a local proxy, launches the real `codex` binary with the proxy URL in
-Codex's `chatgpt_base_url` config override, and otherwise passes arguments
-through unchanged. The proxy is where account rotation will live.
+Codex's `chatgpt_base_url` config override while preserving Codex's
+`/backend-api` base path, and otherwise passes arguments through unchanged. The
+proxy is where account rotation will live.
 
 This repo intentionally uses only the Go standard library.
 

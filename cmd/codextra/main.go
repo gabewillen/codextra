@@ -21,7 +21,7 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 2
+const proxyStateVersion = 3
 const defaultProxyLogMaxBytes int64 = 1 << 20
 
 func main() {
@@ -331,9 +331,13 @@ func getenv(key, fallback string) string {
 
 func codexArgs(proxyURL string, userArgs []string) []string {
 	args := make([]string, 0, len(userArgs)+2)
-	args = append(args, "-c", "chatgpt_base_url="+proxyURL)
+	args = append(args, "-c", "chatgpt_base_url="+codexChatGPTBaseURL(proxyURL))
 	args = append(args, userArgs...)
 	return args
+}
+
+func codexChatGPTBaseURL(proxyURL string) string {
+	return strings.TrimRight(proxyURL, "/") + "/backend-api"
 }
 
 func codexEnv(base []string, proxyURL string) []string {
