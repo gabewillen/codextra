@@ -25,7 +25,7 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 10
+const proxyStateVersion = 11
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 
@@ -516,14 +516,27 @@ func getenv(key, fallback string) string {
 }
 
 func codexArgs(proxyURL string, userArgs []string) []string {
-	args := make([]string, 0, len(userArgs)+2)
+	args := make([]string, 0, len(userArgs)+6)
 	args = append(args, "-c", "chatgpt_base_url="+codexChatGPTBaseURL(proxyURL))
+	args = append(args, "-c", "model_providers.codextra="+codexModelProviderConfig(proxyURL))
+	args = append(args, "-c", `model_provider="codextra"`)
 	args = append(args, userArgs...)
 	return args
 }
 
 func codexChatGPTBaseURL(proxyURL string) string {
 	return strings.TrimRight(proxyURL, "/") + "/backend-api"
+}
+
+func codexChatGPTCodexBaseURL(proxyURL string) string {
+	return codexChatGPTBaseURL(proxyURL) + "/codex"
+}
+
+func codexModelProviderConfig(proxyURL string) string {
+	return fmt.Sprintf(
+		`{ name="Codextra", base_url="%s", wire_api="responses", requires_openai_auth=true }`,
+		codexChatGPTCodexBaseURL(proxyURL),
+	)
 }
 
 func prepareCodexHome(account accounts.Account) (string, func(), error) {

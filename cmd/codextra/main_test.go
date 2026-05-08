@@ -24,6 +24,10 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	want := []string{
 		"-c",
 		"chatgpt_base_url=http://127.0.0.1:1234/backend-api",
+		"-c",
+		`model_providers.codextra={ name="Codextra", base_url="http://127.0.0.1:1234/backend-api/codex", wire_api="responses", requires_openai_auth=true }`,
+		"-c",
+		`model_provider="codextra"`,
 		"--model",
 		"gpt-5.4",
 		"--",
@@ -98,10 +102,16 @@ func TestActivateAccountSelectsAliasEvenWhenDisabled(t *testing.T) {
 func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	t.Parallel()
 
-	got := codexArgs("http://proxy", []string{"-c", "chatgpt_base_url=http://custom"})
+	got := codexArgs("http://proxy", []string{
+		"-c", "chatgpt_base_url=http://custom",
+		"-c", `model_provider="openai"`,
+	})
 	want := []string{
 		"-c", "chatgpt_base_url=http://proxy/backend-api",
+		"-c", `model_providers.codextra={ name="Codextra", base_url="http://proxy/backend-api/codex", wire_api="responses", requires_openai_auth=true }`,
+		"-c", `model_provider="codextra"`,
 		"-c", "chatgpt_base_url=http://custom",
+		"-c", `model_provider="openai"`,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("codexArgs() = %#v, want %#v", got, want)
@@ -115,6 +125,16 @@ func TestCodexChatGPTBaseURLPreservesBackendAPIBasePath(t *testing.T) {
 	want := "http://127.0.0.1:1234/backend-api"
 	if got != want {
 		t.Fatalf("codexChatGPTBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestCodexModelProviderConfigUsesChatGPTCodexBasePath(t *testing.T) {
+	t.Parallel()
+
+	got := codexModelProviderConfig("http://127.0.0.1:1234/")
+	want := `{ name="Codextra", base_url="http://127.0.0.1:1234/backend-api/codex", wire_api="responses", requires_openai_auth=true }`
+	if got != want {
+		t.Fatalf("codexModelProviderConfig() = %q, want %q", got, want)
 	}
 }
 
