@@ -8,6 +8,16 @@ through unchanged. The proxy is where account rotation will live.
 
 This repo intentionally uses only the Go standard library.
 
+## Why Proxy
+
+This started as a feature added directly to a Codex fork. That worked, but Codex
+moves quickly and Rust compile times made the fork expensive to keep current.
+
+`codextra` keeps the account-rotation behavior outside the Codex codebase. The
+goal is to preserve a small maintenance surface: launch Codex normally, point its
+ChatGPT backend traffic at a local proxy, and keep rotation policy in this repo
+instead of repeatedly merging a large upstream project.
+
 ## Usage
 
 ```sh
