@@ -50,6 +50,65 @@ func TestCodexEnvAppendsProxyURLWithoutDroppingBase(t *testing.T) {
 	}
 }
 
+func TestParseCodextraArgsConsumesAccountFlag(t *testing.T) {
+	t.Parallel()
+
+	account, pass, err := parseCodextraArgs([]string{"--account", "work", "--model", "gpt-5.4"})
+	if err != nil {
+		t.Fatalf("parseCodextraArgs() error = %v", err)
+	}
+	if account != "work" {
+		t.Fatalf("account = %q, want work", account)
+	}
+	want := []string{"--model", "gpt-5.4"}
+	if !reflect.DeepEqual(pass, want) {
+		t.Fatalf("pass = %#v, want %#v", pass, want)
+	}
+}
+
+func TestParseCodextraArgsConsumesAccountEqualsFlag(t *testing.T) {
+	t.Parallel()
+
+	account, pass, err := parseCodextraArgs([]string{"--model", "gpt-5.4", "--account=personal", "prompt"})
+	if err != nil {
+		t.Fatalf("parseCodextraArgs() error = %v", err)
+	}
+	if account != "personal" {
+		t.Fatalf("account = %q, want personal", account)
+	}
+	want := []string{"--model", "gpt-5.4", "prompt"}
+	if !reflect.DeepEqual(pass, want) {
+		t.Fatalf("pass = %#v, want %#v", pass, want)
+	}
+}
+
+func TestParseCodextraArgsLeavesArgumentsAfterDashDashUntouched(t *testing.T) {
+	t.Parallel()
+
+	account, pass, err := parseCodextraArgs([]string{"--account=work", "--", "--account", "literal"})
+	if err != nil {
+		t.Fatalf("parseCodextraArgs() error = %v", err)
+	}
+	if account != "work" {
+		t.Fatalf("account = %q, want work", account)
+	}
+	want := []string{"--", "--account", "literal"}
+	if !reflect.DeepEqual(pass, want) {
+		t.Fatalf("pass = %#v, want %#v", pass, want)
+	}
+}
+
+func TestParseCodextraArgsRejectsMissingAccountAlias(t *testing.T) {
+	t.Parallel()
+
+	if _, _, err := parseCodextraArgs([]string{"--account"}); err == nil {
+		t.Fatal("parseCodextraArgs(--account) error = nil, want error")
+	}
+	if _, _, err := parseCodextraArgs([]string{"--account="}); err == nil {
+		t.Fatal("parseCodextraArgs(--account=) error = nil, want error")
+	}
+}
+
 func TestGetenvUsesFallbackOnlyForEmptyValues(t *testing.T) {
 	t.Setenv("CODEXTRA_TEST_VALUE", "set")
 	t.Setenv("CODEXTRA_TEST_EMPTY", "")

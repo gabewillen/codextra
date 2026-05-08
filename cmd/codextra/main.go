@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,12 +37,22 @@ func run() error {
 		return runProxyServer(ctx)
 	}
 
+	accountAlias, userArgs, err := parseCodextraArgs(os.Args[1:])
+	if err != nil {
+		return err
+	}
+	if accountAlias != "" {
+		if err := activateAccount(accountAlias); err != nil {
+			return err
+		}
+	}
+
 	proxyURL, err := ensureProxy()
 	if err != nil {
 		return err
 	}
 
-	codexArgs := codexArgs(proxyURL, os.Args[1:])
+	codexArgs := codexArgs(proxyURL, userArgs)
 	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -224,6 +235,21 @@ func defaultStorePath() (string, error) {
 	return filepath.Join(dir, "accounts.json"), nil
 }
 
+func activateAccount(alias string) error {
+	storePath, err := defaultStorePath()
+	if err != nil {
+		return err
+	}
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		return err
+	}
+	if err := store.SetActive(alias); err != nil {
+		return err
+	}
+	return nil
+}
+
 func codextraDir() (string, error) {
 	if dir := os.Getenv("CODEXTRA_HOME"); dir != "" {
 		return dir, nil
@@ -255,4 +281,33 @@ func codexEnv(base []string, proxyURL string) []string {
 	env = append(env, base...)
 	env = append(env, "CODEXTRA_PROXY_URL="+proxyURL)
 	return env
+}
+
+func parseCodextraArgs(args []string) (string, []string, error) {
+	var account string
+	pass := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			pass = append(pass, args[i:]...)
+			break
+		}
+		if arg == "--account" {
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--account requires an alias")
+			}
+			account = args[i+1]
+			i++
+			continue
+		}
+		if value, ok := strings.CutPrefix(arg, "--account="); ok {
+			if value == "" {
+				return "", nil, fmt.Errorf("--account requires an alias")
+			}
+			account = value
+			continue
+		}
+		pass = append(pass, arg)
+	}
+	return account, pass, nil
 }

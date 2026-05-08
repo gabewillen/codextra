@@ -114,6 +114,23 @@ func (s *Store) Upsert(account Account) error {
 	return s.saveLocked()
 }
 
+func (s *Store) SetActive(alias string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for _, account := range s.Data.Accounts {
+		if account.Alias == alias {
+			if account.AccessToken == "" {
+				return fmt.Errorf("account %q has no access token", alias)
+			}
+			s.Data.ActiveAlias = alias
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("account %q not found", alias)
+}
+
 func (s *Store) findEligibleLocked(alias string, now time.Time) (Account, bool) {
 	for _, account := range s.Data.Accounts {
 		if account.Alias == alias && eligible(account, now) {

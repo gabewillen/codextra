@@ -209,6 +209,49 @@ func TestRotateFromWithoutNextEligiblePersistsLimit(t *testing.T) {
 	}
 }
 
+func TestSetActivePersistsSelectedAccount(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{
+		ActiveAlias: "personal",
+		Accounts: []Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: "token-work"},
+		},
+	}
+	if err := store.SetActive("work"); err != nil {
+		t.Fatalf("SetActive() error = %v", err)
+	}
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	if loaded.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want work", loaded.Data.ActiveAlias)
+	}
+}
+
+func TestSetActiveRejectsMissingOrTokenlessAccount(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{Accounts: []Account{{Alias: "empty"}}}
+	if err := store.SetActive("empty"); err == nil {
+		t.Fatal("SetActive(tokenless) error = nil, want error")
+	}
+	if err := store.SetActive("missing"); err == nil {
+		t.Fatal("SetActive(missing) error = nil, want error")
+	}
+}
+
 func TestCurrentReturnsFalseWhenNoEligibleAccount(t *testing.T) {
 	t.Parallel()
 

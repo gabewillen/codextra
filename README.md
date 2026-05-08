@@ -30,6 +30,7 @@ through to `codex`.
 ```sh
 codextra login personal
 codextra login work --device-auth
+codextra --account work
 ```
 
 `login <alias>` runs the normal `codex login`, imports the resulting active
@@ -39,6 +40,10 @@ under the alias.
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
 `chatgpt_base_url` override.
+
+Use `--account <alias>` or `--account=<alias>` to switch the active codextra
+account before launching Codex. The flag is consumed by `codextra` and is not
+passed through to `codex`.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
