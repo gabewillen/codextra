@@ -97,21 +97,6 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
-			if h.updateUsageLimits(r, resp, account) {
-				resp.Body.Close()
-				account, ok = h.store.Current(time.Now())
-				if !ok {
-					h.logger.Warn("no_eligible_account_after_usage_update", "method", r.Method, "path", r.URL.Path)
-					http.Error(w, "codextra has no eligible account", http.StatusServiceUnavailable)
-					return
-				}
-				resp, err = h.forward(r.Context(), r, body, account)
-				if err != nil {
-					h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
-					http.Error(w, err.Error(), http.StatusBadGateway)
-					return
-				}
-			}
 			captured, err := copyResponse(w, resp, responseCaptureLimit(resp))
 			h.logResponse(r, resp, account, time.Since(start), captured, err)
 			return
@@ -134,34 +119,6 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
 	}
-}
-
-func (h *handler) updateUsageLimits(r *http.Request, resp *http.Response, account accounts.Account) bool {
-	if r.URL.Path != "/backend-api/wham/usage" || resp.StatusCode != http.StatusOK {
-		return false
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.logger.Warn("usage_body_read_failed", "path", r.URL.Path, "alias", account.Alias, "error", err)
-		return false
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-
-	limit, resetAt, exhausted := exhaustedUsageLimit(body)
-	if !exhausted {
-		return false
-	}
-	next, rotated, err := h.store.RotateFrom(account.Alias, limit, resetAt, time.Now())
-	if err != nil {
-		h.logger.Warn("usage_rotation_failed", "path", r.URL.Path, "alias", account.Alias, "limit", limit, "error", err)
-		return false
-	}
-	if !rotated {
-		h.logger.Warn("usage_rotation_exhausted", "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
-		return false
-	}
-	h.logger.Info("usage_rotation_detected", "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
-	return true
 }
 
 func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {
@@ -283,30 +240,6 @@ func limitInfo(resp *http.Response) (string, time.Time) {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	return limit, resetAt
-}
-
-func exhaustedUsageLimit(body []byte) (string, time.Time, bool) {
-	var payload struct {
-		RateLimit struct {
-			PrimaryWindow   usageWindow `json:"primary_window"`
-			SecondaryWindow usageWindow `json:"secondary_window"`
-		} `json:"rate_limit"`
-	}
-	if json.Unmarshal(body, &payload) != nil {
-		return "", time.Time{}, false
-	}
-	if payload.RateLimit.SecondaryWindow.UsedPercent >= 100 {
-		return "codex_weekly", time.Unix(payload.RateLimit.SecondaryWindow.ResetAt, 0), true
-	}
-	if payload.RateLimit.PrimaryWindow.UsedPercent >= 100 {
-		return "codex_5h", time.Unix(payload.RateLimit.PrimaryWindow.ResetAt, 0), true
-	}
-	return "", time.Time{}, false
-}
-
-type usageWindow struct {
-	UsedPercent int   `json:"used_percent"`
-	ResetAt     int64 `json:"reset_at"`
 }
 
 func usageLimitMarker(body []byte) bool {

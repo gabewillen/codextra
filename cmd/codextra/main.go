@@ -24,7 +24,7 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 8
+const proxyStateVersion = 9
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 
