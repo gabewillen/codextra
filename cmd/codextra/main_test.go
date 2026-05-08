@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
@@ -72,8 +73,12 @@ func TestActivateAccountSelectsAliasEvenWhenDisabled(t *testing.T) {
 		t.Fatalf("Upsert(fallback) error = %v", err)
 	}
 
-	if err := activateAccount("limited"); err != nil {
+	account, err := activateAccount("limited")
+	if err != nil {
 		t.Fatalf("activateAccount(limited) error = %v", err)
+	}
+	if account.Alias != "limited" {
+		t.Fatalf("activated account alias = %q, want limited", account.Alias)
 	}
 
 	reloaded, err := accounts.LoadStore(storePath)
@@ -130,13 +135,24 @@ func TestCodexEnvAppendsProxyURLWithoutDroppingBase(t *testing.T) {
 	t.Parallel()
 
 	base := []string{"A=1", "B=two"}
-	got := codexEnv(base, "http://127.0.0.1:9999")
+	got := codexEnv(base, "http://127.0.0.1:9999", "")
 	want := []string{"A=1", "B=two", "CODEXTRA_PROXY_URL=http://127.0.0.1:9999"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("codexEnv() = %#v, want %#v", got, want)
 	}
 	if !reflect.DeepEqual(base, []string{"A=1", "B=two"}) {
 		t.Fatalf("codexEnv mutated base: %#v", base)
+	}
+}
+
+func TestCodexEnvReplacesProxyURLAndCodexHome(t *testing.T) {
+	t.Parallel()
+
+	base := []string{"CODEX_HOME=/real", "CODEXTRA_PROXY_URL=http://old", "A=1"}
+	got := codexEnv(base, "http://127.0.0.1:9999", "/tmp/codex-home")
+	want := []string{"A=1", "CODEXTRA_PROXY_URL=http://127.0.0.1:9999", "CODEX_HOME=/tmp/codex-home"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("codexEnv() = %#v, want %#v", got, want)
 	}
 }
 
@@ -320,8 +336,12 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 		t.Fatalf("Upsert(work) error = %v", err)
 	}
 
-	if err := activateAccount("work"); err != nil {
+	account, err := activateAccount("work")
+	if err != nil {
 		t.Fatalf("activateAccount(work) error = %v", err)
+	}
+	if account.Alias != "work" {
+		t.Fatalf("activated account alias = %q, want work", account.Alias)
 	}
 
 	loaded, err := accounts.LoadStore(storePath)
@@ -334,5 +354,61 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
 		t.Fatalf("auth.json stat error = %v, want not exist", err)
+	}
+}
+
+func TestPrepareCodexHomeWritesSelectedAuthWithoutTouchingRealAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	realHome := filepath.Join(tempDir, "real-codex")
+	t.Setenv("CODEX_HOME", realHome)
+	if err := os.MkdirAll(realHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(realHome) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte("model = \"gpt-5.5\"\n"), 0600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "auth.json"), []byte(`{"tokens":{"access_token":"real"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(real auth) error = %v", err)
+	}
+
+	home, cleanup, err := prepareCodexHome(accounts.Account{
+		Alias:        "work",
+		AccessToken:  "token-work",
+		RefreshToken: "refresh-work",
+		IDToken:      `{"email":"work@example.com"}`,
+		AccountID:    "acct-work",
+	})
+	if err != nil {
+		t.Fatalf("prepareCodexHome() error = %v", err)
+	}
+	defer cleanup()
+
+	var auth codexauth.File
+	bytes, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(temp auth) error = %v", err)
+	}
+	if err := json.Unmarshal(bytes, &auth); err != nil {
+		t.Fatalf("Unmarshal(temp auth) error = %v", err)
+	}
+	if auth.Tokens.AccessToken != "token-work" {
+		t.Fatalf("temp auth access token = %q, want token-work", auth.Tokens.AccessToken)
+	}
+	if auth.Tokens.AccountID != "acct-work" {
+		t.Fatalf("temp auth account id = %q, want acct-work", auth.Tokens.AccountID)
+	}
+	configTarget, err := os.Readlink(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("Readlink(config) error = %v", err)
+	}
+	if configTarget != filepath.Join(realHome, "config.toml") {
+		t.Fatalf("config symlink = %q, want real config", configTarget)
+	}
+	realAuth, err := os.ReadFile(filepath.Join(realHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(real auth) error = %v", err)
+	}
+	if string(realAuth) != `{"tokens":{"access_token":"real"}}` {
+		t.Fatalf("real auth = %q, want unchanged", string(realAuth))
 	}
 }

@@ -47,7 +47,10 @@ account before launching Codex. The flag is consumed by `codextra` and is not
 passed through to `codex`. Selecting an account only updates codextra's account
 registry; proxied requests get their `Authorization` and `ChatGPT-Account-ID`
 headers from the active codextra account instead of relying on Codex's
-`auth.json`.
+`auth.json`. For Codex UI/status metadata, `codextra` launches the child process
+with a temporary `CODEX_HOME` that mirrors the normal Codex home but contains an
+isolated `auth.json` for the selected alias. The real Codex auth file is not
+modified.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
