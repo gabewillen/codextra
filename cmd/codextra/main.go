@@ -62,17 +62,14 @@ func run() error {
 	defer server.Shutdown(context.Background())
 
 	proxyURL := "http://" + listener.Addr().String()
-	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), os.Args[1:]...)
+	codexArgs := append([]string{"-c", "chatgpt_base_url=" + proxyURL}, os.Args[1:]...)
+	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(),
 		"CODEXTRA_PROXY_URL="+proxyURL,
 		"CODEXTRA_UPSTREAM="+upstream,
-		// These are the likely knobs to make a Codex build use the proxy. Keeping
-		// both is harmless if one is ignored by a particular Codex version.
-		"CODEX_CHATGPT_BASE_URL="+proxyURL,
-		"OPENAI_BASE_URL="+proxyURL,
 	)
 
 	log.Printf("proxy listening on %s -> %s", proxyURL, upstream)
