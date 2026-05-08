@@ -68,6 +68,14 @@ write that would exceed the cap.
 CODEXTRA_PROXY_LOG_MAX_BYTES=1048576
 ```
 
+The proxy stays alive while at least one `codextra` process has an attached
+client stream open. After the last client disconnects, the proxy exits after a
+short grace period.
+
+```sh
+CODEXTRA_PROXY_IDLE_GRACE_SECONDS=10
+```
+
 Account metadata is stored at:
 
 ```sh

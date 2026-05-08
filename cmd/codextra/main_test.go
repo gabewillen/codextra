@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -197,78 +201,71 @@ func TestGetenvUsesFallbackOnlyForEmptyValues(t *testing.T) {
 	}
 }
 
-func TestProxyLeaseTTLUsesFallbackForInvalidValues(t *testing.T) {
-	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "bad")
-	if got := proxyLeaseTTL(); got != defaultProxyLeaseTTL {
-		t.Fatalf("proxyLeaseTTL(invalid) = %s, want %s", got, defaultProxyLeaseTTL)
+func TestProxyIdleGraceUsesFallbackForInvalidValues(t *testing.T) {
+	t.Setenv("CODEXTRA_PROXY_IDLE_GRACE_SECONDS", "bad")
+	if got := proxyIdleGrace(); got != defaultProxyIdleGrace {
+		t.Fatalf("proxyIdleGrace(invalid) = %s, want %s", got, defaultProxyIdleGrace)
 	}
-	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "-1")
-	if got := proxyLeaseTTL(); got != defaultProxyLeaseTTL {
-		t.Fatalf("proxyLeaseTTL(negative) = %s, want %s", got, defaultProxyLeaseTTL)
+	t.Setenv("CODEXTRA_PROXY_IDLE_GRACE_SECONDS", "-1")
+	if got := proxyIdleGrace(); got != defaultProxyIdleGrace {
+		t.Fatalf("proxyIdleGrace(negative) = %s, want %s", got, defaultProxyIdleGrace)
 	}
-	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "7")
-	if got := proxyLeaseTTL(); got != 7*time.Second {
-		t.Fatalf("proxyLeaseTTL(valid) = %s, want 7s", got)
-	}
-}
-
-func TestProxyLeaseLifecycle(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CODEXTRA_HOME", home)
-
-	lease, err := acquireProxyLease()
-	if err != nil {
-		t.Fatalf("acquireProxyLease() error = %v", err)
-	}
-	active, err := hasActiveProxyLease(time.Now())
-	if err != nil {
-		t.Fatalf("hasActiveProxyLease() error = %v", err)
-	}
-	if !active {
-		t.Fatal("hasActiveProxyLease() = false, want true")
-	}
-
-	lease.Close()
-	active, err = hasActiveProxyLease(time.Now())
-	if err != nil {
-		t.Fatalf("hasActiveProxyLease(after close) error = %v", err)
-	}
-	if active {
-		t.Fatal("hasActiveProxyLease(after close) = true, want false")
-	}
-	if _, err := os.Stat(lease.path); !os.IsNotExist(err) {
-		t.Fatalf("lease file still exists or stat error = %v", err)
+	t.Setenv("CODEXTRA_PROXY_IDLE_GRACE_SECONDS", "7")
+	if got := proxyIdleGrace(); got != 7*time.Second {
+		t.Fatalf("proxyIdleGrace(valid) = %s, want 7s", got)
 	}
 }
 
-func TestHasActiveProxyLeaseRemovesStaleFiles(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CODEXTRA_HOME", home)
-	dir, err := proxyLeaseDir()
+func TestProxyLifecycleStreamTracksClientDisconnect(t *testing.T) {
+	shutdown := make(chan struct{})
+	lifecycle := newProxyLifecycle(http.NotFoundHandler(), slog.New(slog.NewTextHandler(os.Stderr, nil)), func() {
+		close(shutdown)
+	})
+	lifecycle.grace = 10 * time.Millisecond
+	server := httptest.NewServer(lifecycle)
+	defer server.Close()
+
+	client, err := attachProxyClient(context.Background(), server.URL)
 	if err != nil {
-		t.Fatalf("proxyLeaseDir() error = %v", err)
+		t.Fatalf("attachProxyClient() error = %v", err)
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	path := filepath.Join(dir, "stale.lease")
-	if err := os.WriteFile(path, []byte("stale"), 0600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-	old := time.Now().Add(-2 * defaultProxyLeaseTTL)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatalf("Chtimes() error = %v", err)
+	lifecycle.mu.Lock()
+	clients := lifecycle.clients
+	lifecycle.mu.Unlock()
+	if clients != 1 {
+		t.Fatalf("clients = %d, want 1", clients)
 	}
 
-	active, err := hasActiveProxyLease(time.Now())
-	if err != nil {
-		t.Fatalf("hasActiveProxyLease() error = %v", err)
+	client.Close()
+	select {
+	case <-shutdown:
+	case <-time.After(time.Second):
+		t.Fatal("proxy lifecycle did not shut down after client disconnect")
 	}
-	if active {
-		t.Fatal("hasActiveProxyLease(stale) = true, want false")
+}
+
+func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
+	lifecycle := newProxyLifecycle(http.NotFoundHandler(), slog.New(slog.NewTextHandler(os.Stderr, nil)), func() {})
+	req := httptest.NewRequest(http.MethodGet, "/__codextra/client", nil)
+	resp := httptest.NewRecorder()
+
+	lifecycle.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("stale lease still exists or stat error = %v", err)
+}
+
+func TestAttachProxyClientReturnsStatusError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no", http.StatusTeapot)
+	}))
+	defer server.Close()
+
+	client, err := attachProxyClient(context.Background(), server.URL)
+	if err == nil {
+		client.Close()
+		t.Fatal("attachProxyClient(status error) error = nil, want error")
 	}
 }
 

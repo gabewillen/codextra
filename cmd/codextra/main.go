@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -23,11 +25,9 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 6
+const proxyStateVersion = 7
 const defaultProxyLogMaxBytes int64 = 1 << 20
-const defaultProxyLeaseTTL = 20 * time.Second
-const proxyLeaseHeartbeat = 5 * time.Second
-const proxyLeaseIdlePoll = 5 * time.Second
+const defaultProxyIdleGrace = 10 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -57,16 +57,15 @@ func run() error {
 		}
 	}
 
-	lease, err := acquireProxyLease()
-	if err != nil {
-		return err
-	}
-	defer lease.Close()
-
 	proxyURL, err := ensureProxy()
 	if err != nil {
 		return err
 	}
+	client, err := attachProxyClient(ctx, proxyURL)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
 
 	codexArgs := codexArgs(proxyURL, userArgs)
 	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
@@ -112,6 +111,10 @@ func runProxyServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	lifecycle := newProxyLifecycle(server.Handler, logger, func() {
+		_ = server.Shutdown(context.Background())
+	})
+	server.Handler = lifecycle
 
 	proxyURL := "http://" + listener.Addr().String()
 	if err := writeProxyState(proxyState{
@@ -128,9 +131,7 @@ func runProxyServer(ctx context.Context) error {
 		<-ctx.Done()
 		_ = server.Shutdown(context.Background())
 	}()
-	go monitorProxyLeases(ctx, logger, func() {
-		_ = server.Shutdown(context.Background())
-	})
+	lifecycle.scheduleIdleShutdown()
 
 	err = server.Serve(listener)
 	if err == http.ErrServerClosed {
@@ -228,125 +229,163 @@ func proxyLogMaxBytes() int64 {
 	return maxBytes
 }
 
-type proxyLease struct {
-	path string
-	done chan struct{}
-	once sync.Once
-	wg   sync.WaitGroup
-}
-
-func acquireProxyLease() (*proxyLease, error) {
-	dir, err := proxyLeaseDir()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("create proxy lease directory: %w", err)
-	}
-	lease := &proxyLease{
-		path: filepath.Join(dir, fmt.Sprintf("%d-%d.lease", os.Getpid(), time.Now().UnixNano())),
-		done: make(chan struct{}),
-	}
-	if err := lease.touch(); err != nil {
-		return nil, err
-	}
-	lease.wg.Add(1)
-	go lease.heartbeat()
-	return lease, nil
-}
-
-func (l *proxyLease) heartbeat() {
-	defer l.wg.Done()
-	ticker := time.NewTicker(proxyLeaseHeartbeat)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			_ = l.touch()
-		case <-l.done:
-			return
-		}
-	}
-}
-
-func (l *proxyLease) touch() error {
-	data := []byte(fmt.Sprintf("pid=%d\nupdated_at=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano)))
-	if err := os.WriteFile(l.path, data, 0600); err != nil {
-		return fmt.Errorf("write proxy lease: %w", err)
-	}
-	return nil
-}
-
-func (l *proxyLease) Close() {
-	l.once.Do(func() {
-		close(l.done)
-		l.wg.Wait()
-		_ = os.Remove(l.path)
-	})
-}
-
-func monitorProxyLeases(ctx context.Context, logger *slog.Logger, shutdown func()) {
-	ticker := time.NewTicker(proxyLeaseIdlePoll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			active, err := hasActiveProxyLease(time.Now())
-			if err != nil {
-				logger.Warn("proxy_lease_scan_failed", "error", err)
-				continue
-			}
-			if !active {
-				logger.Info("proxy_idle_shutdown")
-				shutdown()
-				return
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func hasActiveProxyLease(now time.Time) (bool, error) {
-	dir, err := proxyLeaseDir()
-	if err != nil {
-		return false, err
-	}
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read proxy lease directory: %w", err)
-	}
-	ttl := proxyLeaseTTL()
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lease") {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if now.Sub(info.ModTime()) <= ttl {
-			return true, nil
-		}
-		_ = os.Remove(path)
-	}
-	return false, nil
-}
-
-func proxyLeaseTTL() time.Duration {
-	value := os.Getenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS")
+func proxyIdleGrace() time.Duration {
+	value := os.Getenv("CODEXTRA_PROXY_IDLE_GRACE_SECONDS")
 	if value == "" {
-		return defaultProxyLeaseTTL
+		return defaultProxyIdleGrace
 	}
 	seconds, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || seconds <= 0 {
-		return defaultProxyLeaseTTL
+		return defaultProxyIdleGrace
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+type proxyClient struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func attachProxyClient(ctx context.Context, proxyURL string) (*proxyClient, error) {
+	clientCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(clientCtx, http.MethodPost, strings.TrimRight(proxyURL, "/")+"/__codextra/client", nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	ready := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			ready <- err
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			ready <- fmt.Errorf("proxy client attach returned %s", resp.Status)
+			return
+		}
+		ready <- nil
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}()
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			cancel()
+			<-done
+			return nil, fmt.Errorf("attach proxy client: %w", err)
+		}
+		return &proxyClient{cancel: cancel, done: done}, nil
+	case <-ctx.Done():
+		cancel()
+		<-done
+		return nil, ctx.Err()
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		return nil, errors.New("attach proxy client: timeout")
+	}
+}
+
+func (c *proxyClient) Close() {
+	c.cancel()
+	<-c.done
+}
+
+type proxyLifecycle struct {
+	next     http.Handler
+	logger   *slog.Logger
+	shutdown func()
+	grace    time.Duration
+	mu       sync.Mutex
+	clients  int
+	timer    *time.Timer
+	closed   bool
+}
+
+func newProxyLifecycle(next http.Handler, logger *slog.Logger, shutdown func()) *proxyLifecycle {
+	return &proxyLifecycle{
+		next:     next,
+		logger:   logger,
+		shutdown: shutdown,
+		grace:    proxyIdleGrace(),
+	}
+}
+
+func (l *proxyLifecycle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/__codextra/client" {
+		l.next.ServeHTTP(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	l.attach()
+	defer l.detach()
+
+	w.Header().Set("content-type", "text/event-stream")
+	w.Header().Set("cache-control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(": connected\n\n"))
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	<-r.Context().Done()
+}
+
+func (l *proxyLifecycle) attach() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.timer != nil {
+		l.timer.Stop()
+		l.timer = nil
+	}
+	l.clients++
+	l.logger.Info("proxy_client_attached", "clients", l.clients)
+}
+
+func (l *proxyLifecycle) detach() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.clients > 0 {
+		l.clients--
+	}
+	l.logger.Info("proxy_client_detached", "clients", l.clients)
+	if l.clients == 0 {
+		l.scheduleIdleShutdownLocked()
+	}
+}
+
+func (l *proxyLifecycle) scheduleIdleShutdown() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.clients == 0 {
+		l.scheduleIdleShutdownLocked()
+	}
+}
+
+func (l *proxyLifecycle) scheduleIdleShutdownLocked() {
+	if l.closed {
+		return
+	}
+	if l.timer != nil {
+		l.timer.Stop()
+	}
+	l.timer = time.AfterFunc(l.grace, func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.clients != 0 || l.closed {
+			return
+		}
+		l.closed = true
+		l.logger.Info("proxy_idle_shutdown")
+		go l.shutdown()
+	})
 }
 
 func healthy(proxyURL string) bool {
@@ -410,14 +449,6 @@ func proxyLogPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "proxy.log"), nil
-}
-
-func proxyLeaseDir() (string, error) {
-	dir, err := codextraDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "proxy-leases"), nil
 }
 
 func defaultStorePath() (string, error) {
