@@ -61,6 +61,10 @@ with a temporary `CODEX_HOME` that mirrors the normal Codex home but contains an
 isolated `auth.json` for the selected alias. The real Codex auth file is not
 modified.
 
+After rotation, Codex's `/status` screen can show mixed account information:
+the `Account` field comes from Codex's startup auth snapshot, while usage limits
+and model requests come from the currently selected codextra proxy account.
+
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
 ```sh
