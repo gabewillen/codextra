@@ -192,6 +192,36 @@ func TestProxyHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestProxyServerSetsReadHeaderTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := newTestProxy(t, "http://example.test", accounts.Data{})
+	if server.ReadHeaderTimeout <= 0 {
+		t.Fatal("ReadHeaderTimeout = 0, want positive timeout")
+	}
+}
+
+func TestResponseCaptureLimitDoesNotCaptureSuccessfulStreams(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"content-type": []string{"text/event-stream"}},
+	}
+	if got := responseCaptureLimit(resp); got != 0 {
+		t.Fatalf("responseCaptureLimit(success stream) = %d, want 0", got)
+	}
+}
+
+func TestResponseCaptureLimitCapsErrorBodies(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{StatusCode: http.StatusBadGateway}
+	if got := responseCaptureLimit(resp); got != 4*1024 {
+		t.Fatalf("responseCaptureLimit(error) = %d, want 4096", got)
+	}
+}
+
 func TestProxyTunnelsWebSocketWithActiveAccountAuth(t *testing.T) {
 	t.Parallel()
 
@@ -496,6 +526,12 @@ func TestNewRejectsInvalidUpstream(t *testing.T) {
 	if _, err := New(Config{Upstream: "://bad-url", Store: newTestStore(t, accounts.Data{})}); err == nil {
 		t.Fatal("New(invalid upstream) error = nil, want error")
 	}
+	if _, err := New(Config{Upstream: "file:///tmp/socket", Store: newTestStore(t, accounts.Data{})}); err == nil {
+		t.Fatal("New(file upstream) error = nil, want error")
+	}
+	if _, err := New(Config{Upstream: "https://", Store: newTestStore(t, accounts.Data{})}); err == nil {
+		t.Fatal("New(hostless upstream) error = nil, want error")
+	}
 }
 
 func TestNewRejectsInvalidAPIUpstream(t *testing.T) {
@@ -503,6 +539,9 @@ func TestNewRejectsInvalidAPIUpstream(t *testing.T) {
 
 	if _, err := New(Config{Upstream: "http://example.test", APIUpstream: "://bad-url", Store: newTestStore(t, accounts.Data{})}); err == nil {
 		t.Fatal("New(invalid API upstream) error = nil, want error")
+	}
+	if _, err := New(Config{Upstream: "http://example.test", APIUpstream: "ftp://example.test", Store: newTestStore(t, accounts.Data{})}); err == nil {
+		t.Fatal("New(ftp API upstream) error = nil, want error")
 	}
 }
 

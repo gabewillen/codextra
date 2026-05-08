@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -25,7 +28,7 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 11
+const proxyStateVersion = 12
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 
@@ -86,7 +89,7 @@ func run() error {
 	}
 	cmd.Env = codexEnv(os.Environ(), proxyURL, codexHome)
 
-	log.Printf("using proxy %s", proxyURL)
+	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 	return cmd.Run()
 }
 
@@ -124,12 +127,19 @@ func runProxyServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	routePrefix, err := randomRoutePrefix()
+	if err != nil {
+		return err
+	}
 	lifecycle := newProxyLifecycle(server.Handler, logger, func() {
-		_ = server.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
 	})
-	server.Handler = lifecycle
+	server.Handler = newRoutePrefixHandler(routePrefix, lifecycle)
 
-	proxyURL := "http://" + listener.Addr().String()
+	listenURL := "http://" + listener.Addr().String()
+	proxyURL := listenURL + routePrefix
 	if err := writeProxyState(proxyState{
 		URL:         proxyURL,
 		PID:         os.Getpid(),
@@ -139,11 +149,13 @@ func runProxyServer(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	logger.Info("proxy_listening", "url", proxyURL, "upstream", upstream, "api_upstream", apiUpstream, "store", storePath)
+	logger.Info("proxy_listening", "url", listenURL, "upstream", upstream, "api_upstream", apiUpstream, "store", storePath)
 
 	go func() {
 		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
 	}()
 	lifecycle.scheduleIdleShutdown()
 
@@ -254,6 +266,52 @@ func proxyIdleGrace() time.Duration {
 		return defaultProxyIdleGrace
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func randomRoutePrefix() (string, error) {
+	var bytes [24]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", fmt.Errorf("generate proxy route token: %w", err)
+	}
+	return "/__codextra/" + hex.EncodeToString(bytes[:]), nil
+}
+
+func proxyDisplayURL(proxyURL string) string {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return proxyURL
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+type routePrefixHandler struct {
+	prefix string
+	next   http.Handler
+}
+
+func newRoutePrefixHandler(prefix string, next http.Handler) http.Handler {
+	return routePrefixHandler{prefix: strings.TrimRight(prefix, "/"), next: next}
+}
+
+func (h routePrefixHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	trimmedPath, ok := strings.CutPrefix(r.URL.Path, h.prefix)
+	if !ok || (trimmedPath != "" && !strings.HasPrefix(trimmedPath, "/")) {
+		http.NotFound(w, r)
+		return
+	}
+	if trimmedPath == "" {
+		trimmedPath = "/"
+	}
+	cloned := r.Clone(r.Context())
+	urlCopy := *r.URL
+	urlCopy.Path = trimmedPath
+	urlCopy.RawPath = ""
+	cloned.URL = &urlCopy
+	h.next.ServeHTTP(w, cloned)
 }
 
 type proxyClient struct {

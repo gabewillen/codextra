@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -289,6 +290,63 @@ func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
 
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestRoutePrefixHandlerRequiresSecretPrefix(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	handler := newRoutePrefixHandler("/__codextra/secret", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil))
+	if unauthorized.Code != http.StatusNotFound {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusNotFound)
+	}
+
+	authorized := httptest.NewRecorder()
+	handler.ServeHTTP(authorized, httptest.NewRequest(http.MethodGet, "/__codextra/secret/backend-api/wham/usage", nil))
+	if authorized.Code != http.StatusAccepted {
+		t.Fatalf("authorized status = %d, want %d", authorized.Code, http.StatusAccepted)
+	}
+	if gotPath != "/backend-api/wham/usage" {
+		t.Fatalf("forwarded path = %q, want /backend-api/wham/usage", gotPath)
+	}
+}
+
+func TestProxyDisplayURLRedactsRoutePrefix(t *testing.T) {
+	t.Parallel()
+
+	got := proxyDisplayURL("http://127.0.0.1:1234/__codextra/secret")
+	want := "http://127.0.0.1:1234"
+	if got != want {
+		t.Fatalf("proxyDisplayURL() = %q, want %q", got, want)
+	}
+}
+
+func TestRandomRoutePrefixIsUnguessablePath(t *testing.T) {
+	t.Parallel()
+
+	first, err := randomRoutePrefix()
+	if err != nil {
+		t.Fatalf("randomRoutePrefix() error = %v", err)
+	}
+	second, err := randomRoutePrefix()
+	if err != nil {
+		t.Fatalf("randomRoutePrefix() second error = %v", err)
+	}
+	if !strings.HasPrefix(first, "/__codextra/") {
+		t.Fatalf("prefix = %q, want /__codextra/ prefix", first)
+	}
+	if len(strings.TrimPrefix(first, "/__codextra/")) != 48 {
+		t.Fatalf("token length = %d, want 48", len(strings.TrimPrefix(first, "/__codextra/")))
+	}
+	if first == second {
+		t.Fatal("randomRoutePrefix returned duplicate prefixes")
 	}
 }
 

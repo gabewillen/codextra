@@ -31,6 +31,9 @@ func New(config Config) (*http.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse upstream: %w", err)
 	}
+	if err := validateUpstreamURL(upstream); err != nil {
+		return nil, fmt.Errorf("validate upstream: %w", err)
+	}
 	apiUpstreamValue := config.APIUpstream
 	if apiUpstreamValue == "" {
 		apiUpstreamValue = config.Upstream
@@ -38,6 +41,9 @@ func New(config Config) (*http.Server, error) {
 	apiUpstream, err := url.Parse(apiUpstreamValue)
 	if err != nil {
 		return nil, fmt.Errorf("parse api upstream: %w", err)
+	}
+	if err := validateUpstreamURL(apiUpstream); err != nil {
+		return nil, fmt.Errorf("validate api upstream: %w", err)
 	}
 	handler := &handler{
 		upstream:    upstream,
@@ -49,7 +55,19 @@ func New(config Config) (*http.Server, error) {
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &http.Server{Handler: handler}, nil
+	return &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}, nil
+}
+
+func validateUpstreamURL(upstream *url.URL) error {
+	if upstream.Host == "" {
+		return fmt.Errorf("missing host")
+	}
+	switch upstream.Scheme {
+	case "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("unsupported scheme %q", upstream.Scheme)
+	}
 }
 
 type handler struct {
@@ -129,7 +147,7 @@ func (h *handler) logResponse(r *http.Request, resp *http.Response, account acco
 	args := []any{
 		"method", r.Method,
 		"path", r.URL.Path,
-		"query", r.URL.RawQuery,
+		"query_present", r.URL.RawQuery != "",
 		"alias", account.Alias,
 		"upstream_host", h.upstreamFor(r.URL.Path).Host,
 		"status", resp.StatusCode,
@@ -409,9 +427,8 @@ func usageLimitMarker(body []byte) bool {
 }
 
 func responseCaptureLimit(resp *http.Response) int {
-	contentType := resp.Header.Get("content-type")
-	if resp.StatusCode >= http.StatusBadRequest || strings.Contains(contentType, "text/event-stream") {
-		return 256 * 1024
+	if resp.StatusCode >= http.StatusBadRequest {
+		return 4 * 1024
 	}
 	return 0
 }
