@@ -67,6 +67,19 @@ func (s *Store) Current(now time.Time) (Account, bool) {
 	return Account{}, false
 }
 
+func (s *Store) Get(alias string) (Account, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for _, account := range s.Data.Accounts {
+		if account.Alias == alias {
+			return account, true
+		}
+	}
+	return Account{}, false
+}
+
 func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now time.Time) (Account, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

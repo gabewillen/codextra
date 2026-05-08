@@ -43,7 +43,9 @@ All other arguments are passed to `codex` unchanged after injecting the
 
 Use `--account <alias>` or `--account=<alias>` to switch the active codextra
 account before launching Codex. The flag is consumed by `codextra` and is not
-passed through to `codex`.
+passed through to `codex`. Selecting an account also writes that account's token
+set into Codex's active auth file before launch, so Codex status and backend
+requests use the same account.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
@@ -63,5 +65,5 @@ Account metadata is stored at:
 ~/.codextra/accounts.json
 ```
 
-The account store is scaffolded for rotation, but login/token acquisition is not
-implemented yet.
+The proxy and account store are scaffolded for rotation. `login <alias>` imports
+the account token set from an ordinary Codex login.

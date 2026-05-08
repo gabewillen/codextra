@@ -10,12 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
 )
 
 type codexAuthFile struct {
-	Tokens *codexTokenData `json:"tokens"`
+	Tokens      *codexTokenData `json:"tokens"`
+	LastRefresh string          `json:"last_refresh,omitempty"`
 }
 
 type codexTokenData struct {
@@ -109,6 +111,43 @@ func importCodexAuth(alias, path string) (accounts.Account, error) {
 		Email:        firstNonEmpty(stringClaim(claims, "email"), stringClaim(claims, "https://api.openai.com/email")),
 		PlanType:     firstNonEmpty(stringClaim(claims, "chatgpt_plan_type"), stringClaim(claims, "https://api.openai.com/plan_type")),
 	}, nil
+}
+
+func writeCodexAuth(path string, account accounts.Account) error {
+	if account.AccessToken == "" {
+		return fmt.Errorf("account %q has no access token", account.Alias)
+	}
+	auth := codexAuthFile{
+		Tokens: &codexTokenData{
+			IDToken:      codexIDTokenValue(account.IDToken),
+			AccessToken:  account.AccessToken,
+			RefreshToken: account.RefreshToken,
+			AccountID:    account.AccountID,
+		},
+		LastRefresh: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	bytes, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode codex auth: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create codex auth directory: %w", err)
+	}
+	if err := os.WriteFile(path, append(bytes, '\n'), 0600); err != nil {
+		return fmt.Errorf("write codex auth: %w", err)
+	}
+	return nil
+}
+
+func codexIDTokenValue(token string) any {
+	if token == "" {
+		return map[string]any{}
+	}
+	var value any
+	if err := json.Unmarshal([]byte(token), &value); err == nil {
+		return value
+	}
+	return token
 }
 
 func idTokenString(value any) string {

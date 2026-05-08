@@ -244,10 +244,18 @@ func activateAccount(alias string) error {
 	if err != nil {
 		return err
 	}
+	account, ok := store.Get(alias)
+	if !ok {
+		return fmt.Errorf("account %q not found", alias)
+	}
 	if err := store.SetActive(alias); err != nil {
 		return err
 	}
-	return nil
+	authPath, err := codexAuthPath()
+	if err != nil {
+		return err
+	}
+	return writeCodexAuth(authPath, account)
 }
 
 func codextraDir() (string, error) {

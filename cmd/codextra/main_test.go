@@ -1,8 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/gabewillen/codextra/internal/accounts"
 )
 
 func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
@@ -121,5 +126,71 @@ func TestGetenvUsesFallbackOnlyForEmptyValues(t *testing.T) {
 	}
 	if got := getenv("CODEXTRA_TEST_MISSING", "fallback"); got != "fallback" {
 		t.Fatalf("getenv(missing) = %q, want fallback", got)
+	}
+}
+
+func TestActivateAccountWritesSelectedAliasToCodexAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  "token-personal",
+		RefreshToken: "refresh-personal",
+		AccountID:    "acct-personal",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  "token-work",
+		RefreshToken: "refresh-work",
+		IDToken:      `{"email":"work@example.com","chatgpt_plan_type":"pro"}`,
+		AccountID:    "acct-work",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+
+	if err := activateAccount("work"); err != nil {
+		t.Fatalf("activateAccount(work) error = %v", err)
+	}
+
+	loaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	if loaded.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want work", loaded.Data.ActiveAlias)
+	}
+
+	bytes, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth.json) error = %v", err)
+	}
+	var auth codexAuthFile
+	if err := json.Unmarshal(bytes, &auth); err != nil {
+		t.Fatalf("Unmarshal(auth.json) error = %v", err)
+	}
+	want := &codexTokenData{
+		IDToken: map[string]any{
+			"email":             "work@example.com",
+			"chatgpt_plan_type": "pro",
+		},
+		AccessToken:  "token-work",
+		RefreshToken: "refresh-work",
+		AccountID:    "acct-work",
+	}
+	if !reflect.DeepEqual(auth.Tokens, want) {
+		t.Fatalf("auth.Tokens = %#v, want %#v", auth.Tokens, want)
+	}
+	if auth.LastRefresh == "" {
+		t.Fatal("LastRefresh = empty, want timestamp")
 	}
 }

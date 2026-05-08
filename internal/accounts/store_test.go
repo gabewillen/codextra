@@ -276,6 +276,39 @@ func TestCurrentReturnsFalseWhenNoEligibleAccount(t *testing.T) {
 	}
 }
 
+func TestGetReloadsAndReturnsNamedAccount(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	want := Account{Alias: "work", AccessToken: "token-work", AccountID: "acct-work"}
+	data := Data{
+		ActiveAlias: "work",
+		Accounts:    []Account{want},
+	}
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(path, bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	account, ok := store.Get("work")
+	if !ok {
+		t.Fatal("Get(work) ok = false, want true")
+	}
+	if !reflect.DeepEqual(account, want) {
+		t.Fatalf("Get(work) = %#v, want %#v", account, want)
+	}
+	if account, ok := store.Get("missing"); ok {
+		t.Fatalf("Get(missing) = %#v, true; want false", account)
+	}
+}
+
 func TestCurrentReloadsAccountStoreFromDisk(t *testing.T) {
 	t.Parallel()
 
