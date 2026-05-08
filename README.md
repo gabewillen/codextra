@@ -21,6 +21,15 @@ instead of repeatedly merging a large upstream project.
 
 ## Usage
 
+Install from a release archive for your platform on the
+[releases page](https://github.com/gabewillen/codextra/releases/latest).
+
+Or build from source:
+
+```sh
+go install github.com/gabewillen/codextra/cmd/codextra@latest
+```
+
 ```sh
 codextra [codex args...]
 ```
@@ -88,3 +97,9 @@ Account metadata is stored at:
 
 The proxy and account store are scaffolded for rotation. `login <alias>` imports
 the account token set from an ordinary Codex login.
+
+## Releases
+
+Tagged releases are built by GoReleaser for macOS, Linux, and Windows on amd64
+and arm64. Push a `v*` tag to publish a GitHub release with archives and
+checksums.
