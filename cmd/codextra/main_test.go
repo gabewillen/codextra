@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
 )
@@ -32,7 +31,7 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	}
 }
 
-func TestActivateAccountWritesEligibleFallbackWhenSelectedAliasIsDisabled(t *testing.T) {
+func TestActivateAccountWritesSelectedAliasEvenWhenDisabled(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
 	codexHome := filepath.Join(tempDir, "codex")
@@ -44,13 +43,20 @@ func TestActivateAccountWritesEligibleFallbackWhenSelectedAliasIsDisabled(t *tes
 		t.Fatalf("LoadStore() error = %v", err)
 	}
 	if err := store.Upsert(accounts.Account{
-		Alias:         "limited",
-		AccessToken:   "token-limited",
-		RefreshToken:  "refresh-limited",
-		AccountID:     "acct-limited",
-		DisabledUntil: map[string]int64{"codex_weekly": time.Now().Add(time.Hour).Unix()},
+		Alias:        "limited",
+		AccessToken:  "token-limited",
+		RefreshToken: "refresh-limited",
+		AccountID:    "acct-limited",
 	}); err != nil {
 		t.Fatalf("Upsert(limited) error = %v", err)
+	}
+	loaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	loaded.Data.Accounts[0].DisabledUntil = map[string]int64{"codex_weekly": 9_999_999_999}
+	if err := os.WriteFile(storePath, mustJSON(t, loaded.Data), 0600); err != nil {
+		t.Fatalf("WriteFile(disabled store) error = %v", err)
 	}
 	if err := store.Upsert(accounts.Account{
 		Alias:        "fallback",
@@ -73,11 +79,11 @@ func TestActivateAccountWritesEligibleFallbackWhenSelectedAliasIsDisabled(t *tes
 	if err := json.Unmarshal(bytes, &auth); err != nil {
 		t.Fatalf("Unmarshal(auth.json) error = %v", err)
 	}
-	if auth.Tokens.AccessToken != "token-fallback" {
-		t.Fatalf("AccessToken = %q, want token-fallback", auth.Tokens.AccessToken)
+	if auth.Tokens.AccessToken != "token-limited" {
+		t.Fatalf("AccessToken = %q, want token-limited", auth.Tokens.AccessToken)
 	}
-	if auth.Tokens.AccountID != "acct-fallback" {
-		t.Fatalf("AccountID = %q, want acct-fallback", auth.Tokens.AccountID)
+	if auth.Tokens.AccountID != "acct-limited" {
+		t.Fatalf("AccountID = %q, want acct-limited", auth.Tokens.AccountID)
 	}
 }
 
@@ -187,6 +193,15 @@ func TestGetenvUsesFallbackOnlyForEmptyValues(t *testing.T) {
 	if got := getenv("CODEXTRA_TEST_MISSING", "fallback"); got != "fallback" {
 		t.Fatalf("getenv(missing) = %q, want fallback", got)
 	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	bytes, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	return bytes
 }
 
 func TestActivateAccountWritesSelectedAliasToCodexAuth(t *testing.T) {

@@ -296,16 +296,12 @@ func activateAccount(alias string) error {
 	if err != nil {
 		return err
 	}
-	_, ok := store.Get(alias)
+	account, ok := store.Get(alias)
 	if !ok {
 		return fmt.Errorf("account %q not found", alias)
 	}
 	if err := store.SetActive(alias); err != nil {
 		return err
-	}
-	account, ok := store.Current(time.Now())
-	if !ok {
-		return fmt.Errorf("account %q is not eligible and no fallback account is available", alias)
 	}
 	authPath, err := codexAuthPath()
 	if err != nil {
