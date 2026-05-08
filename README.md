@@ -59,6 +59,14 @@ The proxy listens on a random localhost port and forwards to:
 CODEXTRA_UPSTREAM=https://chatgpt.com
 ```
 
+Proxy diagnostics are written to `~/.codextra/proxy.log` as structured `slog`
+text records. The file is capped at 1 MiB by default and truncates before a
+write that would exceed the cap.
+
+```sh
+CODEXTRA_PROXY_LOG_MAX_BYTES=1048576
+```
+
 Account metadata is stored at:
 
 ```sh

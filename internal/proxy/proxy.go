@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ import (
 type Config struct {
 	Upstream string
 	Store    *accounts.Store
+	Logger   *slog.Logger
 }
 
 func New(config Config) (*http.Server, error) {
@@ -28,6 +30,10 @@ func New(config Config) (*http.Server, error) {
 		upstream: upstream,
 		store:    config.Store,
 		client:   http.DefaultClient,
+		logger:   config.Logger,
+	}
+	if handler.logger == nil {
+		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &http.Server{Handler: handler}, nil
 }
@@ -36,6 +42,7 @@ type handler struct {
 	upstream *url.URL
 	store    *accounts.Store
 	client   *http.Client
+	logger   *slog.Logger
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,8 +60,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.logger.Warn("request_body_read_failed", "method", r.Method, "path", r.URL.Path, "error", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -63,6 +72,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	account, ok := h.store.Current(now)
 	if !ok {
+		h.logger.Warn("no_eligible_account", "method", r.Method, "path", r.URL.Path)
 		http.Error(w, "codextra has no eligible account", http.StatusServiceUnavailable)
 		return
 	}
@@ -70,28 +80,56 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		resp, err := h.forward(r.Context(), r, body, account)
 		if err != nil {
+			h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
-			copyResponse(w, resp)
+			captured, err := copyResponse(w, resp, responseCaptureLimit(resp))
+			h.logResponse(r, resp, account, time.Since(start), captured, err)
 			return
 		}
 
 		limit, resetAt := limitInfo(resp)
 		resp.Body.Close()
+		h.logger.Info("usage_limit_detected", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
 		next, rotated, err := h.store.RotateFrom(account.Alias, limit, resetAt, time.Now())
 		if err != nil {
+			h.logger.Warn("account_rotation_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if !rotated {
+			h.logger.Warn("account_rotation_exhausted", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit)
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
 	}
+}
+
+func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {
+	args := []any{
+		"method", r.Method,
+		"path", r.URL.Path,
+		"query", r.URL.RawQuery,
+		"alias", account.Alias,
+		"status", resp.StatusCode,
+		"content_type", resp.Header.Get("content-type"),
+		"duration_ms", elapsed.Milliseconds(),
+	}
+	if len(body) > 0 {
+		args = append(args,
+			"usage_marker", usageLimitMarker(body),
+			"body_prefix", compactPrefix(body, 512),
+		)
+	}
+	if copyErr != nil {
+		args = append(args, "copy_error", copyErr)
+	}
+	h.logger.Info("upstream_response", args...)
 }
 
 func (h *handler) forward(ctx context.Context, original *http.Request, body []byte, account accounts.Account) (*http.Response, error) {
@@ -119,11 +157,29 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "codextra websocket proxy is not implemented yet", http.StatusNotImplemented)
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
+func copyResponse(w http.ResponseWriter, resp *http.Response, captureLimit int) ([]byte, error) {
 	defer resp.Body.Close()
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	capture := &prefixCapture{limit: captureLimit}
+	_, err := io.Copy(io.MultiWriter(w, capture), resp.Body)
+	return capture.bytes, err
+}
+
+type prefixCapture struct {
+	limit int
+	bytes []byte
+}
+
+func (c *prefixCapture) Write(p []byte) (int, error) {
+	if c.limit > 0 && len(c.bytes) < c.limit {
+		remaining := c.limit - len(c.bytes)
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		c.bytes = append(c.bytes, p[:remaining]...)
+	}
+	return len(p), nil
 }
 
 func copyHeader(dst, src http.Header) {
@@ -140,7 +196,7 @@ func isUsageLimit(resp *http.Response) bool {
 		return false
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return bytes.Contains(body, []byte(`"usage_limit_reached"`))
+	return usageLimitMarker(body)
 }
 
 func limitInfo(resp *http.Response) (string, time.Time) {
@@ -162,6 +218,31 @@ func limitInfo(resp *http.Response) (string, time.Time) {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	return limit, resetAt
+}
+
+func usageLimitMarker(body []byte) bool {
+	return bytes.Contains(body, []byte(`"usage_limit_reached"`)) ||
+		bytes.Contains(body, []byte("usage limit")) ||
+		bytes.Contains(body, []byte("Usage limit"))
+}
+
+func responseCaptureLimit(resp *http.Response) int {
+	contentType := resp.Header.Get("content-type")
+	if resp.StatusCode >= http.StatusBadRequest || strings.Contains(contentType, "text/event-stream") {
+		return 256 * 1024
+	}
+	return 0
+}
+
+func compactPrefix(body []byte, max int) string {
+	if len(body) > max {
+		body = body[:max]
+	}
+	text := strings.Join(strings.Fields(string(body)), " ")
+	if len(text) > max {
+		return text[:max]
+	}
+	return text
 }
 
 func isWebSocket(r *http.Request) bool {

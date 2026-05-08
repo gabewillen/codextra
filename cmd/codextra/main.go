@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,9 @@ import (
 	"github.com/gabewillen/codextra/internal/accounts"
 	"github.com/gabewillen/codextra/internal/proxy"
 )
+
+const proxyStateVersion = 2
+const defaultProxyLogMaxBytes int64 = 1 << 20
 
 func main() {
 	if err := run(); err != nil {
@@ -74,6 +79,12 @@ func runProxyServer(ctx context.Context) error {
 	}
 
 	upstream := getenv("CODEXTRA_UPSTREAM", "https://chatgpt.com")
+	logger, logCloser, err := proxyLogger()
+	if err != nil {
+		return err
+	}
+	defer logCloser()
+
 	addr := getenv("CODEXTRA_PROXY_ADDR", "127.0.0.1:0")
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -84,6 +95,7 @@ func runProxyServer(ctx context.Context) error {
 	server, err := proxy.New(proxy.Config{
 		Upstream: upstream,
 		Store:    store,
+		Logger:   logger,
 	})
 	if err != nil {
 		return err
@@ -94,10 +106,11 @@ func runProxyServer(ctx context.Context) error {
 		URL:      proxyURL,
 		PID:      os.Getpid(),
 		Upstream: upstream,
+		Version:  proxyStateVersion,
 	}); err != nil {
 		return err
 	}
-	log.Printf("proxy listening on %s -> %s", proxyURL, upstream)
+	logger.Info("proxy_listening", "url", proxyURL, "upstream", upstream, "store", storePath)
 
 	go func() {
 		<-ctx.Done()
@@ -115,11 +128,15 @@ type proxyState struct {
 	URL      string `json:"url"`
 	PID      int    `json:"pid"`
 	Upstream string `json:"upstream"`
+	Version  int    `json:"version,omitempty"`
 }
 
 func ensureProxy() (string, error) {
 	if state, err := readProxyState(); err == nil && healthy(state.URL) {
-		return state.URL, nil
+		if state.Version == proxyStateVersion {
+			return state.URL, nil
+		}
+		stopProxy(state.PID)
 	}
 
 	exe, err := os.Executable()
@@ -159,6 +176,41 @@ func ensureProxy() (string, error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return "", fmt.Errorf("proxy did not become healthy; see %s", logPath)
+}
+
+func stopProxy(pid int) {
+	if pid <= 0 {
+		return
+	}
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		_ = process.Signal(syscall.SIGTERM)
+	}
+}
+
+func proxyLogger() (*slog.Logger, func() error, error) {
+	logPath, err := proxyLogPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	writer, err := newCappedLogWriter(logPath, proxyLogMaxBytes())
+	if err != nil {
+		return nil, nil, err
+	}
+	handler := slog.NewTextHandler(writer, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return slog.New(handler), writer.Close, nil
+}
+
+func proxyLogMaxBytes() int64 {
+	value := os.Getenv("CODEXTRA_PROXY_LOG_MAX_BYTES")
+	if value == "" {
+		return defaultProxyLogMaxBytes
+	}
+	maxBytes, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || maxBytes <= 0 {
+		return defaultProxyLogMaxBytes
+	}
+	return maxBytes
 }
 
 func healthy(proxyURL string) bool {
