@@ -21,7 +21,7 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 3
+const proxyStateVersion = 4
 const defaultProxyLogMaxBytes int64 = 1 << 20
 
 func main() {

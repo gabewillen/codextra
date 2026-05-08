@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -260,6 +261,201 @@ func TestProxyDefaultsLimitIDWhenHeaderMissing(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex"]; got != resetAt.Unix() {
 		t.Fatalf("DisabledUntil[codex] = %d, want %d", got, resetAt.Unix())
+	}
+}
+
+func TestProxyRotatesOnExhaustedUsageResponse(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Unix(1_778_632_231, 0)
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		w.Header().Set("content-type", "application/json")
+		if len(tokens) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{
+						"used_percent": 14,
+						"reset_at":     resetAt.Add(-time.Hour).Unix(),
+					},
+					"secondary_window": map[string]any{
+						"used_percent": 100,
+						"reset_at":     resetAt.Unix(),
+					},
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"email": "work@example.com",
+			"rate_limit": map[string]any{
+				"primary_window":   map[string]any{"used_percent": 0, "reset_at": resetAt.Unix()},
+				"secondary_window": map[string]any{"used_percent": 0, "reset_at": resetAt.Unix()},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: "token-work"},
+		},
+	})
+	server := newProxyWithStore(t, upstream.URL, store)
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "work@example.com") {
+		t.Fatalf("body = %q, want refreshed usage from rotated account", resp.Body.String())
+	}
+	wantTokens := []string{"Bearer token-personal", "Bearer token-work"}
+	if len(tokens) != len(wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+	}
+	for i := range wantTokens {
+		if tokens[i] != wantTokens[i] {
+			t.Fatalf("tokens[%d] = %q, want %q", i, tokens[i], wantTokens[i])
+		}
+	}
+	if store.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want work", store.Data.ActiveAlias)
+	}
+	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
+		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+}
+
+func TestExhaustedUsageLimitDetectsPrimaryAndSecondaryWindows(t *testing.T) {
+	t.Parallel()
+
+	weeklyReset := time.Unix(1_778_632_231, 0)
+	limit, resetAt, exhausted := exhaustedUsageLimit([]byte(`{
+		"rate_limit": {
+			"primary_window": {"used_percent": 14, "reset_at": 1778267046},
+			"secondary_window": {"used_percent": 100, "reset_at": 1778632231}
+		}
+	}`))
+	if !exhausted {
+		t.Fatal("exhausted = false, want true")
+	}
+	if limit != "codex_weekly" {
+		t.Fatalf("limit = %q, want codex_weekly", limit)
+	}
+	if !resetAt.Equal(weeklyReset) {
+		t.Fatalf("resetAt = %s, want %s", resetAt, weeklyReset)
+	}
+
+	limit, _, exhausted = exhaustedUsageLimit([]byte(`{
+		"rate_limit": {
+			"primary_window": {"used_percent": 100, "reset_at": 1778267046},
+			"secondary_window": {"used_percent": 40, "reset_at": 1778632231}
+		}
+	}`))
+	if !exhausted {
+		t.Fatal("primary exhausted = false, want true")
+	}
+	if limit != "codex_5h" {
+		t.Fatalf("primary limit = %q, want codex_5h", limit)
+	}
+
+	if _, _, exhausted := exhaustedUsageLimit([]byte(`{"rate_limit":{}}`)); exhausted {
+		t.Fatal("empty usage exhausted = true, want false")
+	}
+	if _, _, exhausted := exhaustedUsageLimit([]byte(`{`)); exhausted {
+		t.Fatal("malformed usage exhausted = true, want false")
+	}
+}
+
+func TestUpdateUsageLimitsNoopsForNonUsageAndUnexhaustedResponses(t *testing.T) {
+	t.Parallel()
+
+	handler := &handler{
+		store:  newTestStore(t, accounts.Data{Accounts: []accounts.Account{{Alias: "personal", AccessToken: "token"}}}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	account := accounts.Account{Alias: "personal", AccessToken: "token"}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"rate_limit":{"primary_window":{"used_percent":0},"secondary_window":{"used_percent":0}}}`)),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	if handler.updateUsageLimits(req, resp, account) {
+		t.Fatal("updateUsageLimits(unexhausted) = true, want false")
+	}
+
+	resp = &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{`))}
+	req = httptest.NewRequest(http.MethodGet, "/backend-api/not-usage", nil)
+	if handler.updateUsageLimits(req, resp, account) {
+		t.Fatal("updateUsageLimits(non-usage path) = true, want false")
+	}
+
+	resp = &http.Response{StatusCode: http.StatusOK, Body: errReader{}}
+	req = httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	if handler.updateUsageLimits(req, resp, account) {
+		t.Fatal("updateUsageLimits(read error) = true, want false")
+	}
+}
+
+func TestUpdateUsageLimitsReturnsFalseWhenNoRotationAvailable(t *testing.T) {
+	t.Parallel()
+
+	handler := &handler{
+		store: newTestStore(t, accounts.Data{
+			ActiveAlias: "personal",
+			Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token"}},
+		}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(`{
+			"rate_limit": {
+				"primary_window": {"used_percent": 0, "reset_at": 1778267046},
+				"secondary_window": {"used_percent": 100, "reset_at": 1778632231}
+			}
+		}`)),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	if handler.updateUsageLimits(req, resp, accounts.Account{Alias: "personal", AccessToken: "token"}) {
+		t.Fatal("updateUsageLimits(no next account) = true, want false")
+	}
+}
+
+func TestCompactPrefixTruncatesBodyAndWhitespace(t *testing.T) {
+	t.Parallel()
+
+	got := compactPrefix([]byte("alpha\n\n beta gamma delta"), 12)
+	if got != "alpha beta" {
+		t.Fatalf("compactPrefix() = %q, want alpha beta", got)
+	}
+	got = compactPrefix([]byte("abcdefghijk"), 5)
+	if got != "abcde" {
+		t.Fatalf("compactPrefix(long word) = %q, want abcde", got)
+	}
+}
+
+func TestProxyReturnsBadRequestWhenRequestBodyCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	server := newTestProxy(t, "http://example.test", accounts.Data{
+		ActiveAlias: "personal",
+		Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	req.Body = errReader{}
+	resp := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
 	}
 }
 
