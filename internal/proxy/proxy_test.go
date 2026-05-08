@@ -569,6 +569,59 @@ func TestProxyPreservesNonUsageLimitTooManyRequests(t *testing.T) {
 	}
 }
 
+func TestProxyPreservesAmbiguousUsageLimitText(t *testing.T) {
+	t.Parallel()
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("You've hit your usage limit."))
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: "token-work"},
+		},
+	})
+	server := newProxyWithStore(t, upstream.URL, store)
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/responses", nil))
+
+	if resp.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusTooManyRequests)
+	}
+	if len(tokens) != 1 || tokens[0] != "Bearer token-personal" {
+		t.Fatalf("tokens = %#v, want only personal token", tokens)
+	}
+	if store.Data.ActiveAlias != "personal" {
+		t.Fatalf("ActiveAlias = %q, want personal", store.Data.ActiveAlias)
+	}
+}
+
+func TestUsageLimitMarkerRequiresStructuredJSON(t *testing.T) {
+	t.Parallel()
+
+	if !usageLimitMarker(http.Header{}, []byte(`{"error":{"type":"usage_limit_reached"}}`)) {
+		t.Fatal("usageLimitMarker(structured) = false, want true")
+	}
+	if !usageLimitMarker(http.Header{}, []byte(`{"errors":[{"code":"usage_limit_reached"}]}`)) {
+		t.Fatal("usageLimitMarker(array value) = false, want true")
+	}
+	if usageLimitMarker(http.Header{}, []byte("usage_limit_reached")) {
+		t.Fatal("usageLimitMarker(raw text) = true, want false")
+	}
+	if usageLimitMarker(http.Header{}, []byte(`{"error":{"type":"rate_limit_reached","message":"usage limit"}}`)) {
+		t.Fatal("usageLimitMarker(ambiguous text) = true, want false")
+	}
+	if usageLimitMarker(http.Header{}, []byte(`{"error":{"type":429}}`)) {
+		t.Fatal("usageLimitMarker(non-string value) = true, want false")
+	}
+}
+
 func TestProxyDefaultsLimitIDWhenHeaderMissing(t *testing.T) {
 	t.Parallel()
 

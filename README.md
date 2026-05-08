@@ -21,8 +21,18 @@ instead of repeatedly merging a large upstream project.
 
 ## Usage
 
-Install from a release archive for your platform on the
-[releases page](https://github.com/gabewillen/codextra/releases/latest).
+Install the latest release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | sh
+```
+
+The installer puts `codextra` in a writable directory already on `PATH` when it
+can. Override the target directory with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
 
 Or build from source:
 

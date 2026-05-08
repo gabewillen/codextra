@@ -156,7 +156,7 @@ func (h *handler) logResponse(r *http.Request, resp *http.Response, account acco
 	}
 	if len(body) > 0 {
 		args = append(args,
-			"usage_marker", usageLimitMarker(body),
+			"usage_marker", usageLimitMarker(resp.Header, body),
 			"body_prefix", compactPrefix(body, 512),
 		)
 	}
@@ -396,7 +396,7 @@ func isUsageLimit(resp *http.Response) bool {
 		return false
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return usageLimitMarker(body)
+	return usageLimitMarker(resp.Header, body)
 }
 
 func limitInfo(resp *http.Response) (string, time.Time) {
@@ -420,10 +420,39 @@ func limitInfo(resp *http.Response) (string, time.Time) {
 	return limit, resetAt
 }
 
-func usageLimitMarker(body []byte) bool {
-	return bytes.Contains(body, []byte(`"usage_limit_reached"`)) ||
-		bytes.Contains(body, []byte("usage limit")) ||
-		bytes.Contains(body, []byte("Usage limit"))
+func usageLimitMarker(header http.Header, body []byte) bool {
+	if limit := strings.TrimSpace(header.Get("x-codex-active-limit")); limit != "" {
+		return jsonHasStringValue(body, "usage_limit_reached")
+	}
+	return jsonHasStringValue(body, "usage_limit_reached")
+}
+
+func jsonHasStringValue(body []byte, want string) bool {
+	var value any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return false
+	}
+	return hasStringValue(value, want)
+}
+
+func hasStringValue(value any, want string) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed == want
+	case []any:
+		for _, item := range typed {
+			if hasStringValue(item, want) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if hasStringValue(item, want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func responseCaptureLimit(resp *http.Response) int {

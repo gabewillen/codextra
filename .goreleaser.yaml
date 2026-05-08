@@ -38,6 +38,7 @@ archives:
     files:
       - README.md
       - AGENTS.md
+      - install.sh
 
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
