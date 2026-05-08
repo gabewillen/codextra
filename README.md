@@ -36,6 +36,10 @@ codextra login work --device-auth
 Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
 under the alias.
 
+Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
+All other arguments are passed to `codex` unchanged after injecting the
+`chatgpt_base_url` override.
+
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
 ```sh

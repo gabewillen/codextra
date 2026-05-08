@@ -41,12 +41,12 @@ func run() error {
 		return err
 	}
 
-	codexArgs := append([]string{"-c", "chatgpt_base_url=" + proxyURL}, os.Args[1:]...)
+	codexArgs := codexArgs(proxyURL, os.Args[1:])
 	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "CODEXTRA_PROXY_URL="+proxyURL)
+	cmd.Env = codexEnv(os.Environ(), proxyURL)
 
 	log.Printf("using proxy %s", proxyURL)
 	return cmd.Run()
@@ -241,4 +241,18 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func codexArgs(proxyURL string, userArgs []string) []string {
+	args := make([]string, 0, len(userArgs)+2)
+	args = append(args, "-c", "chatgpt_base_url="+proxyURL)
+	args = append(args, userArgs...)
+	return args
+}
+
+func codexEnv(base []string, proxyURL string) []string {
+	env := make([]string, 0, len(base)+1)
+	env = append(env, base...)
+	env = append(env, "CODEXTRA_PROXY_URL="+proxyURL)
+	return env
 }
