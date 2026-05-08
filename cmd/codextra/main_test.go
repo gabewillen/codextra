@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
 )
@@ -28,6 +29,55 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	}
 	if !reflect.DeepEqual(userArgs, []string{"--model", "gpt-5.4", "--", "hello -c untouched"}) {
 		t.Fatalf("codexArgs mutated userArgs: %#v", userArgs)
+	}
+}
+
+func TestActivateAccountWritesEligibleFallbackWhenSelectedAliasIsDisabled(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:         "limited",
+		AccessToken:   "token-limited",
+		RefreshToken:  "refresh-limited",
+		AccountID:     "acct-limited",
+		DisabledUntil: map[string]int64{"codex_weekly": time.Now().Add(time.Hour).Unix()},
+	}); err != nil {
+		t.Fatalf("Upsert(limited) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "fallback",
+		AccessToken:  "token-fallback",
+		RefreshToken: "refresh-fallback",
+		AccountID:    "acct-fallback",
+	}); err != nil {
+		t.Fatalf("Upsert(fallback) error = %v", err)
+	}
+
+	if err := activateAccount("limited"); err != nil {
+		t.Fatalf("activateAccount(limited) error = %v", err)
+	}
+
+	bytes, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth.json) error = %v", err)
+	}
+	var auth codexAuthFile
+	if err := json.Unmarshal(bytes, &auth); err != nil {
+		t.Fatalf("Unmarshal(auth.json) error = %v", err)
+	}
+	if auth.Tokens.AccessToken != "token-fallback" {
+		t.Fatalf("AccessToken = %q, want token-fallback", auth.Tokens.AccessToken)
+	}
+	if auth.Tokens.AccountID != "acct-fallback" {
+		t.Fatalf("AccountID = %q, want acct-fallback", auth.Tokens.AccountID)
 	}
 }
 
