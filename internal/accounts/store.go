@@ -13,6 +13,8 @@ import (
 type Account struct {
 	Alias           string            `json:"alias"`
 	AccessToken     string            `json:"access_token"`
+	RefreshToken    string            `json:"refresh_token,omitempty"`
+	IDToken         string            `json:"id_token,omitempty"`
 	AccountID       string            `json:"account_id,omitempty"`
 	Email           string            `json:"email,omitempty"`
 	PlanType        string            `json:"plan_type,omitempty"`
@@ -87,6 +89,27 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 		}
 	}
 	return Account{}, false, s.saveLocked()
+}
+
+func (s *Store) Upsert(account Account) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == account.Alias {
+			s.Data.Accounts[i] = account
+			if s.Data.ActiveAlias == "" {
+				s.Data.ActiveAlias = account.Alias
+			}
+			return s.saveLocked()
+		}
+	}
+
+	s.Data.Accounts = append(s.Data.Accounts, account)
+	if s.Data.ActiveAlias == "" {
+		s.Data.ActiveAlias = account.Alias
+	}
+	return s.saveLocked()
 }
 
 func (s *Store) findEligibleLocked(alias string, now time.Time) (Account, bool) {

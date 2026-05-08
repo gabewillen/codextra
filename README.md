@@ -14,6 +14,18 @@ This repo intentionally uses only the Go standard library.
 codextra [codex args...]
 ```
 
+`codextra` intercepts account-management commands and passes everything else
+through to `codex`.
+
+```sh
+codextra login personal
+codextra login work --device-auth
+```
+
+`login <alias>` runs the normal `codex login`, imports the resulting active
+Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
+under the alias.
+
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
 ```sh

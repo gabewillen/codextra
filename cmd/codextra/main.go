@@ -27,6 +27,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if len(os.Args) > 1 && os.Args[1] == "login" {
+		return runLogin(ctx, os.Args[2:])
+	}
+
 	storePath, err := defaultStorePath()
 	if err != nil {
 		return err
