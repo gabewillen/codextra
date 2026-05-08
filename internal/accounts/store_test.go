@@ -233,6 +233,57 @@ func TestCurrentReturnsFalseWhenNoEligibleAccount(t *testing.T) {
 	}
 }
 
+func TestCurrentReloadsAccountStoreFromDisk(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	data := Data{
+		ActiveAlias: "work",
+		Accounts:    []Account{{Alias: "work", AccessToken: "token-work"}},
+	}
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(path, bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	account, ok := store.Current(time.Now())
+	if !ok {
+		t.Fatal("Current() ok = false, want true")
+	}
+	if account.Alias != "work" {
+		t.Fatalf("Current().Alias = %q, want work", account.Alias)
+	}
+}
+
+func TestReloadLockedReturnsParseError(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	store := &Store{path: path}
+	if err := store.reloadLocked(); err == nil {
+		t.Fatal("reloadLocked() error = nil, want error")
+	}
+}
+
+func TestReloadLockedReturnsReadError(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{path: t.TempDir()}
+	if err := store.reloadLocked(); err == nil {
+		t.Fatal("reloadLocked() error = nil, want error")
+	}
+}
+
 func TestStoreFileIsJSON(t *testing.T) {
 	t.Parallel()
 

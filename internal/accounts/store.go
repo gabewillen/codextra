@@ -53,6 +53,7 @@ func (s *Store) Current(now time.Time) (Account, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.reloadLocked()
 	if s.Data.ActiveAlias != "" {
 		if account, ok := s.findEligibleLocked(s.Data.ActiveAlias, now); ok {
 			return account, true
@@ -70,6 +71,7 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.reloadLocked()
 	for i := range s.Data.Accounts {
 		if s.Data.Accounts[i].Alias == alias {
 			if s.Data.Accounts[i].DisabledUntil == nil {
@@ -139,4 +141,20 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("encode account store: %w", err)
 	}
 	return os.WriteFile(s.path, append(bytes, '\n'), 0600)
+}
+
+func (s *Store) reloadLocked() error {
+	bytes, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read account store: %w", err)
+	}
+	var data Data
+	if err := json.Unmarshal(bytes, &data); err != nil {
+		return fmt.Errorf("parse account store: %w", err)
+	}
+	s.Data = data
+	return nil
 }

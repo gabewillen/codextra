@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,21 @@ func TestProxyRejectsWebSocketClearly(t *testing.T) {
 	}
 }
 
+func TestProxyHealthEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := newTestProxy(t, "http://example.test", accounts.Data{})
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/__codextra/health", nil))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if strings.TrimSpace(resp.Body.String()) != `{"ok":true}` {
+		t.Fatalf("body = %q, want health JSON", resp.Body.String())
+	}
+}
+
 func TestNewRejectsInvalidUpstream(t *testing.T) {
 	t.Parallel()
 
@@ -272,6 +288,36 @@ func TestProxyJoinsUpstreamAndRequestPaths(t *testing.T) {
 	}
 }
 
+func TestSingleJoiningSlashVariants(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		a    string
+		b    string
+		want string
+	}{
+		{name: "both slash", a: "/base/", b: "/path", want: "/base/path"},
+		{name: "neither slash", a: "/base", b: "path", want: "/base/path"},
+		{name: "left slash", a: "/base/", b: "path", want: "/base/path"},
+		{name: "right slash", a: "/base", b: "/path", want: "/base/path"},
+	}
+	for _, tc := range cases {
+		if got := singleJoiningSlash(tc.a, tc.b); got != tc.want {
+			t.Fatalf("%s: singleJoiningSlash(%q, %q) = %q, want %q", tc.name, tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestIsUsageLimitReturnsFalseOnReadError(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{Body: errReader{}}
+	if isUsageLimit(resp) {
+		t.Fatal("isUsageLimit(errReader) = true, want false")
+	}
+}
+
 func TestProxyForwardsWithoutAccountIDHeaderWhenMissing(t *testing.T) {
 	t.Parallel()
 
@@ -295,6 +341,16 @@ func TestProxyForwardsWithoutAccountIDHeaderWhenMissing(t *testing.T) {
 	if gotAccount != "" {
 		t.Fatalf("ChatGPT-Account-ID = %q, want empty", gotAccount)
 	}
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func (errReader) Close() error {
+	return nil
 }
 
 func newTestProxy(t *testing.T, upstream string, data accounts.Data) *http.Server {
