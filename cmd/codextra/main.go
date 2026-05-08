@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,8 +23,11 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 5
+const proxyStateVersion = 6
 const defaultProxyLogMaxBytes int64 = 1 << 20
+const defaultProxyLeaseTTL = 20 * time.Second
+const proxyLeaseHeartbeat = 5 * time.Second
+const proxyLeaseIdlePoll = 5 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -52,6 +56,12 @@ func run() error {
 			return err
 		}
 	}
+
+	lease, err := acquireProxyLease()
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 
 	proxyURL, err := ensureProxy()
 	if err != nil {
@@ -118,6 +128,9 @@ func runProxyServer(ctx context.Context) error {
 		<-ctx.Done()
 		_ = server.Shutdown(context.Background())
 	}()
+	go monitorProxyLeases(ctx, logger, func() {
+		_ = server.Shutdown(context.Background())
+	})
 
 	err = server.Serve(listener)
 	if err == http.ErrServerClosed {
@@ -215,6 +228,127 @@ func proxyLogMaxBytes() int64 {
 	return maxBytes
 }
 
+type proxyLease struct {
+	path string
+	done chan struct{}
+	once sync.Once
+	wg   sync.WaitGroup
+}
+
+func acquireProxyLease() (*proxyLease, error) {
+	dir, err := proxyLeaseDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create proxy lease directory: %w", err)
+	}
+	lease := &proxyLease{
+		path: filepath.Join(dir, fmt.Sprintf("%d-%d.lease", os.Getpid(), time.Now().UnixNano())),
+		done: make(chan struct{}),
+	}
+	if err := lease.touch(); err != nil {
+		return nil, err
+	}
+	lease.wg.Add(1)
+	go lease.heartbeat()
+	return lease, nil
+}
+
+func (l *proxyLease) heartbeat() {
+	defer l.wg.Done()
+	ticker := time.NewTicker(proxyLeaseHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_ = l.touch()
+		case <-l.done:
+			return
+		}
+	}
+}
+
+func (l *proxyLease) touch() error {
+	data := []byte(fmt.Sprintf("pid=%d\nupdated_at=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano)))
+	if err := os.WriteFile(l.path, data, 0600); err != nil {
+		return fmt.Errorf("write proxy lease: %w", err)
+	}
+	return nil
+}
+
+func (l *proxyLease) Close() {
+	l.once.Do(func() {
+		close(l.done)
+		l.wg.Wait()
+		_ = os.Remove(l.path)
+	})
+}
+
+func monitorProxyLeases(ctx context.Context, logger *slog.Logger, shutdown func()) {
+	ticker := time.NewTicker(proxyLeaseIdlePoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			active, err := hasActiveProxyLease(time.Now())
+			if err != nil {
+				logger.Warn("proxy_lease_scan_failed", "error", err)
+				continue
+			}
+			if !active {
+				logger.Info("proxy_idle_shutdown")
+				shutdown()
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func hasActiveProxyLease(now time.Time) (bool, error) {
+	dir, err := proxyLeaseDir()
+	if err != nil {
+		return false, err
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read proxy lease directory: %w", err)
+	}
+	ttl := proxyLeaseTTL()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lease") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) <= ttl {
+			return true, nil
+		}
+		_ = os.Remove(path)
+	}
+	return false, nil
+}
+
+func proxyLeaseTTL() time.Duration {
+	value := os.Getenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS")
+	if value == "" {
+		return defaultProxyLeaseTTL
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds <= 0 {
+		return defaultProxyLeaseTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func healthy(proxyURL string) bool {
 	if proxyURL == "" {
 		return false
@@ -276,6 +410,14 @@ func proxyLogPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "proxy.log"), nil
+}
+
+func proxyLeaseDir() (string, error) {
+	dir, err := codextraDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "proxy-leases"), nil
 }
 
 func defaultStorePath() (string, error) {

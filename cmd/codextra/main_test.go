@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
 	"github.com/gabewillen/codextra/internal/codexauth"
@@ -193,6 +194,81 @@ func TestGetenvUsesFallbackOnlyForEmptyValues(t *testing.T) {
 	}
 	if got := getenv("CODEXTRA_TEST_MISSING", "fallback"); got != "fallback" {
 		t.Fatalf("getenv(missing) = %q, want fallback", got)
+	}
+}
+
+func TestProxyLeaseTTLUsesFallbackForInvalidValues(t *testing.T) {
+	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "bad")
+	if got := proxyLeaseTTL(); got != defaultProxyLeaseTTL {
+		t.Fatalf("proxyLeaseTTL(invalid) = %s, want %s", got, defaultProxyLeaseTTL)
+	}
+	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "-1")
+	if got := proxyLeaseTTL(); got != defaultProxyLeaseTTL {
+		t.Fatalf("proxyLeaseTTL(negative) = %s, want %s", got, defaultProxyLeaseTTL)
+	}
+	t.Setenv("CODEXTRA_PROXY_LEASE_TTL_SECONDS", "7")
+	if got := proxyLeaseTTL(); got != 7*time.Second {
+		t.Fatalf("proxyLeaseTTL(valid) = %s, want 7s", got)
+	}
+}
+
+func TestProxyLeaseLifecycle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", home)
+
+	lease, err := acquireProxyLease()
+	if err != nil {
+		t.Fatalf("acquireProxyLease() error = %v", err)
+	}
+	active, err := hasActiveProxyLease(time.Now())
+	if err != nil {
+		t.Fatalf("hasActiveProxyLease() error = %v", err)
+	}
+	if !active {
+		t.Fatal("hasActiveProxyLease() = false, want true")
+	}
+
+	lease.Close()
+	active, err = hasActiveProxyLease(time.Now())
+	if err != nil {
+		t.Fatalf("hasActiveProxyLease(after close) error = %v", err)
+	}
+	if active {
+		t.Fatal("hasActiveProxyLease(after close) = true, want false")
+	}
+	if _, err := os.Stat(lease.path); !os.IsNotExist(err) {
+		t.Fatalf("lease file still exists or stat error = %v", err)
+	}
+}
+
+func TestHasActiveProxyLeaseRemovesStaleFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", home)
+	dir, err := proxyLeaseDir()
+	if err != nil {
+		t.Fatalf("proxyLeaseDir() error = %v", err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	path := filepath.Join(dir, "stale.lease")
+	if err := os.WriteFile(path, []byte("stale"), 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	old := time.Now().Add(-2 * defaultProxyLeaseTTL)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+
+	active, err := hasActiveProxyLease(time.Now())
+	if err != nil {
+		t.Fatalf("hasActiveProxyLease() error = %v", err)
+	}
+	if active {
+		t.Fatal("hasActiveProxyLease(stale) = true, want false")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale lease still exists or stat error = %v", err)
 	}
 }
 
