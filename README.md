@@ -27,6 +27,13 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | sh
 ```
 
+The installer requires `codex` to already be installed and available on `PATH`.
+If your Codex binary lives somewhere else, set `CODEXTRA_CODEX_BIN`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | CODEXTRA_CODEX_BIN=/path/to/codex sh
+```
+
 The installer puts `codextra` in a writable directory already on `PATH` when it
 can. Override the target directory with:
 

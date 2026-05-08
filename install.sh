@@ -11,6 +11,33 @@ need() {
 	fi
 }
 
+check_codex() {
+	if [ -n "${CODEXTRA_CODEX_BIN:-}" ]; then
+		case "$CODEXTRA_CODEX_BIN" in
+		*/*)
+			if [ -x "$CODEXTRA_CODEX_BIN" ]; then
+				return
+			fi
+			;;
+		*)
+			if command -v "$CODEXTRA_CODEX_BIN" >/dev/null 2>&1; then
+				return
+			fi
+			;;
+		esac
+		echo "CODEXTRA_CODEX_BIN does not point to an executable codex binary: $CODEXTRA_CODEX_BIN" >&2
+		exit 1
+	fi
+
+	if command -v codex >/dev/null 2>&1; then
+		return
+	fi
+
+	echo "codex is not installed or is not on PATH" >&2
+	echo "install OpenAI Codex first, or set CODEXTRA_CODEX_BIN=/path/to/codex" >&2
+	exit 1
+}
+
 platform() {
 	case "$(uname -s)" in
 	Darwin) echo "darwin" ;;
@@ -89,6 +116,7 @@ install_binary() {
 need curl
 need tar
 need mktemp
+check_codex
 
 version="${VERSION:-$(latest_version)}"
 os="$(platform)"
