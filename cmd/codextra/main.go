@@ -21,11 +21,10 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
-	"github.com/gabewillen/codextra/internal/codexauth"
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 7
+const proxyStateVersion = 8
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 
@@ -89,6 +88,7 @@ func runProxyServer(ctx context.Context) error {
 	}
 
 	upstream := getenv("CODEXTRA_UPSTREAM", "https://chatgpt.com")
+	apiUpstream := getenv("CODEXTRA_API_UPSTREAM", "https://api.openai.com")
 	logger, logCloser, err := proxyLogger()
 	if err != nil {
 		return err
@@ -103,10 +103,10 @@ func runProxyServer(ctx context.Context) error {
 	defer listener.Close()
 
 	server, err := proxy.New(proxy.Config{
-		Upstream: upstream,
-		Store:    store,
-		Logger:   logger,
-		OnRotate: updateCodexAuthForAccount,
+		Upstream:    upstream,
+		APIUpstream: apiUpstream,
+		Store:       store,
+		Logger:      logger,
 	})
 	if err != nil {
 		return err
@@ -118,14 +118,15 @@ func runProxyServer(ctx context.Context) error {
 
 	proxyURL := "http://" + listener.Addr().String()
 	if err := writeProxyState(proxyState{
-		URL:      proxyURL,
-		PID:      os.Getpid(),
-		Upstream: upstream,
-		Version:  proxyStateVersion,
+		URL:         proxyURL,
+		PID:         os.Getpid(),
+		Upstream:    upstream,
+		APIUpstream: apiUpstream,
+		Version:     proxyStateVersion,
 	}); err != nil {
 		return err
 	}
-	logger.Info("proxy_listening", "url", proxyURL, "upstream", upstream, "store", storePath)
+	logger.Info("proxy_listening", "url", proxyURL, "upstream", upstream, "api_upstream", apiUpstream, "store", storePath)
 
 	go func() {
 		<-ctx.Done()
@@ -141,10 +142,11 @@ func runProxyServer(ctx context.Context) error {
 }
 
 type proxyState struct {
-	URL      string `json:"url"`
-	PID      int    `json:"pid"`
-	Upstream string `json:"upstream"`
-	Version  int    `json:"version,omitempty"`
+	URL         string `json:"url"`
+	PID         int    `json:"pid"`
+	Upstream    string `json:"upstream"`
+	APIUpstream string `json:"api_upstream,omitempty"`
+	Version     int    `json:"version,omitempty"`
 }
 
 func ensureProxy() (string, error) {
@@ -471,22 +473,7 @@ func activateAccount(alias string) error {
 	if err != nil {
 		return err
 	}
-	account, ok := store.Get(alias)
-	if !ok {
-		return fmt.Errorf("account %q not found", alias)
-	}
-	if err := store.SetActive(alias); err != nil {
-		return err
-	}
-	return updateCodexAuthForAccount(account)
-}
-
-func updateCodexAuthForAccount(account accounts.Account) error {
-	authPath, err := codexauth.Path()
-	if err != nil {
-		return err
-	}
-	return codexauth.Write(authPath, account)
+	return store.SetActive(alias)
 }
 
 func codextraDir() (string, error) {
@@ -509,14 +496,19 @@ func getenv(key, fallback string) string {
 }
 
 func codexArgs(proxyURL string, userArgs []string) []string {
-	args := make([]string, 0, len(userArgs)+2)
+	args := make([]string, 0, len(userArgs)+4)
 	args = append(args, "-c", "chatgpt_base_url="+codexChatGPTBaseURL(proxyURL))
+	args = append(args, "-c", "openai_base_url="+codexOpenAIBaseURL(proxyURL))
 	args = append(args, userArgs...)
 	return args
 }
 
 func codexChatGPTBaseURL(proxyURL string) string {
 	return strings.TrimRight(proxyURL, "/") + "/backend-api"
+}
+
+func codexOpenAIBaseURL(proxyURL string) string {
+	return strings.TrimRight(proxyURL, "/") + "/v1"
 }
 
 func codexEnv(base []string, proxyURL string) []string {

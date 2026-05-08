@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
-	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
@@ -24,6 +23,8 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	want := []string{
 		"-c",
 		"chatgpt_base_url=http://127.0.0.1:1234/backend-api",
+		"-c",
+		"openai_base_url=http://127.0.0.1:1234/v1",
 		"--model",
 		"gpt-5.4",
 		"--",
@@ -37,12 +38,10 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	}
 }
 
-func TestActivateAccountWritesSelectedAliasEvenWhenDisabled(t *testing.T) {
+func TestActivateAccountSelectsAliasEvenWhenDisabled(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
-	codexHome := filepath.Join(tempDir, "codex")
 	t.Setenv("CODEXTRA_STORE", storePath)
-	t.Setenv("CODEX_HOME", codexHome)
 
 	store, err := accounts.LoadStore(storePath)
 	if err != nil {
@@ -77,19 +76,19 @@ func TestActivateAccountWritesSelectedAliasEvenWhenDisabled(t *testing.T) {
 		t.Fatalf("activateAccount(limited) error = %v", err)
 	}
 
-	bytes, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	reloaded, err := accounts.LoadStore(storePath)
 	if err != nil {
-		t.Fatalf("ReadFile(auth.json) error = %v", err)
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
 	}
-	var auth codexauth.File
-	if err := json.Unmarshal(bytes, &auth); err != nil {
-		t.Fatalf("Unmarshal(auth.json) error = %v", err)
+	if reloaded.Data.ActiveAlias != "limited" {
+		t.Fatalf("ActiveAlias = %q, want limited", reloaded.Data.ActiveAlias)
 	}
-	if auth.Tokens.AccessToken != "token-limited" {
-		t.Fatalf("AccessToken = %q, want token-limited", auth.Tokens.AccessToken)
+	limited, ok := reloaded.Get("limited")
+	if !ok {
+		t.Fatal("limited account missing after activate")
 	}
-	if auth.Tokens.AccountID != "acct-limited" {
-		t.Fatalf("AccountID = %q, want acct-limited", auth.Tokens.AccountID)
+	if len(limited.DisabledUntil) != 0 {
+		t.Fatalf("DisabledUntil = %#v, want cleared", limited.DisabledUntil)
 	}
 }
 
@@ -97,7 +96,11 @@ func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	t.Parallel()
 
 	got := codexArgs("http://proxy", []string{"-c", "chatgpt_base_url=http://custom"})
-	want := []string{"-c", "chatgpt_base_url=http://proxy/backend-api", "-c", "chatgpt_base_url=http://custom"}
+	want := []string{
+		"-c", "chatgpt_base_url=http://proxy/backend-api",
+		"-c", "openai_base_url=http://proxy/v1",
+		"-c", "chatgpt_base_url=http://custom",
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("codexArgs() = %#v, want %#v", got, want)
 	}
@@ -110,6 +113,16 @@ func TestCodexChatGPTBaseURLPreservesBackendAPIBasePath(t *testing.T) {
 	want := "http://127.0.0.1:1234/backend-api"
 	if got != want {
 		t.Fatalf("codexChatGPTBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestCodexOpenAIBaseURLPreservesV1BasePath(t *testing.T) {
+	t.Parallel()
+
+	got := codexOpenAIBaseURL("http://127.0.0.1:1234/")
+	want := "http://127.0.0.1:1234/v1"
+	if got != want {
+		t.Fatalf("codexOpenAIBaseURL() = %q, want %q", got, want)
 	}
 }
 
@@ -278,7 +291,7 @@ func mustJSON(t *testing.T, value any) []byte {
 	return bytes
 }
 
-func TestActivateAccountWritesSelectedAliasToCodexAuth(t *testing.T) {
+func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
 	codexHome := filepath.Join(tempDir, "codex")
@@ -319,27 +332,7 @@ func TestActivateAccountWritesSelectedAliasToCodexAuth(t *testing.T) {
 		t.Fatalf("ActiveAlias = %q, want work", loaded.Data.ActiveAlias)
 	}
 
-	bytes, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
-	if err != nil {
-		t.Fatalf("ReadFile(auth.json) error = %v", err)
-	}
-	var auth codexauth.File
-	if err := json.Unmarshal(bytes, &auth); err != nil {
-		t.Fatalf("Unmarshal(auth.json) error = %v", err)
-	}
-	want := &codexauth.TokenData{
-		IDToken: map[string]any{
-			"email":             "work@example.com",
-			"chatgpt_plan_type": "pro",
-		},
-		AccessToken:  "token-work",
-		RefreshToken: "refresh-work",
-		AccountID:    "acct-work",
-	}
-	if !reflect.DeepEqual(auth.Tokens, want) {
-		t.Fatalf("auth.Tokens = %#v, want %#v", auth.Tokens, want)
-	}
-	if auth.LastRefresh == "" {
-		t.Fatal("LastRefresh = empty, want timestamp")
+	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("auth.json stat error = %v, want not exist", err)
 	}
 }

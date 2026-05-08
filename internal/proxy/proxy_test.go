@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,14 +89,9 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 			{Alias: "work", AccessToken: "token-work"},
 		},
 	})
-	var rotatedTo accounts.Account
 	server := newProxyWithConfig(t, Config{
 		Upstream: upstream.URL,
 		Store:    store,
-		OnRotate: func(account accounts.Account) error {
-			rotatedTo = account
-			return nil
-		},
 	})
 
 	resp := httptest.NewRecorder()
@@ -123,9 +117,6 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
 		t.Fatalf("personal disabled reset = %d, want %d", got, resetAt.Unix())
-	}
-	if !reflect.DeepEqual(rotatedTo, accounts.Account{Alias: "work", AccessToken: "token-work"}) {
-		t.Fatalf("rotatedTo = %#v, want work account", rotatedTo)
 	}
 }
 
@@ -218,6 +209,14 @@ func TestNewRejectsInvalidUpstream(t *testing.T) {
 
 	if _, err := New(Config{Upstream: "://bad-url", Store: newTestStore(t, accounts.Data{})}); err == nil {
 		t.Fatal("New(invalid upstream) error = nil, want error")
+	}
+}
+
+func TestNewRejectsInvalidAPIUpstream(t *testing.T) {
+	t.Parallel()
+
+	if _, err := New(Config{Upstream: "http://example.test", APIUpstream: "://bad-url", Store: newTestStore(t, accounts.Data{})}); err == nil {
+		t.Fatal("New(invalid API upstream) error = nil, want error")
 	}
 }
 
@@ -316,14 +315,9 @@ func TestProxyRotatesOnExhaustedUsageResponse(t *testing.T) {
 			{Alias: "work", AccessToken: "token-work"},
 		},
 	})
-	var rotatedTo accounts.Account
 	server := newProxyWithConfig(t, Config{
 		Upstream: upstream.URL,
 		Store:    store,
-		OnRotate: func(account accounts.Account) error {
-			rotatedTo = account
-			return nil
-		},
 	})
 
 	resp := httptest.NewRecorder()
@@ -349,9 +343,6 @@ func TestProxyRotatesOnExhaustedUsageResponse(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
 		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
-	}
-	if !reflect.DeepEqual(rotatedTo, accounts.Account{Alias: "work", AccessToken: "token-work"}) {
-		t.Fatalf("rotatedTo = %#v, want work account", rotatedTo)
 	}
 }
 
@@ -451,22 +442,6 @@ func TestUpdateUsageLimitsReturnsFalseWhenNoRotationAvailable(t *testing.T) {
 	}
 }
 
-func TestNotifyRotateHandlesNilAndCallbackErrors(t *testing.T) {
-	t.Parallel()
-
-	handler := &handler{}
-	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != nil {
-		t.Fatalf("notifyRotate(nil callback) error = %v", err)
-	}
-	wantErr := errors.New("callback failed")
-	handler.onRotate = func(accounts.Account) error {
-		return wantErr
-	}
-	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != wantErr {
-		t.Fatalf("notifyRotate(error) = %v, want %v", err, wantErr)
-	}
-}
-
 func TestCompactPrefixTruncatesBodyAndWhitespace(t *testing.T) {
 	t.Parallel()
 
@@ -520,6 +495,50 @@ func TestProxyJoinsUpstreamAndRequestPaths(t *testing.T) {
 	}
 	if gotPath != "/backend-api/codex/responses" {
 		t.Fatalf("path = %q, want /backend-api/codex/responses", gotPath)
+	}
+}
+
+func TestProxyRoutesV1PathsToAPIUpstream(t *testing.T) {
+	t.Parallel()
+
+	var chatGPTRequests int
+	chatGPTUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		chatGPTRequests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer chatGPTUpstream.Close()
+
+	var gotPath string
+	var gotAuth string
+	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer apiUpstream.Close()
+
+	server := newProxyWithConfig(t, Config{
+		Upstream:    chatGPTUpstream.URL,
+		APIUpstream: apiUpstream.URL,
+		Store: newTestStore(t, accounts.Data{
+			ActiveAlias: "personal",
+			Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token-personal"}},
+		}),
+	})
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusCreated)
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("api path = %q, want /v1/responses", gotPath)
+	}
+	if gotAuth != "Bearer token-personal" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if chatGPTRequests != 0 {
+		t.Fatalf("chatGPTRequests = %d, want 0", chatGPTRequests)
 	}
 }
 

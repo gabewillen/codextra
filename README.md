@@ -3,9 +3,9 @@
 `codextra` is a thin wrapper around `codex`.
 
 It starts a local proxy, launches the real `codex` binary with the proxy URL in
-Codex's `chatgpt_base_url` config override while preserving Codex's
-`/backend-api` base path, and otherwise passes arguments through unchanged. The
-proxy is where account rotation will live.
+Codex's `chatgpt_base_url` and `openai_base_url` config overrides while
+preserving the upstream base paths, and otherwise passes arguments through
+unchanged. The proxy owns account selection and rotation.
 
 This repo intentionally uses only the Go standard library.
 
@@ -16,8 +16,8 @@ moves quickly and Rust compile times made the fork expensive to keep current.
 
 `codextra` keeps the account-rotation behavior outside the Codex codebase. The
 goal is to preserve a small maintenance surface: launch Codex normally, point its
-ChatGPT backend traffic at a local proxy, and keep rotation policy in this repo
-instead of repeatedly merging a large upstream project.
+ChatGPT backend and OpenAI API traffic at a local proxy, and keep rotation policy
+in this repo instead of repeatedly merging a large upstream project.
 
 ## Usage
 
@@ -40,13 +40,14 @@ under the alias.
 
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
-`chatgpt_base_url` override.
+`chatgpt_base_url` and `openai_base_url` overrides.
 
 Use `--account <alias>` or `--account=<alias>` to switch the active codextra
 account before launching Codex. The flag is consumed by `codextra` and is not
-passed through to `codex`. Selecting an account also writes that account's token
-set into Codex's active auth file before launch, so Codex status and backend
-requests use the same account.
+passed through to `codex`. Selecting an account only updates codextra's account
+registry; proxied requests get their `Authorization` and `ChatGPT-Account-ID`
+headers from the active codextra account instead of relying on Codex's
+`auth.json`.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
@@ -58,6 +59,7 @@ The proxy listens on a random localhost port and forwards to:
 
 ```sh
 CODEXTRA_UPSTREAM=https://chatgpt.com
+CODEXTRA_API_UPSTREAM=https://api.openai.com
 ```
 
 Proxy diagnostics are written to `~/.codextra/proxy.log` as structured `slog`
