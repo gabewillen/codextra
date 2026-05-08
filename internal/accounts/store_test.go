@@ -236,6 +236,36 @@ func TestSetActivePersistsSelectedAccount(t *testing.T) {
 	}
 }
 
+func TestSetActiveClearsDisabledLimitState(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{
+		Accounts: []Account{{
+			Alias:           "work",
+			AccessToken:     "token-work",
+			DisabledUntil:   map[string]int64{"codex_weekly": 9_999_999_999},
+			LastLimitStatus: map[string]string{"codex_weekly": "limited"},
+		}},
+	}
+
+	if err := store.SetActive("work"); err != nil {
+		t.Fatalf("SetActive() error = %v", err)
+	}
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	want := Account{Alias: "work", AccessToken: "token-work"}
+	if !reflect.DeepEqual(loaded.Data.Accounts[0], want) {
+		t.Fatalf("account = %#v, want %#v", loaded.Data.Accounts[0], want)
+	}
+}
+
 func TestSetActiveRejectsMissingOrTokenlessAccount(t *testing.T) {
 	t.Parallel()
 

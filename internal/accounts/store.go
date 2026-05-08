@@ -132,11 +132,13 @@ func (s *Store) SetActive(alias string) error {
 	defer s.mu.Unlock()
 
 	_ = s.reloadLocked()
-	for _, account := range s.Data.Accounts {
-		if account.Alias == alias {
-			if account.AccessToken == "" {
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == alias {
+			if s.Data.Accounts[i].AccessToken == "" {
 				return fmt.Errorf("account %q has no access token", alias)
 			}
+			s.Data.Accounts[i].DisabledUntil = nil
+			s.Data.Accounts[i].LastLimitStatus = nil
 			s.Data.ActiveAlias = alias
 			return s.saveLocked()
 		}
