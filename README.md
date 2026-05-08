@@ -3,9 +3,9 @@
 `codextra` is a thin wrapper around `codex`.
 
 It starts a local proxy, launches the real `codex` binary with the proxy URL in
-Codex's `chatgpt_base_url` and `openai_base_url` config overrides while
-preserving the upstream base paths, and otherwise passes arguments through
-unchanged. The proxy owns account selection and rotation.
+Codex's `chatgpt_base_url` config override while preserving Codex's
+`/backend-api` base path, and otherwise passes arguments through unchanged. The
+proxy owns account selection and rotation.
 
 This repo intentionally uses only the Go standard library.
 
@@ -16,8 +16,8 @@ moves quickly and Rust compile times made the fork expensive to keep current.
 
 `codextra` keeps the account-rotation behavior outside the Codex codebase. The
 goal is to preserve a small maintenance surface: launch Codex normally, point its
-ChatGPT backend and OpenAI API traffic at a local proxy, and keep rotation policy
-in this repo instead of repeatedly merging a large upstream project.
+ChatGPT backend traffic at a local proxy, and keep rotation policy in this repo
+instead of repeatedly merging a large upstream project.
 
 ## Usage
 
@@ -40,7 +40,7 @@ under the alias.
 
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
-`chatgpt_base_url` and `openai_base_url` overrides.
+`chatgpt_base_url` override.
 
 Use `--account <alias>` or `--account=<alias>` to switch the active codextra
 account before launching Codex. The flag is consumed by `codextra` and is not
@@ -62,7 +62,6 @@ The proxy listens on a random localhost port and forwards to:
 
 ```sh
 CODEXTRA_UPSTREAM=https://chatgpt.com
-CODEXTRA_API_UPSTREAM=https://api.openai.com
 ```
 
 Proxy diagnostics are written to `~/.codextra/proxy.log` as structured `slog`

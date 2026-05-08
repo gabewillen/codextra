@@ -1,15 +1,19 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
@@ -156,13 +160,17 @@ func (h *handler) forward(ctx context.Context, original *http.Request, body []by
 	}
 	req.Header = original.Header.Clone()
 	req.Host = upstream.Host
-	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
-	if account.AccountID != "" {
-		req.Header.Set("ChatGPT-Account-ID", account.AccountID)
-	} else {
-		req.Header.Del("ChatGPT-Account-ID")
-	}
+	applyAuthHeaders(req.Header, account)
 	return h.client.Do(req)
+}
+
+func applyAuthHeaders(header http.Header, account accounts.Account) {
+	header.Set("Authorization", "Bearer "+account.AccessToken)
+	if account.AccountID != "" {
+		header.Set("ChatGPT-Account-ID", account.AccountID)
+	} else {
+		header.Del("ChatGPT-Account-ID")
+	}
 }
 
 func (h *handler) upstreamFor(path string) *url.URL {
@@ -173,10 +181,162 @@ func (h *handler) upstreamFor(path string) *url.URL {
 }
 
 func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Standard-library-only WebSocket proxying is intentionally deferred. HTTP
-	// Upgrade tunneling needs careful hijacking and frame piping. For now, fail
-	// clearly instead of pretending this path works.
-	http.Error(w, "codextra websocket proxy is not implemented yet", http.StatusNotImplemented)
+	start := time.Now()
+	account, ok := h.store.Current(time.Now())
+	if !ok {
+		h.logger.Warn("no_eligible_account", "method", r.Method, "path", r.URL.Path)
+		http.Error(w, "codextra has no eligible account", http.StatusServiceUnavailable)
+		return
+	}
+
+	for {
+		upstreamConn, upstreamReader, upstreamReq, resp, err := h.openWebSocket(r.Context(), r, account)
+		if err != nil {
+			h.logger.Warn("websocket_upstream_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			h.logger.Info("websocket_upgraded", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "upstream_host", upstreamReq.Host, "duration_ms", time.Since(start).Milliseconds())
+			h.tunnelWebSocket(w, r, upstreamConn, upstreamReader, resp)
+			return
+		}
+
+		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
+			captured, err := copyResponse(w, resp, responseCaptureLimit(resp))
+			h.logResponse(r, resp, account, time.Since(start), captured, err)
+			upstreamConn.Close()
+			return
+		}
+
+		limit, resetAt := limitInfo(resp)
+		resp.Body.Close()
+		upstreamConn.Close()
+		h.logger.Info("usage_limit_detected", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
+		next, rotated, err := h.store.RotateFrom(account.Alias, limit, resetAt, time.Now())
+		if err != nil {
+			h.logger.Warn("account_rotation_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !rotated {
+			h.logger.Warn("account_rotation_exhausted", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit)
+			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
+			return
+		}
+		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
+		account = next
+	}
+}
+
+func (h *handler) openWebSocket(ctx context.Context, original *http.Request, account accounts.Account) (net.Conn, *bufio.Reader, *http.Request, *http.Response, error) {
+	upstream := h.upstreamFor(original.URL.Path)
+	target := *upstream
+	target.Path = singleJoiningSlash(upstream.Path, original.URL.Path)
+	target.RawQuery = original.URL.RawQuery
+
+	req := original.Clone(ctx)
+	req.URL = &target
+	req.RequestURI = ""
+	req.Host = upstream.Host
+	req.Header = original.Header.Clone()
+	applyAuthHeaders(req.Header, account)
+
+	conn, err := dialURL(ctx, upstream)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, nil, nil, nil, err
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		conn.Close()
+		return nil, nil, nil, nil, err
+	}
+	return conn, reader, req, resp, nil
+}
+
+func dialURL(ctx context.Context, target *url.URL) (net.Conn, error) {
+	addr := target.Host
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		switch target.Scheme {
+		case "https", "wss":
+			addr = net.JoinHostPort(target.Host, "443")
+		default:
+			addr = net.JoinHostPort(target.Host, "80")
+		}
+	}
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if target.Scheme != "https" && target.Scheme != "wss" {
+		return conn, nil
+	}
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: target.Hostname(), MinVersion: tls.VersionTLS12})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func (h *handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, upstreamConn net.Conn, upstreamReader *bufio.Reader, resp *http.Response) {
+	defer upstreamConn.Close()
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		resp.Body.Close()
+		http.Error(w, "response writer cannot hijack connection", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientRW, err := hijacker.Hijack()
+	if err != nil {
+		resp.Body.Close()
+		h.logger.Warn("websocket_hijack_failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		return
+	}
+	defer clientConn.Close()
+
+	if err := resp.Write(clientRW); err != nil {
+		h.logger.Warn("websocket_response_write_failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		return
+	}
+	if err := clientRW.Flush(); err != nil {
+		h.logger.Warn("websocket_response_flush_failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		return
+	}
+	resp.Body.Close()
+
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+		})
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		if upstreamReader.Buffered() > 0 {
+			_, _ = io.CopyN(clientConn, upstreamReader, int64(upstreamReader.Buffered()))
+		}
+		_, _ = io.Copy(clientConn, upstreamConn)
+	}()
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		if clientRW.Reader.Buffered() > 0 {
+			_, _ = io.CopyN(upstreamConn, clientRW.Reader, int64(clientRW.Reader.Buffered()))
+		}
+		_, _ = io.Copy(upstreamConn, clientConn)
+	}()
+	wg.Wait()
 }
 
 func copyResponse(w http.ResponseWriter, resp *http.Response, captureLimit int) ([]byte, error) {

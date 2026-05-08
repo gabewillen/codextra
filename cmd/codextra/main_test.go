@@ -24,8 +24,6 @@ func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
 	want := []string{
 		"-c",
 		"chatgpt_base_url=http://127.0.0.1:1234/backend-api",
-		"-c",
-		"openai_base_url=http://127.0.0.1:1234/v1",
 		"--model",
 		"gpt-5.4",
 		"--",
@@ -103,7 +101,6 @@ func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	got := codexArgs("http://proxy", []string{"-c", "chatgpt_base_url=http://custom"})
 	want := []string{
 		"-c", "chatgpt_base_url=http://proxy/backend-api",
-		"-c", "openai_base_url=http://proxy/v1",
 		"-c", "chatgpt_base_url=http://custom",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -118,16 +115,6 @@ func TestCodexChatGPTBaseURLPreservesBackendAPIBasePath(t *testing.T) {
 	want := "http://127.0.0.1:1234/backend-api"
 	if got != want {
 		t.Fatalf("codexChatGPTBaseURL() = %q, want %q", got, want)
-	}
-}
-
-func TestCodexOpenAIBaseURLPreservesV1BasePath(t *testing.T) {
-	t.Parallel()
-
-	got := codexOpenAIBaseURL("http://127.0.0.1:1234/")
-	want := "http://127.0.0.1:1234/v1"
-	if got != want {
-		t.Fatalf("codexOpenAIBaseURL() = %q, want %q", got, want)
 	}
 }
 

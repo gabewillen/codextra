@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -172,22 +177,6 @@ func TestProxyReturnsTooManyRequestsWhenAllAccountsLimited(t *testing.T) {
 	}
 }
 
-func TestProxyRejectsWebSocketClearly(t *testing.T) {
-	t.Parallel()
-
-	server := newTestProxy(t, "http://example.test", accounts.Data{
-		Accounts: []accounts.Account{{Alias: "personal", AccessToken: "token"}},
-	})
-	req := httptest.NewRequest(http.MethodGet, "/realtime", nil)
-	req.Header.Set("Upgrade", "websocket")
-	resp := httptest.NewRecorder()
-	server.Handler.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotImplemented)
-	}
-}
-
 func TestProxyHealthEndpoint(t *testing.T) {
 	t.Parallel()
 
@@ -200,6 +189,304 @@ func TestProxyHealthEndpoint(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.Body.String()) != `{"ok":true}` {
 		t.Fatalf("body = %q, want health JSON", resp.Body.String())
+	}
+}
+
+func TestProxyTunnelsWebSocketWithActiveAccountAuth(t *testing.T) {
+	t.Parallel()
+
+	authSeen := make(chan string, 1)
+	accountSeen := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authSeen <- r.Header.Get("Authorization")
+		accountSeen <- r.Header.Get("ChatGPT-Account-ID")
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("upstream writer is not hijackable")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = rw.WriteString("upstream-ready\n")
+		if err := rw.Flush(); err != nil {
+			t.Errorf("upstream flush error = %v", err)
+			return
+		}
+		line, err := rw.ReadString('\n')
+		if err != nil {
+			t.Errorf("upstream read error = %v", err)
+			return
+		}
+		_, _ = rw.WriteString("echo: " + line)
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	proxy := newProxyWithConfig(t, Config{
+		Upstream:    "http://example.test",
+		APIUpstream: upstream.URL,
+		Store: newTestStore(t, accounts.Data{
+			ActiveAlias: "personal",
+			Accounts: []accounts.Account{{
+				Alias:       "personal",
+				AccessToken: "token-personal",
+				AccountID:   "acct-personal",
+			}},
+		}),
+	})
+	proxyServer := httptest.NewServer(proxy.Handler)
+	defer proxyServer.Close()
+
+	conn, reader, resp := openTestWebSocket(t, proxyServer.URL, "/v1/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	ready, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString(ready) error = %v", err)
+	}
+	if ready != "upstream-ready\n" {
+		t.Fatalf("ready = %q, want upstream-ready", ready)
+	}
+	if _, err := conn.Write([]byte("client-data\n")); err != nil {
+		t.Fatalf("Write(client-data) error = %v", err)
+	}
+	echo, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString(echo) error = %v", err)
+	}
+	if echo != "echo: client-data\n" {
+		t.Fatalf("echo = %q, want echo", echo)
+	}
+	if got := <-authSeen; got != "Bearer token-personal" {
+		t.Fatalf("Authorization = %q, want bearer token", got)
+	}
+	if got := <-accountSeen; got != "acct-personal" {
+		t.Fatalf("ChatGPT-Account-ID = %q, want acct-personal", got)
+	}
+}
+
+func TestProxyWebSocketRotatesOnUsageLimitBeforeUpgrade(t *testing.T) {
+	t.Parallel()
+
+	var tokens []string
+	resetAt := time.Unix(1_700_000_123, 0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.Header().Set("x-codex-active-limit", "codex_weekly")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type":      "usage_limit_reached",
+					"resets_at": resetAt.Unix(),
+				},
+			})
+			return
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("upstream writer is not hijackable")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: "token-work"},
+		},
+	})
+	proxy := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+	proxyServer := httptest.NewServer(proxy.Handler)
+	defer proxyServer.Close()
+
+	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	wantTokens := []string{"Bearer token-personal", "Bearer token-work"}
+	if len(tokens) != len(wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+	}
+	for i := range wantTokens {
+		if tokens[i] != wantTokens[i] {
+			t.Fatalf("tokens[%d] = %q, want %q", i, tokens[i], wantTokens[i])
+		}
+	}
+	if store.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want work", store.Data.ActiveAlias)
+	}
+	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
+		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+}
+
+func TestProxyWebSocketCopiesPreUpgradeError(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"detail":"Unauthorized"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token-personal"}},
+	})
+	proxyServer := httptest.NewServer(proxy.Handler)
+	defer proxyServer.Close()
+
+	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(body) error = %v", err)
+	}
+	if !strings.Contains(string(body), "Unauthorized") {
+		t.Fatalf("body = %q, want unauthorized detail", string(body))
+	}
+}
+
+func TestProxyWebSocketReturnsUnavailableWithoutEligibleAccount(t *testing.T) {
+	t.Parallel()
+
+	server := newTestProxy(t, "http://example.test", accounts.Data{
+		Accounts: []accounts.Account{{Alias: "empty"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	resp := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestProxyWebSocketReturnsBadGatewayWhenUpstreamUnavailable(t *testing.T) {
+	t.Parallel()
+
+	server := newTestProxy(t, "http://127.0.0.1:1", accounts.Data{
+		ActiveAlias: "personal",
+		Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token-personal"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	resp := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadGateway)
+	}
+}
+
+func TestProxyWebSocketReturnsTooManyRequestsWhenAllAccountsLimited(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-codex-active-limit", "codex_weekly")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"type": "usage_limit_reached"},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token-personal"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	resp := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestProxyWebSocketReturnsServerErrorWhenWriterCannotHijack(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("upstream writer is not hijackable")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts:    []accounts.Account{{Alias: "personal", AccessToken: "token-personal"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	resp := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestDialURLReportsTLSHandshakeFailure(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewTLSServer(http.NotFoundHandler())
+	defer upstream.Close()
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("Parse(upstream.URL) error = %v", err)
+	}
+
+	conn, err := dialURL(contextWithTimeout(t), parsed)
+	if err == nil {
+		conn.Close()
+		t.Fatal("dialURL(NewTLSServer) error = nil, want certificate error")
 	}
 }
 
@@ -347,6 +634,19 @@ func TestCompactPrefixTruncatesBodyAndWhitespace(t *testing.T) {
 	if got != "abcde" {
 		t.Fatalf("compactPrefix(long word) = %q, want abcde", got)
 	}
+}
+
+func TestLogResponseIncludesCopyError(t *testing.T) {
+	t.Parallel()
+
+	handler := &handler{
+		upstream:    mustParseURL(t, "http://chatgpt.test"),
+		apiUpstream: mustParseURL(t, "http://api.test"),
+		logger:      slogDiscard(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
+	resp := &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{"content-type": []string{"text/plain"}}}
+	handler.logResponse(req, resp, accounts.Account{Alias: "personal"}, time.Millisecond, []byte("Usage limit"), errors.New("copy failed"))
 }
 
 func TestProxyReturnsBadRequestWhenRequestBodyCannotBeRead(t *testing.T) {
@@ -528,4 +828,56 @@ func newTestStore(t *testing.T, data accounts.Data) *accounts.Store {
 	}
 	store.Data = data
 	return store
+}
+
+func openTestWebSocket(t *testing.T, serverURL string, path string) (net.Conn, *bufio.Reader, *http.Response) {
+	t.Helper()
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatalf("Parse(%q) error = %v", serverURL, err)
+	}
+	conn, err := net.Dial("tcp", parsed.Host)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", parsed.Host, err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+parsed.Host+path, nil)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		t.Fatalf("Write(request) error = %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("ReadResponse() error = %v", err)
+	}
+	return conn, reader, resp
+}
+
+func contextWithTimeout(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func mustParseURL(t *testing.T, value string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(value)
+	if err != nil {
+		t.Fatalf("Parse(%q) error = %v", value, err)
+	}
+	return parsed
+}
+
+func slogDiscard() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
