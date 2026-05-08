@@ -116,8 +116,9 @@ Account metadata is stored at:
 ~/.codextra/accounts.json
 ```
 
-The proxy and account store are scaffolded for rotation. `login <alias>` imports
-the account token set from an ordinary Codex login.
+When a usage-limit response is detected, the proxy marks that account ineligible
+until its reset time when one is available, switches to the next eligible alias,
+and retries before returning a response to Codex.
 
 ## Releases
 
