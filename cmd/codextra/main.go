@@ -18,10 +18,11 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 4
+const proxyStateVersion = 5
 const defaultProxyLogMaxBytes int64 = 1 << 20
 
 func main() {
@@ -96,6 +97,7 @@ func runProxyServer(ctx context.Context) error {
 		Upstream: upstream,
 		Store:    store,
 		Logger:   logger,
+		OnRotate: updateCodexAuthForAccount,
 	})
 	if err != nil {
 		return err
@@ -303,11 +305,15 @@ func activateAccount(alias string) error {
 	if err := store.SetActive(alias); err != nil {
 		return err
 	}
-	authPath, err := codexAuthPath()
+	return updateCodexAuthForAccount(account)
+}
+
+func updateCodexAuthForAccount(account accounts.Account) error {
+	authPath, err := codexauth.Path()
 	if err != nil {
 		return err
 	}
-	return writeCodexAuth(authPath, account)
+	return codexauth.Write(authPath, account)
 }
 
 func codextraDir() (string, error) {

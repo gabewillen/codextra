@@ -19,6 +19,7 @@ type Config struct {
 	Upstream string
 	Store    *accounts.Store
 	Logger   *slog.Logger
+	OnRotate func(accounts.Account) error
 }
 
 func New(config Config) (*http.Server, error) {
@@ -31,6 +32,7 @@ func New(config Config) (*http.Server, error) {
 		store:    config.Store,
 		client:   http.DefaultClient,
 		logger:   config.Logger,
+		onRotate: config.OnRotate,
 	}
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -43,6 +45,7 @@ type handler struct {
 	store    *accounts.Store
 	client   *http.Client
 	logger   *slog.Logger
+	onRotate func(accounts.Account) error
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +123,9 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		if err := h.notifyRotate(next); err != nil {
+			h.logger.Warn("rotation_callback_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
 	}
@@ -149,8 +155,18 @@ func (h *handler) updateUsageLimits(r *http.Request, resp *http.Response, accoun
 		h.logger.Warn("usage_rotation_exhausted", "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
 		return false
 	}
+	if err := h.notifyRotate(next); err != nil {
+		h.logger.Warn("rotation_callback_failed", "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+	}
 	h.logger.Info("usage_rotation_detected", "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
 	return true
+}
+
+func (h *handler) notifyRotate(account accounts.Account) error {
+	if h.onRotate == nil {
+		return nil
+	}
+	return h.onRotate(account)
 }
 
 func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {

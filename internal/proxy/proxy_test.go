@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +90,15 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 			{Alias: "work", AccessToken: "token-work"},
 		},
 	})
-	server := newProxyWithStore(t, upstream.URL, store)
+	var rotatedTo accounts.Account
+	server := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnRotate: func(account accounts.Account) error {
+			rotatedTo = account
+			return nil
+		},
+	})
 
 	resp := httptest.NewRecorder()
 	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader("body")))
@@ -114,6 +123,9 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
 		t.Fatalf("personal disabled reset = %d, want %d", got, resetAt.Unix())
+	}
+	if !reflect.DeepEqual(rotatedTo, accounts.Account{Alias: "work", AccessToken: "token-work"}) {
+		t.Fatalf("rotatedTo = %#v, want work account", rotatedTo)
 	}
 }
 
@@ -304,7 +316,15 @@ func TestProxyRotatesOnExhaustedUsageResponse(t *testing.T) {
 			{Alias: "work", AccessToken: "token-work"},
 		},
 	})
-	server := newProxyWithStore(t, upstream.URL, store)
+	var rotatedTo accounts.Account
+	server := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnRotate: func(account accounts.Account) error {
+			rotatedTo = account
+			return nil
+		},
+	})
 
 	resp := httptest.NewRecorder()
 	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil))
@@ -329,6 +349,9 @@ func TestProxyRotatesOnExhaustedUsageResponse(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
 		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+	if !reflect.DeepEqual(rotatedTo, accounts.Account{Alias: "work", AccessToken: "token-work"}) {
+		t.Fatalf("rotatedTo = %#v, want work account", rotatedTo)
 	}
 }
 
@@ -425,6 +448,22 @@ func TestUpdateUsageLimitsReturnsFalseWhenNoRotationAvailable(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
 	if handler.updateUsageLimits(req, resp, accounts.Account{Alias: "personal", AccessToken: "token"}) {
 		t.Fatal("updateUsageLimits(no next account) = true, want false")
+	}
+}
+
+func TestNotifyRotateHandlesNilAndCallbackErrors(t *testing.T) {
+	t.Parallel()
+
+	handler := &handler{}
+	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != nil {
+		t.Fatalf("notifyRotate(nil callback) error = %v", err)
+	}
+	wantErr := errors.New("callback failed")
+	handler.onRotate = func(accounts.Account) error {
+		return wantErr
+	}
+	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != wantErr {
+		t.Fatalf("notifyRotate(error) = %v, want %v", err, wantErr)
 	}
 }
 
@@ -556,7 +595,12 @@ func newTestProxy(t *testing.T, upstream string, data accounts.Data) *http.Serve
 
 func newProxyWithStore(t *testing.T, upstream string, store *accounts.Store) *http.Server {
 	t.Helper()
-	server, err := New(Config{Upstream: upstream, Store: store})
+	return newProxyWithConfig(t, Config{Upstream: upstream, Store: store})
+}
+
+func newProxyWithConfig(t *testing.T, config Config) *http.Server {
+	t.Helper()
+	server, err := New(config)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

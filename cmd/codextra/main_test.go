@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 func TestCodexArgsPassesUserArgsThroughAfterProxyOverride(t *testing.T) {
@@ -75,7 +76,7 @@ func TestActivateAccountWritesSelectedAliasEvenWhenDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(auth.json) error = %v", err)
 	}
-	var auth codexAuthFile
+	var auth codexauth.File
 	if err := json.Unmarshal(bytes, &auth); err != nil {
 		t.Fatalf("Unmarshal(auth.json) error = %v", err)
 	}
@@ -249,11 +250,11 @@ func TestActivateAccountWritesSelectedAliasToCodexAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(auth.json) error = %v", err)
 	}
-	var auth codexAuthFile
+	var auth codexauth.File
 	if err := json.Unmarshal(bytes, &auth); err != nil {
 		t.Fatalf("Unmarshal(auth.json) error = %v", err)
 	}
-	want := &codexTokenData{
+	want := &codexauth.TokenData{
 		IDToken: map[string]any{
 			"email":             "work@example.com",
 			"chatgpt_plan_type": "pro",
