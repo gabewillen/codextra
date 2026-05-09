@@ -8,9 +8,9 @@ Codex's `chatgpt_base_url` config override while preserving Codex's
 proxy owns account selection and rotation.
 
 `codextra` is intended for switching between paid personal ChatGPT
-subscriptions that you personally control. It is not intended to encourage or
+subscriptions that you personally control. **It is not intended to encourage or
 support cycling through free accounts, shared accounts, trial accounts, or other
-accounts used to evade usage limits or service terms.
+accounts used to evade usage limits or service terms.**
 
 This repo intentionally uses only the Go standard library.
 
@@ -122,9 +122,9 @@ Account metadata is stored at:
 ~/.codextra/accounts.json
 ```
 
-When a usage-limit response is detected, the proxy marks that account ineligible
-until its reset time when one is available, switches to the next eligible alias,
-and retries before returning a response to Codex.
+When an account becomes temporarily unavailable due to usage availability or
+authentication state, the proxy can switch to another configured account owned
+by the user.
 
 ## Releases
 
