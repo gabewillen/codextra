@@ -350,6 +350,82 @@ func TestRandomRoutePrefixIsUnguessablePath(t *testing.T) {
 	}
 }
 
+func TestRoutePrefixFromProxyURLValidatesSecretPrefix(t *testing.T) {
+	t.Parallel()
+
+	prefix, ok := routePrefixFromProxyURL("http://127.0.0.1:1234/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef")
+	if !ok {
+		t.Fatal("routePrefixFromProxyURL(valid) ok = false, want true")
+	}
+	if prefix != "/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("prefix = %q", prefix)
+	}
+
+	for _, value := range []string{
+		"http://127.0.0.1:1234",
+		"http://127.0.0.1:1234/backend-api",
+		"http://127.0.0.1:1234/__codextra/not-hex",
+		"http://127.0.0.1:1234/__codextra/0123456789abcdef",
+		"://bad",
+	} {
+		if prefix, ok := routePrefixFromProxyURL(value); ok {
+			t.Fatalf("routePrefixFromProxyURL(%q) = %q, true; want false", value, prefix)
+		}
+	}
+}
+
+func TestReusableProxyAddrUsesPreviousLoopbackPort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:49408" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:49408", got)
+	}
+}
+
+func TestReusableProxyAddrRejectsNonLoopbackHost(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://example.com:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
+func TestReusableRoutePrefixUsesPreviousSecret(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	prefix, err := reusableRoutePrefix()
+	if err != nil {
+		t.Fatalf("reusableRoutePrefix() error = %v", err)
+	}
+	if prefix != "/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("reusableRoutePrefix() = %q", prefix)
+	}
+}
+
 func TestAttachProxyClientReturnsStatusError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "no", http.StatusTeapot)

@@ -111,8 +111,15 @@ func runProxyServer(ctx context.Context) error {
 	}
 	defer logCloser()
 
-	addr := getenv("CODEXTRA_PROXY_ADDR", "127.0.0.1:0")
+	addr := getenv("CODEXTRA_PROXY_ADDR", "")
+	if addr == "" {
+		addr = reusableProxyAddr()
+	}
 	listener, err := net.Listen("tcp", addr)
+	if err != nil && os.Getenv("CODEXTRA_PROXY_ADDR") == "" && addr != "127.0.0.1:0" {
+		logger.Warn("proxy_reuse_addr_failed", "addr", addr, "error", err)
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
+	}
 	if err != nil {
 		return fmt.Errorf("listen proxy: %w", err)
 	}
@@ -127,7 +134,7 @@ func runProxyServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	routePrefix, err := randomRoutePrefix()
+	routePrefix, err := reusableRoutePrefix()
 	if err != nil {
 		return err
 	}
@@ -274,6 +281,54 @@ func randomRoutePrefix() (string, error) {
 		return "", fmt.Errorf("generate proxy route token: %w", err)
 	}
 	return "/__codextra/" + hex.EncodeToString(bytes[:]), nil
+}
+
+func reusableProxyAddr() string {
+	state, err := readProxyState()
+	if err != nil || state.URL == "" {
+		return "127.0.0.1:0"
+	}
+	parsed, err := url.Parse(state.URL)
+	if err != nil || parsed.Host == "" {
+		return "127.0.0.1:0"
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || port == "" {
+		return "127.0.0.1:0"
+	}
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return "127.0.0.1:0"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func reusableRoutePrefix() (string, error) {
+	state, err := readProxyState()
+	if err == nil {
+		if prefix, ok := routePrefixFromProxyURL(state.URL); ok {
+			return prefix, nil
+		}
+	}
+	return randomRoutePrefix()
+}
+
+func routePrefixFromProxyURL(proxyURL string) (string, bool) {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return "", false
+	}
+	prefix := strings.TrimRight(parsed.EscapedPath(), "/")
+	if !strings.HasPrefix(prefix, "/__codextra/") {
+		return "", false
+	}
+	token := strings.TrimPrefix(prefix, "/__codextra/")
+	if len(token) != 48 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return "", false
+	}
+	return prefix, true
 }
 
 func proxyDisplayURL(proxyURL string) string {
