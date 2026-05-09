@@ -7,6 +7,11 @@ Codex's `chatgpt_base_url` config override while preserving Codex's
 `/backend-api` base path, and otherwise passes arguments through unchanged. The
 proxy owns account selection and rotation.
 
+`codextra` is intended for switching between paid personal ChatGPT
+subscriptions that you personally control. It is not intended to encourage or
+support cycling through free accounts, shared accounts, trial accounts, or other
+accounts used to evade usage limits or service terms.
+
 This repo intentionally uses only the Go standard library.
 
 ## Why Proxy
@@ -55,14 +60,15 @@ codextra [codex args...]
 through to `codex`.
 
 ```sh
-codextra login personal
-codextra login work --device-auth
-codextra --account work
+codextra login personal-plus
+codextra login personal-pro --device-auth
+codextra --account personal-pro
 ```
 
 `login <alias>` runs the normal `codex login`, imports the resulting active
 Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
-under the alias.
+under the alias. Use aliases for your own paid personal subscriptions; do not
+use `codextra` to manage pools of free or throwaway accounts.
 
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
