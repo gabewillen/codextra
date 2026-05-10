@@ -97,10 +97,12 @@ account before launching Codex. The flag is consumed by `codextra` and is not
 passed through to `codex`. Selecting an account only updates codextra's account
 registry; proxied requests get their `Authorization` and `ChatGPT-Account-ID`
 headers from the active codextra account instead of relying on Codex's
-`auth.json`. For Codex UI/status metadata, `codextra` launches the child process
-with a temporary `CODEX_HOME` that mirrors the normal Codex home but contains an
-isolated `auth.json` for the selected alias. The real Codex auth file is not
-modified.
+`auth.json`. `codextra` does not replace `CODEX_HOME`, so Codex session
+history, resume state, config, and other local files stay in the normal Codex
+home. Because Codex still reads the normal `auth.json` locally, UI and status
+metadata can show the account logged in through Codex itself rather than the
+alias selected with `--account`; proxied model requests still use the selected
+codextra account.
 
 After rotation, Codex's `/status` screen can show mixed account information:
 the `Account` field comes from Codex's startup auth snapshot, while usage limits
