@@ -33,6 +33,12 @@ type Data struct {
 	Accounts    []Account `json:"accounts"`
 }
 
+type Snapshot struct {
+	ActiveAlias  string
+	CurrentAlias string
+	Accounts     []Account
+}
+
 func LoadStore(path string) (*Store, error) {
 	store := &Store{path: path}
 	bytes, err := os.ReadFile(path)
@@ -65,6 +71,69 @@ func (s *Store) Current(now time.Time) (Account, bool) {
 		}
 	}
 	return Account{}, false
+}
+
+func (s *Store) Snapshot(now time.Time) (Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.reloadLocked(); err != nil {
+		return Snapshot{}, err
+	}
+
+	snapshot := Snapshot{
+		ActiveAlias: s.Data.ActiveAlias,
+		Accounts:    make([]Account, len(s.Data.Accounts)),
+	}
+	for i := range s.Data.Accounts {
+		snapshot.Accounts[i] = cloneAccount(s.Data.Accounts[i])
+	}
+
+	if alias, ok := s.currentAliasLocked(now); ok {
+		snapshot.CurrentAlias = alias
+	}
+	return snapshot, nil
+}
+
+func (s *Store) currentAliasLocked(now time.Time) (string, bool) {
+	if account, ok := s.findEligibleLocked(s.Data.ActiveAlias, now); ok {
+		return account.Alias, true
+	}
+	for _, account := range s.Data.Accounts {
+		if eligible(account, now) {
+			return account.Alias, true
+		}
+	}
+	return "", false
+}
+
+func cloneAccount(account Account) Account {
+	cloned := account
+	cloned.DisabledUntil = cloneInt64Map(account.DisabledUntil)
+	cloned.LastLimitStatus = cloneStringMap(account.LastLimitStatus)
+	return cloned
+}
+
+func cloneInt64Map(values map[string]int64) map[string]int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]int64, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (s *Store) Get(alias string) (Account, bool) {

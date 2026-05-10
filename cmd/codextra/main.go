@@ -69,6 +69,19 @@ func run() error {
 	}
 	defer client.Close()
 
+	storePath, err := defaultStorePath()
+	if err != nil {
+		return err
+	}
+	stopTray := startTray(ctx, storePath, func(alias string) error {
+		_, err := activateAccount(alias)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	defer stopTray()
+
 	codexArgs := codexArgs(proxyURL, userArgs)
 	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
 	cmd.Stdin = os.Stdin

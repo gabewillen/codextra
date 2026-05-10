@@ -413,3 +413,48 @@ func TestStoreFileIsJSON(t *testing.T) {
 		t.Fatalf("ActiveAlias = %q, want personal", data.ActiveAlias)
 	}
 }
+
+func TestSnapshotReturnsCurrentAliasAndCopiesAccounts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	store, err := LoadStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+
+	store.Data = Data{
+		ActiveAlias: "personal",
+		Accounts: []Account{
+			{
+				Alias:           "personal",
+				AccessToken:     "token-personal",
+				DisabledUntil:   map[string]int64{"codex_weekly": now.Add(-time.Hour).Unix()},
+				LastLimitStatus: map[string]string{"codex_weekly": "ready"},
+			},
+			{
+				Alias:       "work",
+				AccessToken: "token-work",
+			},
+		},
+	}
+
+	snapshot, err := store.Snapshot(now)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.ActiveAlias != "personal" {
+		t.Fatalf("ActiveAlias = %q, want personal", snapshot.ActiveAlias)
+	}
+	if snapshot.CurrentAlias != "personal" {
+		t.Fatalf("CurrentAlias = %q, want personal", snapshot.CurrentAlias)
+	}
+	if len(snapshot.Accounts) != 2 {
+		t.Fatalf("len(snapshot.Accounts) = %d, want 2", len(snapshot.Accounts))
+	}
+
+	snapshot.Accounts[0].DisabledUntil["codex_weekly"] = now.Add(time.Hour).Unix()
+	if store.Data.Accounts[0].DisabledUntil["codex_weekly"] == snapshot.Accounts[0].DisabledUntil["codex_weekly"] {
+		t.Fatal("snapshot should copy account maps, not share references")
+	}
+}
