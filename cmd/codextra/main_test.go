@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,6 +292,45 @@ func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
 	}
+}
+
+func TestKeepProxyAliveReattachesDroppedClientStream(t *testing.T) {
+	var attaches atomic.Int32
+	releaseSecond := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/__codextra/client" {
+			http.NotFound(w, r)
+			return
+		}
+		count := attaches.Add(1)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(": connected\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if count == 1 {
+			return
+		}
+		<-releaseSecond
+	}))
+	defer server.Close()
+
+	keeper, err := keepProxyAlive(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("keepProxyAlive() error = %v", err)
+	}
+	defer close(releaseSecond)
+	defer keeper.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if attaches.Load() >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("client stream attaches = %d, want at least 2", attaches.Load())
 }
 
 func TestRoutePrefixHandlerRequiresSecretPrefix(t *testing.T) {

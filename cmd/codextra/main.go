@@ -67,7 +67,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	client, err := attachProxyClient(ctx, proxyURL)
+	client, err := keepProxyAlive(ctx, proxyURL)
 	if err != nil {
 		return err
 	}
@@ -443,6 +443,63 @@ func attachProxyClient(ctx context.Context, proxyURL string) (*proxyClient, erro
 func (c *proxyClient) Close() {
 	c.cancel()
 	<-c.done
+}
+
+type proxyKeepAlive struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func keepProxyAlive(ctx context.Context, proxyURL string) (*proxyKeepAlive, error) {
+	client, err := attachProxyClient(ctx, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+
+	keepCtx, cancel := context.WithCancel(ctx)
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(ready)
+		defer client.Close()
+
+		backoff := 100 * time.Millisecond
+		for {
+			select {
+			case <-keepCtx.Done():
+				return
+			case <-client.done:
+			}
+			client.Close()
+
+			for {
+				select {
+				case <-keepCtx.Done():
+					return
+				case <-time.After(backoff):
+				}
+
+				next, err := attachProxyClient(keepCtx, proxyURL)
+				if err == nil {
+					client = next
+					backoff = 100 * time.Millisecond
+					break
+				}
+				if backoff < time.Second {
+					backoff *= 2
+				}
+			}
+		}
+	}()
+	<-ready
+
+	return &proxyKeepAlive{cancel: cancel, done: done}, nil
+}
+
+func (k *proxyKeepAlive) Close() {
+	k.cancel()
+	<-k.done
 }
 
 type proxyLifecycle struct {
