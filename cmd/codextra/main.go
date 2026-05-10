@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
-	"github.com/gabewillen/codextra/internal/codexauth"
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
@@ -54,13 +53,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var selectedAccount *accounts.Account
 	if accountAlias != "" {
-		account, err := activateAccount(accountAlias)
-		if err != nil {
+		if _, err := activateAccount(accountAlias); err != nil {
 			return err
 		}
-		selectedAccount = &account
 	}
 
 	proxyURL, err := ensureProxy()
@@ -78,16 +74,7 @@ func run() error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	codexHome := ""
-	if selectedAccount != nil {
-		home, cleanup, err := prepareCodexHome(*selectedAccount)
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		codexHome = home
-	}
-	cmd.Env = codexEnv(os.Environ(), proxyURL, codexHome)
+	cmd.Env = codexEnv(os.Environ(), proxyURL)
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 	return cmd.Run()
@@ -730,75 +717,15 @@ func codexModelProviderConfig(proxyURL string) string {
 	)
 }
 
-func prepareCodexHome(account accounts.Account) (string, func(), error) {
-	dir, err := os.MkdirTemp("", "codextra-codex-home-*")
-	if err != nil {
-		return "", nil, fmt.Errorf("create temporary codex home: %w", err)
-	}
-	cleanup := func() {
-		_ = os.RemoveAll(dir)
-	}
-	if err := mirrorCodexHome(dir); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	if err := codexauth.Write(filepath.Join(dir, "auth.json"), account); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	return dir, cleanup, nil
-}
-
-func mirrorCodexHome(dst string) error {
-	src, err := realCodexHome()
-	if err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read codex home: %w", err)
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == "auth.json" {
-			continue
-		}
-		if err := os.Symlink(filepath.Join(src, name), filepath.Join(dst, name)); err != nil {
-			return fmt.Errorf("mirror codex home entry %q: %w", name, err)
-		}
-	}
-	return nil
-}
-
-func realCodexHome() (string, error) {
-	if home := os.Getenv("CODEX_HOME"); home != "" {
-		return home, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("find home directory: %w", err)
-	}
-	return filepath.Join(home, ".codex"), nil
-}
-
-func codexEnv(base []string, proxyURL string, codexHome string) []string {
+func codexEnv(base []string, proxyURL string) []string {
 	env := make([]string, 0, len(base)+2)
 	for _, value := range base {
 		if strings.HasPrefix(value, "CODEXTRA_PROXY_URL=") {
 			continue
 		}
-		if codexHome != "" && strings.HasPrefix(value, "CODEX_HOME=") {
-			continue
-		}
 		env = append(env, value)
 	}
 	env = append(env, "CODEXTRA_PROXY_URL="+proxyURL)
-	if codexHome != "" {
-		env = append(env, "CODEX_HOME="+codexHome)
-	}
 	return env
 }
 
