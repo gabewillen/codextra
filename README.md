@@ -26,24 +26,38 @@ instead of repeatedly merging a large upstream project.
 
 ## Usage
 
-Install the latest release:
+Install the latest release on macOS or Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | sh
+```
+
+Install the latest release from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 The installer requires `codex` to already be installed and available on `PATH`.
 If your Codex binary lives somewhere else, set `CODEXTRA_CODEX_BIN`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | CODEXTRA_CODEX_BIN=/path/to/codex sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | CODEXTRA_CODEX_BIN=/path/to/codex sh
+```
+
+```powershell
+$env:CODEXTRA_CODEX_BIN = "C:\path\to\codex.exe"; irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 The installer puts `codextra` in a writable directory already on `PATH` when it
 can. Override the target directory with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
+```powershell
+$env:INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 Or build from source:
