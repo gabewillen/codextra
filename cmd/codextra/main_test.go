@@ -570,6 +570,77 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 	}
 }
 
+func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"tokens":{"access_token":"token-work","refresh_token":"refresh-work","account_id":"acct-work"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := runLogin(context.Background(), []string{"--tag"}); err != nil {
+		t.Fatalf("runLogin(--tag) error = %v", err)
+	}
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	account, ok := store.Get("acct-work")
+	if !ok {
+		t.Fatal("tagged account missing")
+	}
+	if account.AccessToken != "token-work" {
+		t.Fatalf("AccessToken = %q, want token-work", account.AccessToken)
+	}
+	if account.RefreshToken != "refresh-work" {
+		t.Fatalf("RefreshToken = %q, want refresh-work", account.RefreshToken)
+	}
+	if account.AccountID != "acct-work" {
+		t.Fatalf("AccountID = %q, want acct-work", account.AccountID)
+	}
+	if store.Data.ActiveAlias != "acct-work" {
+		t.Fatalf("ActiveAlias = %q, want acct-work", store.Data.ActiveAlias)
+	}
+}
+
+func TestParseLoginArgsConsumesTagFlag(t *testing.T) {
+	alias, tagOnly, pass, err := parseLoginArgs([]string{"personal", "--tag"})
+	if err != nil {
+		t.Fatalf("parseLoginArgs() error = %v", err)
+	}
+	if alias != "personal" {
+		t.Fatalf("alias = %q, want personal", alias)
+	}
+	if !tagOnly {
+		t.Fatal("tagOnly = false, want true")
+	}
+	if len(pass) != 0 {
+		t.Fatalf("pass = %#v, want empty", pass)
+	}
+}
+
+func TestParseLoginArgsAllowsTagWithoutAlias(t *testing.T) {
+	alias, tagOnly, pass, err := parseLoginArgs([]string{"--tag"})
+	if err != nil {
+		t.Fatalf("parseLoginArgs(--tag) error = %v", err)
+	}
+	if alias != "" {
+		t.Fatalf("alias = %q, want empty", alias)
+	}
+	if !tagOnly {
+		t.Fatal("tagOnly = false, want true")
+	}
+	if len(pass) != 0 {
+		t.Fatalf("pass = %#v, want empty", pass)
+	}
+}
+
 func TestPrepareCodexHomeWritesSelectedAuthWithoutTouchingRealAuth(t *testing.T) {
 	tempDir := t.TempDir()
 	realHome := filepath.Join(tempDir, "real-codex")

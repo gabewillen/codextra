@@ -62,13 +62,17 @@ through to `codex`.
 ```sh
 codextra login personal-plus
 codextra login personal-pro --device-auth
+codextra login --tag
 codextra --account personal-pro
 ```
 
 `login <alias>` runs the normal `codex login`, imports the resulting active
 Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
-under the alias. Use aliases for your own paid personal subscriptions; do not
-use `codextra` to manage pools of free or throwaway accounts.
+under the alias. `login --tag` skips the login step and stores the current
+Codex auth, using the auth email as the alias when available and otherwise
+using the account ID. Use `login --tag <alias>` to choose the alias yourself.
+Use aliases for your own paid personal subscriptions; do not use `codextra` to
+manage pools of free or throwaway accounts.
 
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
