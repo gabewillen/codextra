@@ -26,24 +26,38 @@ instead of repeatedly merging a large upstream project.
 
 ## Usage
 
-Install the latest release:
+Install the latest release on macOS or Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | sh
+```
+
+Install the latest release from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 The installer requires `codex` to already be installed and available on `PATH`.
 If your Codex binary lives somewhere else, set `CODEXTRA_CODEX_BIN`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | CODEXTRA_CODEX_BIN=/path/to/codex sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | CODEXTRA_CODEX_BIN=/path/to/codex sh
+```
+
+```powershell
+$env:CODEXTRA_CODEX_BIN = "C:\path\to\codex.exe"; irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 The installer puts `codextra` in a writable directory already on `PATH` when it
 can. Override the target directory with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
+```powershell
+$env:INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/gabewillen/codextra/refs/heads/main/install.ps1 | iex
 ```
 
 Or build from source:
@@ -62,13 +76,17 @@ through to `codex`.
 ```sh
 codextra login personal-plus
 codextra login personal-pro --device-auth
+codextra login --tag
 codextra --account personal-pro
 ```
 
 `login <alias>` runs the normal `codex login`, imports the resulting active
 Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
-under the alias. Use aliases for your own paid personal subscriptions; do not
-use `codextra` to manage pools of free or throwaway accounts.
+under the alias. `login --tag` skips the login step and stores the current
+Codex auth, using the auth email as the alias when available and otherwise
+using the account ID. Use `login --tag <alias>` to choose the alias yourself.
+Use aliases for your own paid personal subscriptions; do not use `codextra` to
+manage pools of free or throwaway accounts.
 
 Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the

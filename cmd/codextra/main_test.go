@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,6 +294,45 @@ func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
 	}
 }
 
+func TestKeepProxyAliveReattachesDroppedClientStream(t *testing.T) {
+	var attaches atomic.Int32
+	releaseSecond := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/__codextra/client" {
+			http.NotFound(w, r)
+			return
+		}
+		count := attaches.Add(1)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(": connected\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if count == 1 {
+			return
+		}
+		<-releaseSecond
+	}))
+	defer server.Close()
+
+	keeper, err := keepProxyAlive(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("keepProxyAlive() error = %v", err)
+	}
+	defer close(releaseSecond)
+	defer keeper.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if attaches.Load() >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("client stream attaches = %d, want at least 2", attaches.Load())
+}
+
 func TestRoutePrefixHandlerRequiresSecretPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -347,6 +387,114 @@ func TestRandomRoutePrefixIsUnguessablePath(t *testing.T) {
 	}
 	if first == second {
 		t.Fatal("randomRoutePrefix returned duplicate prefixes")
+	}
+}
+
+func TestRoutePrefixFromProxyURLValidatesSecretPrefix(t *testing.T) {
+	t.Parallel()
+
+	prefix, ok := routePrefixFromProxyURL("http://127.0.0.1:1234/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef")
+	if !ok {
+		t.Fatal("routePrefixFromProxyURL(valid) ok = false, want true")
+	}
+	if prefix != "/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("prefix = %q", prefix)
+	}
+
+	for _, value := range []string{
+		"http://127.0.0.1:1234",
+		"http://127.0.0.1:1234/backend-api",
+		"http://127.0.0.1:1234/__codextra/not-hex",
+		"http://127.0.0.1:1234/__codextra/0123456789abcdef",
+		"://bad",
+	} {
+		if prefix, ok := routePrefixFromProxyURL(value); ok {
+			t.Fatalf("routePrefixFromProxyURL(%q) = %q, true; want false", value, prefix)
+		}
+	}
+}
+
+func TestReusableProxyAddrUsesPreviousLoopbackPort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:49408" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:49408", got)
+	}
+}
+
+func TestReusableProxyAddrRejectsNonLoopbackHost(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://example.com:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
+func TestReusableProxyAddrRejectsNonNumericPort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:http/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
+func TestReusableProxyAddrRejectsOutOfRangePort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:70000/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
+func TestReusableRoutePrefixUsesPreviousSecret(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:49408/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	prefix, err := reusableRoutePrefix()
+	if err != nil {
+		t.Fatalf("reusableRoutePrefix() error = %v", err)
+	}
+	if prefix != "/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("reusableRoutePrefix() = %q", prefix)
 	}
 }
 
@@ -419,6 +567,77 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
 		t.Fatalf("auth.json stat error = %v, want not exist", err)
+	}
+}
+
+func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"tokens":{"access_token":"token-work","refresh_token":"refresh-work","account_id":"acct-work"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := runLogin(context.Background(), []string{"--tag"}); err != nil {
+		t.Fatalf("runLogin(--tag) error = %v", err)
+	}
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	account, ok := store.Get("acct-work")
+	if !ok {
+		t.Fatal("tagged account missing")
+	}
+	if account.AccessToken != "token-work" {
+		t.Fatalf("AccessToken = %q, want token-work", account.AccessToken)
+	}
+	if account.RefreshToken != "refresh-work" {
+		t.Fatalf("RefreshToken = %q, want refresh-work", account.RefreshToken)
+	}
+	if account.AccountID != "acct-work" {
+		t.Fatalf("AccountID = %q, want acct-work", account.AccountID)
+	}
+	if store.Data.ActiveAlias != "acct-work" {
+		t.Fatalf("ActiveAlias = %q, want acct-work", store.Data.ActiveAlias)
+	}
+}
+
+func TestParseLoginArgsConsumesTagFlag(t *testing.T) {
+	alias, tagOnly, pass, err := parseLoginArgs([]string{"personal", "--tag"})
+	if err != nil {
+		t.Fatalf("parseLoginArgs() error = %v", err)
+	}
+	if alias != "personal" {
+		t.Fatalf("alias = %q, want personal", alias)
+	}
+	if !tagOnly {
+		t.Fatal("tagOnly = false, want true")
+	}
+	if len(pass) != 0 {
+		t.Fatalf("pass = %#v, want empty", pass)
+	}
+}
+
+func TestParseLoginArgsAllowsTagWithoutAlias(t *testing.T) {
+	alias, tagOnly, pass, err := parseLoginArgs([]string{"--tag"})
+	if err != nil {
+		t.Fatalf("parseLoginArgs(--tag) error = %v", err)
+	}
+	if alias != "" {
+		t.Fatalf("alias = %q, want empty", alias)
+	}
+	if !tagOnly {
+		t.Fatal("tagOnly = false, want true")
+	}
+	if len(pass) != 0 {
+		t.Fatalf("pass = %#v, want empty", pass)
 	}
 }
 

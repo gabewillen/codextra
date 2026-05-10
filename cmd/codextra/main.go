@@ -67,7 +67,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	client, err := attachProxyClient(ctx, proxyURL)
+	client, err := keepProxyAlive(ctx, proxyURL)
 	if err != nil {
 		return err
 	}
@@ -111,8 +111,12 @@ func runProxyServer(ctx context.Context) error {
 	}
 	defer logCloser()
 
-	addr := getenv("CODEXTRA_PROXY_ADDR", "127.0.0.1:0")
-	listener, err := net.Listen("tcp", addr)
+	addr := os.Getenv("CODEXTRA_PROXY_ADDR")
+	explicitAddr := addr != ""
+	if !explicitAddr {
+		addr = reusableProxyAddr()
+	}
+	listener, err := listenProxy(addr, explicitAddr, logger)
 	if err != nil {
 		return fmt.Errorf("listen proxy: %w", err)
 	}
@@ -127,7 +131,7 @@ func runProxyServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	routePrefix, err := randomRoutePrefix()
+	routePrefix, err := reusableRoutePrefix()
 	if err != nil {
 		return err
 	}
@@ -276,6 +280,78 @@ func randomRoutePrefix() (string, error) {
 	return "/__codextra/" + hex.EncodeToString(bytes[:]), nil
 }
 
+func listenProxy(addr string, explicit bool, logger *slog.Logger) (net.Listener, error) {
+	listener, err := listenProxyWithRetry(addr)
+	if err == nil || explicit || addr == "127.0.0.1:0" {
+		return listener, err
+	}
+	logger.Warn("proxy_reuse_addr_failed", "addr", addr, "error", err)
+	return net.Listen("tcp", "127.0.0.1:0")
+}
+
+func listenProxyWithRetry(addr string) (net.Listener, error) {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		listener, err := net.Listen("tcp", addr)
+		if err == nil || !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
+			return listener, err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func reusableProxyAddr() string {
+	state, err := readProxyState()
+	if err != nil || state.URL == "" {
+		return "127.0.0.1:0"
+	}
+	parsed, err := url.Parse(state.URL)
+	if err != nil || parsed.Host == "" {
+		return "127.0.0.1:0"
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || port == "" {
+		return "127.0.0.1:0"
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "127.0.0.1:0"
+	}
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return "127.0.0.1:0"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func reusableRoutePrefix() (string, error) {
+	state, err := readProxyState()
+	if err == nil {
+		if prefix, ok := routePrefixFromProxyURL(state.URL); ok {
+			return prefix, nil
+		}
+	}
+	return randomRoutePrefix()
+}
+
+func routePrefixFromProxyURL(proxyURL string) (string, bool) {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return "", false
+	}
+	prefix := strings.TrimRight(parsed.EscapedPath(), "/")
+	if !strings.HasPrefix(prefix, "/__codextra/") {
+		return "", false
+	}
+	token := strings.TrimPrefix(prefix, "/__codextra/")
+	if len(token) != 48 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return "", false
+	}
+	return prefix, true
+}
+
 func proxyDisplayURL(proxyURL string) string {
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
@@ -367,6 +443,63 @@ func attachProxyClient(ctx context.Context, proxyURL string) (*proxyClient, erro
 func (c *proxyClient) Close() {
 	c.cancel()
 	<-c.done
+}
+
+type proxyKeepAlive struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func keepProxyAlive(ctx context.Context, proxyURL string) (*proxyKeepAlive, error) {
+	client, err := attachProxyClient(ctx, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+
+	keepCtx, cancel := context.WithCancel(ctx)
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(ready)
+		defer client.Close()
+
+		backoff := 100 * time.Millisecond
+		for {
+			select {
+			case <-keepCtx.Done():
+				return
+			case <-client.done:
+			}
+			client.Close()
+
+			for {
+				select {
+				case <-keepCtx.Done():
+					return
+				case <-time.After(backoff):
+				}
+
+				next, err := attachProxyClient(keepCtx, proxyURL)
+				if err == nil {
+					client = next
+					backoff = 100 * time.Millisecond
+					break
+				}
+				if backoff < time.Second {
+					backoff *= 2
+				}
+			}
+		}
+	}()
+	<-ready
+
+	return &proxyKeepAlive{cancel: cancel, done: done}, nil
+}
+
+func (k *proxyKeepAlive) Close() {
+	k.cancel()
+	<-k.done
 }
 
 type proxyLifecycle struct {
