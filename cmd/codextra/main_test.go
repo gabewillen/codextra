@@ -281,6 +281,53 @@ func TestProxyLifecycleStreamTracksClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestProxyActivityHandlerTracksActiveRequests(t *testing.T) {
+	tracker := newProxyActivityTracker()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	handler := newProxyActivityHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/messages" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}), tracker)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	go func() {
+		resp, err := http.Get(server.URL + "/backend-api/messages")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	<-started
+	active, err := proxyActiveRequests(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("proxyActiveRequests() error = %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("active requests = %d, want 1", active)
+	}
+
+	close(release)
+
+	active, err = proxyActiveRequests(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("proxyActiveRequests() after done error = %v", err)
+	}
+	if active != 0 {
+		t.Fatalf("active requests = %d, want 0", active)
+	}
+}
+
 func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
 	lifecycle := newProxyLifecycle(http.NotFoundHandler(), slog.New(slog.NewTextHandler(os.Stderr, nil)), func() {})
 	req := httptest.NewRequest(http.MethodGet, "/__codextra/client", nil)

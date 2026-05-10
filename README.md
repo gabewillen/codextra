@@ -142,6 +142,19 @@ short grace period.
 CODEXTRA_PROXY_IDLE_GRACE_SECONDS=10
 ```
 
+When the installer replaces the codextra binary, it sends `SIGUSR1` to running
+`codextra` processes on Unix-like systems. The running wrapper defers restart
+until the proxy reports no active request traffic, then relaunches itself with the
+new binary.
+
+```sh
+CODEXTRA_UPGRADE_WAIT_SECONDS=10
+```
+
+`CODEXTRA_UPGRADE_WAIT_SECONDS` controls how long codextra waits for traffic to
+go idle before giving up and restarting anyway. Windows does not support this
+signal-based upgrade path in the current release.
+
 Account metadata is stored at:
 
 ```sh
