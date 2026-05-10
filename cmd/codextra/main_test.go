@@ -406,6 +406,38 @@ func TestReusableProxyAddrRejectsNonLoopbackHost(t *testing.T) {
 	}
 }
 
+func TestReusableProxyAddrRejectsNonNumericPort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:http/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
+func TestReusableProxyAddrRejectsOutOfRangePort(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("CODEXTRA_HOME", tempDir)
+	if err := writeProxyState(proxyState{
+		URL:     "http://127.0.0.1:70000/__codextra/0123456789abcdef0123456789abcdef0123456789abcdef",
+		PID:     123,
+		Version: proxyStateVersion,
+	}); err != nil {
+		t.Fatalf("writeProxyState() error = %v", err)
+	}
+
+	if got := reusableProxyAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("reusableProxyAddr() = %q, want 127.0.0.1:0", got)
+	}
+}
+
 func TestReusableRoutePrefixUsesPreviousSecret(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("CODEXTRA_HOME", tempDir)

@@ -111,15 +111,12 @@ func runProxyServer(ctx context.Context) error {
 	}
 	defer logCloser()
 
-	addr := getenv("CODEXTRA_PROXY_ADDR", "")
-	if addr == "" {
+	addr := os.Getenv("CODEXTRA_PROXY_ADDR")
+	explicitAddr := addr != ""
+	if !explicitAddr {
 		addr = reusableProxyAddr()
 	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil && os.Getenv("CODEXTRA_PROXY_ADDR") == "" && addr != "127.0.0.1:0" {
-		logger.Warn("proxy_reuse_addr_failed", "addr", addr, "error", err)
-		listener, err = net.Listen("tcp", "127.0.0.1:0")
-	}
+	listener, err := listenProxy(addr, explicitAddr, logger)
 	if err != nil {
 		return fmt.Errorf("listen proxy: %w", err)
 	}
@@ -283,6 +280,26 @@ func randomRoutePrefix() (string, error) {
 	return "/__codextra/" + hex.EncodeToString(bytes[:]), nil
 }
 
+func listenProxy(addr string, explicit bool, logger *slog.Logger) (net.Listener, error) {
+	listener, err := listenProxyWithRetry(addr)
+	if err == nil || explicit || addr == "127.0.0.1:0" {
+		return listener, err
+	}
+	logger.Warn("proxy_reuse_addr_failed", "addr", addr, "error", err)
+	return net.Listen("tcp", "127.0.0.1:0")
+}
+
+func listenProxyWithRetry(addr string) (net.Listener, error) {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		listener, err := net.Listen("tcp", addr)
+		if err == nil || !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
+			return listener, err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 func reusableProxyAddr() string {
 	state, err := readProxyState()
 	if err != nil || state.URL == "" {
@@ -294,6 +311,10 @@ func reusableProxyAddr() string {
 	}
 	host, port, err := net.SplitHostPort(parsed.Host)
 	if err != nil || port == "" {
+		return "127.0.0.1:0"
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return "127.0.0.1:0"
 	}
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
