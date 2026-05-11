@@ -119,6 +119,44 @@ func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	}
 }
 
+func TestCodexDesktopArgsPrefixesAppCommand(t *testing.T) {
+	t.Parallel()
+
+	base := []string{"-c", "chatgpt_base_url=http://proxy/backend-api", "."}
+	got := codexDesktopArgs(base)
+	want := []string{"app", "-c", "chatgpt_base_url=http://proxy/backend-api", "."}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("codexDesktopArgs() = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(base, []string{"-c", "chatgpt_base_url=http://proxy/backend-api", "."}) {
+		t.Fatalf("codexDesktopArgs mutated base: %#v", base)
+	}
+}
+
+func TestCodexDesktopShouldKeepAlive(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "workspace", args: []string{"."}, want: true},
+		{name: "no args", args: nil, want: true},
+		{name: "help", args: []string{"--help"}, want: false},
+		{name: "short help", args: []string{"-h"}, want: false},
+		{name: "literal help path", args: []string{"--", "--help"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := codexDesktopShouldKeepAlive(tc.args); got != tc.want {
+				t.Fatalf("codexDesktopShouldKeepAlive(%#v) = %t, want %t", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexChatGPTBaseURLPreservesBackendAPIBasePath(t *testing.T) {
 	t.Parallel()
 
@@ -167,12 +205,15 @@ func TestCodexEnvReplacesProxyURLAndPreservesCodexHome(t *testing.T) {
 func TestParseCodextraArgsConsumesAccountFlag(t *testing.T) {
 	t.Parallel()
 
-	account, pass, err := parseCodextraArgs([]string{"--account", "work", "--model", "gpt-5.4"})
+	options, pass, err := parseCodextraArgs([]string{"--account", "work", "--model", "gpt-5.4"})
 	if err != nil {
 		t.Fatalf("parseCodextraArgs() error = %v", err)
 	}
-	if account != "work" {
-		t.Fatalf("account = %q, want work", account)
+	if options.accountAlias != "work" {
+		t.Fatalf("account = %q, want work", options.accountAlias)
+	}
+	if options.desktop {
+		t.Fatal("desktop = true, want false")
 	}
 	want := []string{"--model", "gpt-5.4"}
 	if !reflect.DeepEqual(pass, want) {
@@ -183,12 +224,12 @@ func TestParseCodextraArgsConsumesAccountFlag(t *testing.T) {
 func TestParseCodextraArgsConsumesAccountEqualsFlag(t *testing.T) {
 	t.Parallel()
 
-	account, pass, err := parseCodextraArgs([]string{"--model", "gpt-5.4", "--account=personal", "prompt"})
+	options, pass, err := parseCodextraArgs([]string{"--model", "gpt-5.4", "--account=personal", "prompt"})
 	if err != nil {
 		t.Fatalf("parseCodextraArgs() error = %v", err)
 	}
-	if account != "personal" {
-		t.Fatalf("account = %q, want personal", account)
+	if options.accountAlias != "personal" {
+		t.Fatalf("account = %q, want personal", options.accountAlias)
 	}
 	want := []string{"--model", "gpt-5.4", "prompt"}
 	if !reflect.DeepEqual(pass, want) {
@@ -199,14 +240,49 @@ func TestParseCodextraArgsConsumesAccountEqualsFlag(t *testing.T) {
 func TestParseCodextraArgsLeavesArgumentsAfterDashDashUntouched(t *testing.T) {
 	t.Parallel()
 
-	account, pass, err := parseCodextraArgs([]string{"--account=work", "--", "--account", "literal"})
+	options, pass, err := parseCodextraArgs([]string{"--account=work", "--", "--account", "literal"})
 	if err != nil {
 		t.Fatalf("parseCodextraArgs() error = %v", err)
 	}
-	if account != "work" {
-		t.Fatalf("account = %q, want work", account)
+	if options.accountAlias != "work" {
+		t.Fatalf("account = %q, want work", options.accountAlias)
 	}
 	want := []string{"--", "--account", "literal"}
+	if !reflect.DeepEqual(pass, want) {
+		t.Fatalf("pass = %#v, want %#v", pass, want)
+	}
+}
+
+func TestParseCodextraArgsConsumesDesktopFlag(t *testing.T) {
+	t.Parallel()
+
+	options, pass, err := parseCodextraArgs([]string{"--desktop", "--account=work", "."})
+	if err != nil {
+		t.Fatalf("parseCodextraArgs() error = %v", err)
+	}
+	if !options.desktop {
+		t.Fatal("desktop = false, want true")
+	}
+	if options.accountAlias != "work" {
+		t.Fatalf("account = %q, want work", options.accountAlias)
+	}
+	want := []string{"."}
+	if !reflect.DeepEqual(pass, want) {
+		t.Fatalf("pass = %#v, want %#v", pass, want)
+	}
+}
+
+func TestParseCodextraArgsLeavesDesktopAfterDashDashUntouched(t *testing.T) {
+	t.Parallel()
+
+	options, pass, err := parseCodextraArgs([]string{"--account=work", "--", "--desktop"})
+	if err != nil {
+		t.Fatalf("parseCodextraArgs() error = %v", err)
+	}
+	if options.desktop {
+		t.Fatal("desktop = true, want false")
+	}
+	want := []string{"--", "--desktop"}
 	if !reflect.DeepEqual(pass, want) {
 		t.Fatalf("pass = %#v, want %#v", pass, want)
 	}
