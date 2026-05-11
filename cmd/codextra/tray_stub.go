@@ -1,0 +1,13 @@
+//go:build !darwin
+
+package main
+
+import (
+	"context"
+	"log"
+)
+
+func startTray(ctx context.Context, storePath string, onActivate func(string) error) func() {
+	log.Printf("codextra tray: stub platform (non-darwin), tray is disabled")
+	return func() {}
+}

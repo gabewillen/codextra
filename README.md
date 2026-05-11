@@ -66,6 +66,12 @@ Or build from source:
 go install github.com/gabewillen/codextra/cmd/codextra@latest
 ```
 
+If you want tray support on macOS:
+
+```sh
+CGO_ENABLED=0 go install github.com/gabewillen/codextra/cmd/codextra@latest
+```
+
 ```sh
 codextra [codex args...]
 ```
@@ -136,6 +142,19 @@ short grace period.
 CODEXTRA_PROXY_IDLE_GRACE_SECONDS=10
 ```
 
+When the installer replaces the codextra binary, it sends `SIGUSR1` to running
+`codextra` processes on Unix-like systems. The running wrapper defers restart
+until the proxy reports no active request traffic, then relaunches itself with the
+new binary.
+
+```sh
+CODEXTRA_UPGRADE_WAIT_SECONDS=10
+```
+
+`CODEXTRA_UPGRADE_WAIT_SECONDS` controls how long codextra waits for traffic to
+go idle before giving up and restarting anyway. Windows does not support this
+signal-based upgrade path in the current release.
+
 Account metadata is stored at:
 
 ```sh
@@ -145,6 +164,29 @@ Account metadata is stored at:
 When an account becomes temporarily unavailable due to usage availability or
 authentication state, the proxy can switch to another configured account owned
 by the user.
+
+### macOS system tray
+
+On macOS, codextra shows a menu bar icon while running.
+
+- `Current`: account used for proxy requests (`eligible` account selection skips
+  tokenless and temporarily limited accounts),
+- `Selected`: alias set by `--account` when it differs from the currently active
+  account,
+- one menu item for each account with status (`ready`, `missing token`,
+  `limited (reason) until <timestamp>`), with a checkmark on the current one.
+
+Selecting an account switches the active codextra account immediately.
+
+Disable the menu with:
+
+```sh
+CODEXTRA_NO_TRAY=1 codextra ...
+```
+
+Tray support is only available in macOS builds with `CGO_ENABLED=0`.
+Tray backend is implemented in-repo (pure-Go/macOS ObjC dynamic bridge), so this
+is the supported mode for menu bar tray behavior.
 
 ## Releases
 

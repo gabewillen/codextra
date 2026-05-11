@@ -11,6 +11,16 @@ need() {
 	fi
 }
 
+notify_running_codextra() {
+	if ! command -v pkill >/dev/null 2>&1; then
+		return
+	fi
+	if ! pgrep -x codextra >/dev/null 2>&1; then
+		return
+	}
+	pkill -USR1 -x codextra || true
+}
+
 check_codex() {
 	if [ -n "${CODEXTRA_CODEX_BIN:-}" ]; then
 		case "$CODEXTRA_CODEX_BIN" in
@@ -132,6 +142,7 @@ mkdir -p "$install_dir"
 curl -fsSL "$url" -o "$tmp/$archive"
 tar -xzf "$tmp/$archive" -C "$tmp" "$binary"
 install_binary "$tmp/$binary" "$install_dir/$binary"
+notify_running_codextra
 
 echo "installed $binary $version to $install_dir/$binary"
 
