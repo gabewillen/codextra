@@ -20,6 +20,8 @@ type Account struct {
 	PlanType        string            `json:"plan_type,omitempty"`
 	DisabledUntil   map[string]int64  `json:"disabled_until,omitempty"`
 	LastLimitStatus map[string]string `json:"last_limit_status,omitempty"`
+	UsagePercent    int               `json:"usage_percent,omitempty"`
+	UsageResetAt    int64             `json:"usage_reset_at,omitempty"`
 }
 
 type Store struct {
@@ -173,6 +175,21 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 		}
 	}
 	return Account{}, false, s.saveLocked()
+}
+
+func (s *Store) UpdateUsage(alias string, percent int, resetAt int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == alias {
+			s.Data.Accounts[i].UsagePercent = percent
+			s.Data.Accounts[i].UsageResetAt = resetAt
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("account %q not found", alias)
 }
 
 func (s *Store) Upsert(account Account) error {

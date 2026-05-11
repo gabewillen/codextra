@@ -13,12 +13,13 @@ func startRestartSignalWatcher(ctx context.Context, onRestart func()) func() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGUSR1)
 
+	watchCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
 			select {
-			case <-ctx.Done():
+			case <-watchCtx.Done():
 				return
 			case <-ch:
 				onRestart()
@@ -28,6 +29,7 @@ func startRestartSignalWatcher(ctx context.Context, onRestart func()) func() {
 
 	return func() {
 		signal.Stop(ch)
+		cancel()
 		<-done
 	}
 }

@@ -53,8 +53,29 @@ func runForever() error {
 }
 
 func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	shutdownDone := make(chan struct{})
+	defer close(shutdownDone)
+	go func() {
+		<-sigCh
+		cancel()
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+
+		select {
+		case <-shutdownDone:
+			return
+		case <-sigCh:
+			os.Exit(130)
+		case <-timer.C:
+			os.Exit(130)
+		}
+	}()
 
 	if len(os.Args) > 1 && os.Args[1] == "login" {
 		return runLogin(ctx, os.Args[2:])
@@ -87,6 +108,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	refreshAccountUsage(ctx, proxyURL, storePath)
 	stopTray := startTray(ctx, storePath, func(alias string) error {
 		_, err := activateAccount(alias)
 		if err != nil {
@@ -113,6 +135,7 @@ func run() error {
 	cmdCtx, stopCmd := context.WithCancel(ctx)
 	defer stopCmd()
 	cmd := exec.CommandContext(cmdCtx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
+	configureCommandProcess(cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -120,10 +143,83 @@ func run() error {
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 
+	var stopCommandOnce sync.Once
+	requestCommandStop := func() {
+		stopCommandOnce.Do(func() {
+			if cmd.Process != nil {
+				signalCommandProcess(cmd)
+				time.AfterFunc(500*time.Millisecond, func() {
+					killCommandProcess(cmd)
+				})
+			}
+			stopCmd()
+		})
+	}
+	go func() {
+		<-ctx.Done()
+		requestCommandStop()
+	}()
+
 	runDone := make(chan error, 1)
+	waitCommand := func() error {
+		select {
+		case err := <-runDone:
+			return err
+		case <-time.After(2 * time.Second):
+			return ctx.Err()
+		}
+	}
 	go func() {
 		runDone <- cmd.Run()
 	}()
+
+	if trayRun := takeTrayRunner(); trayRun != nil {
+		trayDone := make(chan error, 1)
+		go func() {
+			for {
+				select {
+				case err := <-runDone:
+					commandRunning.Store(false)
+					stopTray()
+					if restartPending {
+						trayDone <- errRestartRequested
+						return
+					}
+					if errors.Is(err, context.Canceled) {
+						trayDone <- nil
+						return
+					}
+					trayDone <- err
+					return
+				case <-restartReqs:
+					if !commandRunning.Load() {
+						continue
+					}
+					restartPending = true
+					log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
+					if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
+						trayDone <- err
+						return
+					}
+					log.Printf("proxy idle; restarting codextra wrapper")
+					stopCmd()
+				case <-ctx.Done():
+					err := waitCommand()
+					stopTray()
+					if err == nil || errors.Is(err, context.Canceled) {
+						trayDone <- nil
+						return
+					}
+					trayDone <- err
+					return
+				}
+			}
+		}()
+		if err := trayRun(); err != nil {
+			return err
+		}
+		return <-trayDone
+	}
 
 	for {
 		select {
@@ -132,7 +228,7 @@ func run() error {
 			if restartPending {
 				return errRestartRequested
 			}
-			if errors.Is(err, context.Canceled) && !restartPending {
+			if errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return err
@@ -148,8 +244,10 @@ func run() error {
 			log.Printf("proxy idle; restarting codextra wrapper")
 			stopCmd()
 		case <-ctx.Done():
-			stopCmd()
-			err := <-runDone
+			err := waitCommand()
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return err
 		}
 	}
@@ -855,6 +953,80 @@ func activateAccount(alias string) (accounts.Account, error) {
 		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
 	}
 	return account, nil
+}
+
+func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string) {
+	usageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	percent, resetAt, err := fetchAccountUsage(usageCtx, proxyURL)
+	if err != nil {
+		log.Printf("codextra usage fetch: %v", err)
+		return
+	}
+
+	var store *accounts.Store
+	if store, err = accounts.LoadStore(storePath); err != nil {
+		log.Printf("codextra usage store: %v", err)
+		return
+	}
+	now := time.Now()
+	snapshot, err := store.Snapshot(now)
+	if err != nil {
+		log.Printf("codextra usage snapshot: %v", err)
+		return
+	}
+	if snapshot.CurrentAlias == "" {
+		return
+	}
+	if err := store.UpdateUsage(snapshot.CurrentAlias, percent, resetAt); err != nil {
+		log.Printf("codextra usage update: %v", err)
+	}
+}
+
+func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error) {
+	usageURL := strings.TrimRight(proxyURL, "/") + "/backend-api/wham/usage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("fetch wham/usage: %w", err)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read wham/usage: %w", err)
+	}
+
+	var payload struct {
+		RateLimit map[string]json.RawMessage `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, 0, fmt.Errorf("parse wham/usage: %w", err)
+	}
+
+	type rateWindow struct {
+		UsedPercent int   `json:"used_percent"`
+		ResetAt     int64 `json:"reset_at"`
+	}
+	maxPercent := 0
+	var latestReset int64
+	for _, raw := range payload.RateLimit {
+		var window rateWindow
+		if err := json.Unmarshal(raw, &window); err != nil {
+			continue
+		}
+		if window.UsedPercent > maxPercent {
+			maxPercent = window.UsedPercent
+		}
+		if window.ResetAt > latestReset {
+			latestReset = window.ResetAt
+		}
+	}
+	return maxPercent, latestReset, nil
 }
 
 func codextraDir() (string, error) {

@@ -66,7 +66,7 @@ Or build from source:
 go install github.com/gabewillen/codextra/cmd/codextra@latest
 ```
 
-If you want tray support on macOS, build with a pure-Go systray backend:
+If you want tray support on macOS:
 
 ```sh
 CGO_ENABLED=0 go install github.com/gabewillen/codextra/cmd/codextra@latest
@@ -184,8 +184,9 @@ Disable the menu with:
 CODEXTRA_NO_TRAY=1 codextra ...
 ```
 
-Tray support uses a pure-Go backend and is only available in builds with
-`CGO_ENABLED=0`.
+Tray support is only available in macOS builds with `CGO_ENABLED=0`.
+Tray backend is implemented in-repo (pure-Go/macOS ObjC dynamic bridge), so this
+is the supported mode for menu bar tray behavior.
 
 ## Releases
 
