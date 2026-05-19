@@ -21,11 +21,11 @@ import (
 )
 
 type Config struct {
-	Upstream    string
-	APIUpstream string
-	Store       *accounts.Store
-	Logger      *slog.Logger
-	OnRotate    func(accounts.Account) error
+	Upstream        string
+	APIUpstream     string
+	Store           *accounts.Store
+	Logger          *slog.Logger
+	OnAccountUpdate func(accounts.Account) error
 }
 
 func New(config Config) (*http.Server, error) {
@@ -48,12 +48,13 @@ func New(config Config) (*http.Server, error) {
 		return nil, fmt.Errorf("validate api upstream: %w", err)
 	}
 	handler := &handler{
-		upstream:    upstream,
-		apiUpstream: apiUpstream,
-		store:       config.Store,
-		client:      http.DefaultClient,
-		logger:      config.Logger,
-		onRotate:    config.OnRotate,
+		upstream:        upstream,
+		apiUpstream:     apiUpstream,
+		store:           config.Store,
+		client:          http.DefaultClient,
+		logger:          config.Logger,
+		onAccountUpdate: config.OnAccountUpdate,
+		refreshLocks:    newRefreshLocks(),
 	}
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -74,12 +75,36 @@ func validateUpstreamURL(upstream *url.URL) error {
 }
 
 type handler struct {
-	upstream    *url.URL
-	apiUpstream *url.URL
-	store       *accounts.Store
-	client      *http.Client
-	logger      *slog.Logger
-	onRotate    func(accounts.Account) error
+	upstream        *url.URL
+	apiUpstream     *url.URL
+	store           *accounts.Store
+	client          *http.Client
+	logger          *slog.Logger
+	onAccountUpdate func(accounts.Account) error
+	refreshLocks    *refreshLocks
+}
+
+type refreshLocks struct {
+	mu      sync.Mutex
+	byAlias map[string]*sync.Mutex
+}
+
+func newRefreshLocks() *refreshLocks {
+	return &refreshLocks{byAlias: map[string]*sync.Mutex{}}
+}
+
+func (l *refreshLocks) withLock(alias string, fn func() (accounts.Account, error)) (accounts.Account, error) {
+	l.mu.Lock()
+	lock, ok := l.byAlias[alias]
+	if !ok {
+		lock = &sync.Mutex{}
+		l.byAlias[alias] = lock
+	}
+	l.mu.Unlock()
+
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -162,8 +187,8 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
-		if err := h.notifyRotate(next); err != nil {
-			h.logger.Warn("rotation_callback_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		if err := h.notifyAccountUpdate(next); err != nil {
+			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
 		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
@@ -178,25 +203,43 @@ func (h *handler) ensureFreshTokens(ctx context.Context, account accounts.Accoun
 }
 
 func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-	tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
-	if err != nil {
-		return account, err
-	}
-	updated := codexauth.MergeRefresh(account, tokens)
-	if err := h.store.Upsert(updated); err != nil {
-		return account, err
-	}
-	if err := h.notifyRotate(updated); err != nil {
-		h.logger.Warn("rotation_callback_failed", "alias", account.Alias, "error", err)
-	}
-	return updated, nil
+	startingRefresh := account.RefreshToken
+	return h.refreshLocks.withLock(account.Alias, func() (accounts.Account, error) {
+		if latest, ok := h.store.Get(account.Alias); ok {
+			account = latest
+		}
+		if startingRefresh != "" && account.RefreshToken != startingRefresh {
+			return account, nil
+		}
+		if !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
+			return account, nil
+		}
+		if account.RefreshToken == "" {
+			return account, fmt.Errorf("account %q has no refresh token", account.Alias)
+		}
+
+		tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
+		if err != nil {
+			return account, err
+		}
+		updated := codexauth.MergeRefresh(account, tokens)
+		persisted, err := h.store.UpdateTokens(account.Alias, updated)
+		if err != nil {
+			h.logger.Warn("token_refresh_persist_failed", "alias", account.Alias, "error", err)
+			persisted = updated
+		}
+		if err := h.notifyAccountUpdate(persisted); err != nil {
+			h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+		}
+		return persisted, nil
+	})
 }
 
-func (h *handler) notifyRotate(account accounts.Account) error {
-	if h.onRotate == nil {
+func (h *handler) notifyAccountUpdate(account accounts.Account) error {
+	if h.onAccountUpdate == nil {
 		return nil
 	}
-	return h.onRotate(account)
+	return h.onAccountUpdate(account)
 }
 
 func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {
@@ -320,8 +363,8 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
-		if err := h.notifyRotate(next); err != nil {
-			h.logger.Warn("rotation_callback_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		if err := h.notifyAccountUpdate(next); err != nil {
+			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
 		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next

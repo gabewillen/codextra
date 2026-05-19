@@ -390,6 +390,55 @@ func TestReloadLockedReturnsReadError(t *testing.T) {
 	}
 }
 
+func TestUpdateTokensPreservesLimitState(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	resetAt := time.Unix(1_700_000_123, 0)
+	if err := store.Upsert(Account{
+		Alias:         "personal",
+		AccessToken:   "token-old",
+		RefreshToken:  "refresh-old",
+		DisabledUntil: map[string]int64{"codex_weekly": resetAt.Unix()},
+	}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	updated, err := store.UpdateTokens("personal", Account{
+		Alias:        "personal",
+		AccessToken:  "token-new",
+		RefreshToken: "refresh-new",
+	})
+	if err != nil {
+		t.Fatalf("UpdateTokens() error = %v", err)
+	}
+	if updated.AccessToken != "token-new" {
+		t.Fatalf("AccessToken = %q, want token-new", updated.AccessToken)
+	}
+	if got := updated.DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
+		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+
+	reloaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	account, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("reloaded account missing")
+	}
+	if account.RefreshToken != "refresh-new" {
+		t.Fatalf("RefreshToken = %q, want refresh-new", account.RefreshToken)
+	}
+	if got := account.DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
+		t.Fatalf("persisted DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+}
+
 func TestStoreFileIsJSON(t *testing.T) {
 	t.Parallel()
 

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,7 +165,7 @@ func TestProxyRefreshesExpiredTokenBeforeReturningResponse(t *testing.T) {
 	server := newProxyWithConfig(t, Config{
 		Upstream: upstream.URL,
 		Store:    store,
-		OnRotate: func(account accounts.Account) error {
+		OnAccountUpdate: func(account accounts.Account) error {
 			synced = account
 			return nil
 		},
@@ -191,6 +192,53 @@ func TestProxyRefreshesExpiredTokenBeforeReturningResponse(t *testing.T) {
 	}
 	if synced.AccessToken != "token-new" {
 		t.Fatalf("synced AccessToken = %q, want token-new", synced.AccessToken)
+	}
+}
+
+func TestProxySerializesConcurrentTokenRefresh(t *testing.T) {
+	refreshCalls := 0
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls++
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  expiredJWT(t),
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			resp := httptest.NewRecorder()
+			server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+			if resp.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", resp.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", refreshCalls)
 	}
 }
 
@@ -242,19 +290,19 @@ func TestTokenExpiredMarkerDetects401Payload(t *testing.T) {
 	}
 }
 
-func TestNotifyRotateHandlesNilAndCallbackErrors(t *testing.T) {
+func TestNotifyAccountUpdateHandlesNilAndCallbackErrors(t *testing.T) {
 	t.Parallel()
 
 	handler := &handler{}
-	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != nil {
-		t.Fatalf("notifyRotate(nil callback) error = %v", err)
+	if err := handler.notifyAccountUpdate(accounts.Account{Alias: "work"}); err != nil {
+		t.Fatalf("notifyAccountUpdate(nil callback) error = %v", err)
 	}
 	wantErr := errors.New("callback failed")
-	handler.onRotate = func(accounts.Account) error {
+	handler.onAccountUpdate = func(accounts.Account) error {
 		return wantErr
 	}
-	if err := handler.notifyRotate(accounts.Account{Alias: "work"}); err != wantErr {
-		t.Fatalf("notifyRotate(error) = %v, want %v", err, wantErr)
+	if err := handler.notifyAccountUpdate(accounts.Account{Alias: "work"}); err != wantErr {
+		t.Fatalf("notifyAccountUpdate(error) = %v, want %v", err, wantErr)
 	}
 }
 
@@ -296,7 +344,7 @@ func TestProxyRefreshesTokenEvenWhenSyncFails(t *testing.T) {
 	server := newProxyWithConfig(t, Config{
 		Upstream: upstream.URL,
 		Store:    store,
-		OnRotate: func(accounts.Account) error {
+		OnAccountUpdate: func(accounts.Account) error {
 			return errors.New("sync failed")
 		},
 	})

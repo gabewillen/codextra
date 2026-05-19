@@ -11,6 +11,17 @@ import (
 	"github.com/gabewillen/codextra/internal/accounts"
 )
 
+func TestAccessTokenExpiresKnownDetectsJWTExpiry(t *testing.T) {
+	t.Parallel()
+
+	if !AccessTokenExpiresKnown(fakeJWT(t, map[string]any{"exp": time.Now().Add(time.Hour).Unix()})) {
+		t.Fatal("AccessTokenExpiresKnown(jwt) = false, want true")
+	}
+	if AccessTokenExpiresKnown("not-a-jwt") {
+		t.Fatal("AccessTokenExpiresKnown(plain) = true, want false")
+	}
+}
+
 func TestAccessTokenStaleUsesExpiryWithSkew(t *testing.T) {
 	t.Parallel()
 
@@ -148,8 +159,11 @@ func TestRefreshMapsOtherFailureModes(t *testing.T) {
 	if err := classifyRefreshFailure(http.StatusUnauthorized, []byte(`{"error":{"code":"unknown"}}`)); err == nil || err.Error() != "refresh token rejected; sign in again" {
 		t.Fatalf("classify unknown 401 = %v, want refresh token rejected", err)
 	}
-	if err := classifyRefreshFailure(http.StatusBadGateway, []byte(`{}`)); err == nil || err.Error() != "refresh request returned Bad Gateway" {
-		t.Fatalf("classify 502 = %v, want Bad Gateway", err)
+	if err := classifyRefreshFailure(http.StatusBadGateway, []byte(`{}`)); err == nil || err.Error() != "refresh request returned HTTP 502 (Bad Gateway)" {
+		t.Fatalf("classify 502 = %v, want HTTP 502 (Bad Gateway)", err)
+	}
+	if err := classifyRefreshFailure(499, []byte(`{}`)); err == nil || err.Error() != "refresh request returned HTTP 499 (unknown status)" {
+		t.Fatalf("classify 499 = %v, want HTTP 499 (unknown status)", err)
 	}
 }
 

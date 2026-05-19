@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	defaultRefreshURL = "https://auth.openai.com/oauth/token"
-	clientID          = "app_EMoamEEZ73f0CkXaXp7hran"
-	tokenRefreshSkew  = 30 * time.Second
+	defaultRefreshURL     = "https://auth.openai.com/oauth/token"
+	clientID              = "app_EMoamEEZ73f0CkXaXp7hran"
+	tokenRefreshSkew      = 30 * time.Second
+	defaultRefreshTimeout = 30 * time.Second
 )
 
 var errRefreshTokenUnavailable = errors.New("refresh token unavailable")
@@ -32,6 +33,16 @@ type refreshResponse struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+}
+
+// AccessTokenExpiresKnown reports whether the access token carries a JWT expiry claim.
+func AccessTokenExpiresKnown(accessToken string) bool {
+	claims := jwtClaims(accessToken)
+	if claims == nil {
+		return false
+	}
+	_, ok := claims["exp"].(float64)
+	return ok
 }
 
 // AccessTokenStale reports whether the access token is expired or near expiry.
@@ -55,6 +66,8 @@ func Refresh(ctx context.Context, client *http.Client, refreshToken string) (Tok
 	if client == nil {
 		client = http.DefaultClient
 	}
+	refreshCtx, cancel := context.WithTimeout(ctx, defaultRefreshTimeout)
+	defer cancel()
 
 	body, err := json.Marshal(refreshRequest{
 		ClientID:     clientID,
@@ -65,7 +78,7 @@ func Refresh(ctx context.Context, client *http.Client, refreshToken string) (Tok
 		return TokenData{}, fmt.Errorf("encode refresh request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshTokenURL(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(refreshCtx, http.MethodPost, refreshTokenURL(), bytes.NewReader(body))
 	if err != nil {
 		return TokenData{}, fmt.Errorf("create refresh request: %w", err)
 	}
@@ -153,7 +166,11 @@ func classifyRefreshFailure(status int, body []byte) error {
 	if status == http.StatusUnauthorized {
 		return errors.New("refresh token rejected; sign in again")
 	}
-	return fmt.Errorf("refresh request returned %s", http.StatusText(status))
+	statusText := http.StatusText(status)
+	if statusText == "" {
+		statusText = "unknown status"
+	}
+	return fmt.Errorf("refresh request returned HTTP %d (%s)", status, statusText)
 }
 
 func refreshErrorCode(body []byte) string {

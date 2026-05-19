@@ -111,11 +111,11 @@ func runProxyServer(ctx context.Context) error {
 	defer listener.Close()
 
 	server, err := proxy.New(proxy.Config{
-		Upstream:    upstream,
-		APIUpstream: apiUpstream,
-		Store:       store,
-		Logger:      logger,
-		OnRotate:    updateCodexAuthForAccount,
+		Upstream:        upstream,
+		APIUpstream:     apiUpstream,
+		Store:           store,
+		Logger:          logger,
+		OnAccountUpdate: updateCodexAuthForAccount,
 	})
 	if err != nil {
 		return err
@@ -657,7 +657,12 @@ func defaultStorePath() (string, error) {
 	return filepath.Join(dir, "accounts.json"), nil
 }
 
+var codexAuthWriteMu sync.Mutex
+
 func updateCodexAuthForAccount(account accounts.Account) error {
+	codexAuthWriteMu.Lock()
+	defer codexAuthWriteMu.Unlock()
+
 	authPath, err := codexauth.Path()
 	if err != nil {
 		return err
