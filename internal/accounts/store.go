@@ -106,6 +106,40 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 	return Account{}, false, s.saveLocked()
 }
 
+func (s *Store) UpdateTokens(alias string, tokens Account) (Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.reloadLocked(); err != nil {
+		return Account{}, err
+	}
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias != alias {
+			continue
+		}
+		acc := &s.Data.Accounts[i]
+		acc.AccessToken = tokens.AccessToken
+		if tokens.RefreshToken != "" {
+			acc.RefreshToken = tokens.RefreshToken
+		}
+		if tokens.IDToken != "" {
+			acc.IDToken = tokens.IDToken
+		}
+		if tokens.AccountID != "" {
+			acc.AccountID = tokens.AccountID
+		}
+		if tokens.Email != "" {
+			acc.Email = tokens.Email
+		}
+		if tokens.PlanType != "" {
+			acc.PlanType = tokens.PlanType
+		}
+		updated := *acc
+		return updated, s.saveLocked()
+	}
+	return Account{}, fmt.Errorf("account %q not found", alias)
+}
+
 func (s *Store) Upsert(account Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

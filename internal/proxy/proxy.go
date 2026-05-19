@@ -17,13 +17,15 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 type Config struct {
-	Upstream    string
-	APIUpstream string
-	Store       *accounts.Store
-	Logger      *slog.Logger
+	Upstream        string
+	APIUpstream     string
+	Store           *accounts.Store
+	Logger          *slog.Logger
+	OnAccountUpdate func(accounts.Account) error
 }
 
 func New(config Config) (*http.Server, error) {
@@ -46,11 +48,13 @@ func New(config Config) (*http.Server, error) {
 		return nil, fmt.Errorf("validate api upstream: %w", err)
 	}
 	handler := &handler{
-		upstream:    upstream,
-		apiUpstream: apiUpstream,
-		store:       config.Store,
-		client:      http.DefaultClient,
-		logger:      config.Logger,
+		upstream:        upstream,
+		apiUpstream:     apiUpstream,
+		store:           config.Store,
+		client:          http.DefaultClient,
+		logger:          config.Logger,
+		onAccountUpdate: config.OnAccountUpdate,
+		refreshLocks:    newRefreshLocks(),
 	}
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -71,11 +75,36 @@ func validateUpstreamURL(upstream *url.URL) error {
 }
 
 type handler struct {
-	upstream    *url.URL
-	apiUpstream *url.URL
-	store       *accounts.Store
-	client      *http.Client
-	logger      *slog.Logger
+	upstream        *url.URL
+	apiUpstream     *url.URL
+	store           *accounts.Store
+	client          *http.Client
+	logger          *slog.Logger
+	onAccountUpdate func(accounts.Account) error
+	refreshLocks    *refreshLocks
+}
+
+type refreshLocks struct {
+	mu      sync.Mutex
+	byAlias map[string]*sync.Mutex
+}
+
+func newRefreshLocks() *refreshLocks {
+	return &refreshLocks{byAlias: map[string]*sync.Mutex{}}
+}
+
+func (l *refreshLocks) withLock(alias string, fn func() (accounts.Account, error)) (accounts.Account, error) {
+	l.mu.Lock()
+	lock, ok := l.byAlias[alias]
+	if !ok {
+		lock = &sync.Mutex{}
+		l.byAlias[alias] = lock
+	}
+	l.mu.Unlock()
+
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -110,12 +139,32 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tokenRefreshed := false
 	for {
+		account, err = h.ensureFreshTokens(r.Context(), account)
+		if err != nil {
+			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
+		}
+
 		resp, err := h.forward(r.Context(), r, body, account)
 		if err != nil {
 			h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+			resp.Body.Close()
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
+			if refreshErr != nil {
+				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				return
+			}
+			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			account = updated
+			tokenRefreshed = true
+			continue
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
@@ -138,9 +187,60 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		if err := h.notifyAccountUpdate(next); err != nil {
+			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
+		tokenRefreshed = false
 	}
+}
+
+func (h *handler) ensureFreshTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	if !codexauth.AccessTokenStale(account.AccessToken, time.Now()) {
+		return account, nil
+	}
+	return h.refreshAccountTokens(ctx, account, false)
+}
+
+func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Account, force bool) (accounts.Account, error) {
+	startingRefresh := account.RefreshToken
+	return h.refreshLocks.withLock(account.Alias, func() (accounts.Account, error) {
+		if latest, ok := h.store.Get(account.Alias); ok {
+			account = latest
+		}
+		if startingRefresh != "" && account.RefreshToken != startingRefresh {
+			return account, nil
+		}
+		if !force && !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
+			return account, nil
+		}
+		if account.RefreshToken == "" {
+			return account, fmt.Errorf("account %q has no refresh token", account.Alias)
+		}
+
+		tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
+		if err != nil {
+			return account, err
+		}
+		updated := codexauth.MergeRefresh(account, tokens)
+		persisted, err := h.store.UpdateTokens(account.Alias, updated)
+		if err != nil {
+			h.logger.Warn("token_refresh_persist_failed", "alias", account.Alias, "error", err)
+			persisted = updated
+		}
+		if err := h.notifyAccountUpdate(persisted); err != nil {
+			h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+		}
+		return persisted, nil
+	})
+}
+
+func (h *handler) notifyAccountUpdate(account accounts.Account) error {
+	if h.onAccountUpdate == nil {
+		return nil
+	}
+	return h.onAccountUpdate(account)
 }
 
 func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {
@@ -207,7 +307,14 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tokenRefreshed := false
 	for {
+		var refreshErr error
+		account, refreshErr = h.ensureFreshTokens(r.Context(), account)
+		if refreshErr != nil {
+			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+		}
+
 		upstreamConn, upstreamReader, upstreamReq, resp, err := h.openWebSocket(r.Context(), r, account)
 		if err != nil {
 			h.logger.Warn("websocket_upstream_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
@@ -218,6 +325,21 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("websocket_upgraded", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "upstream_host", upstreamReq.Host, "duration_ms", time.Since(start).Milliseconds())
 			h.tunnelWebSocket(w, r, upstreamConn, upstreamReader, resp)
 			return
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+			resp.Body.Close()
+			upstreamConn.Close()
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
+			if refreshErr != nil {
+				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				return
+			}
+			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			account = updated
+			tokenRefreshed = true
+			continue
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
@@ -242,8 +364,12 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		if err := h.notifyAccountUpdate(next); err != nil {
+			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
+		tokenRefreshed = false
 	}
 }
 
@@ -388,6 +514,27 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, value)
 		}
 	}
+}
+
+func isTokenExpired(resp *http.Response) bool {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return tokenExpiredMarker(body)
+}
+
+func tokenExpiredMarker(body []byte) bool {
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Code == "token_expired" {
+		return true
+	}
+	return jsonHasStringValue(body, "token_expired")
 }
 
 func isUsageLimit(resp *http.Response) bool {
