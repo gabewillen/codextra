@@ -466,14 +466,87 @@ func TestProxyAdoptsCodexAuthWithoutCallingRefreshEndpoint(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
 	}
-	if gotAuth != "Bearer "+fresh {
-		t.Fatalf("Authorization = %q, want Bearer %q", gotAuth, fresh)
+	wantAuth := "Bearer " + fresh
+	if gotAuth != wantAuth {
+		t.Fatalf("Authorization mismatch (got %s, want %s)", redactTestSecret(gotAuth), redactTestSecret(wantAuth))
 	}
 	if refreshCalls.Load() != 0 {
 		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
 	}
 	if store.Data.Accounts[0].AccessToken != fresh {
-		t.Fatalf("stored AccessToken = %q, want adopted fresh token", store.Data.Accounts[0].AccessToken)
+		t.Fatalf("stored AccessToken mismatch (got %s, want %s)", redactTestSecret(store.Data.Accounts[0].AccessToken), redactTestSecret(fresh))
+	}
+}
+
+func TestProxyAdoptsCodexAuthOnReactiveRefreshWithoutOAuthCall(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	const accountID = "acct-personal"
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID)
+	stale := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID)
+	auth := codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	}
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + stale, "Bearer " + fresh}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
 	}
 }
 
@@ -515,6 +588,24 @@ func freshJWT(t *testing.T) string {
 func jwtWithExpiry(t *testing.T, exp int64) string {
 	t.Helper()
 	return jwtWithAccountExpiry(t, exp, "")
+}
+
+func redactTestSecret(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	if len(value) <= 12 {
+		return "<redacted>"
+	}
+	return value[:4] + "…" + value[len(value)-4:]
+}
+
+func redactTestSecrets(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = redactTestSecret(value)
+	}
+	return out
 }
 
 func jwtWithAccountExpiry(t *testing.T, exp int64, accountID string) string {

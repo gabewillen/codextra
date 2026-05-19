@@ -9,8 +9,9 @@ import (
 )
 
 // AdoptFromCodexAuth copies OAuth credentials from the live Codex auth.json file
-// into a registry account when they refer to the same ChatGPT account and the
-// on-disk session is strictly newer than the registry copy.
+// into a registry account when they refer to the same ChatGPT account and Codex
+// on disk has a fresher access token and/or a different refresh token while the
+// registry copy is stale.
 func AdoptFromCodexAuth(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
 	path, err := Path()
 	if err != nil {

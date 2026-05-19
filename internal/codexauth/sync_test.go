@@ -46,10 +46,10 @@ func TestAdoptFromCodexAuthCopiesFreshSession(t *testing.T) {
 		t.Fatal("AdoptFromCodexAuth() ok = false, want true")
 	}
 	if adopted.AccessToken != fresh {
-		t.Fatalf("AccessToken = %q, want fresh token", adopted.AccessToken)
+		t.Fatalf("AccessToken mismatch (got %s, want %s)", redactSecret(adopted.AccessToken), redactSecret(fresh))
 	}
 	if adopted.RefreshToken != "refresh-live" {
-		t.Fatalf("RefreshToken = %q, want refresh-live", adopted.RefreshToken)
+		t.Fatalf("RefreshToken mismatch (got %s, want %s)", redactSecret(adopted.RefreshToken), redactSecret("refresh-live"))
 	}
 }
 

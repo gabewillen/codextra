@@ -212,17 +212,17 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 		if startingRefresh != "" && account.RefreshToken != startingRefresh {
 			return account, nil
 		}
-		if !force && !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
+		now := time.Now()
+		if !force && accessTokenReady(account.AccessToken, now) {
 			return account, nil
 		}
 
-		now := time.Now()
 		if adopted, ok, err := h.adoptFromCodexAuth(account, now); err != nil {
 			h.logger.Warn("codex_auth_sync_failed", "alias", account.Alias, "error", err)
 		} else if ok {
 			h.logger.Info("codex_auth_synced", "alias", account.Alias)
 			account = adopted
-			if !force && !codexauth.AccessTokenStale(account.AccessToken, now) {
+			if accessTokenReady(account.AccessToken, now) {
 				return account, nil
 			}
 		}
@@ -233,10 +233,14 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 
 		tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
 		if err != nil {
+			if accessTokenReady(account.AccessToken, now) {
+				h.logger.Info("token_refresh_skipped_using_adopted", "alias", account.Alias)
+				return account, nil
+			}
 			if codexauth.IsRecoverableRefreshFailure(err) {
 				if adopted, ok, adoptErr := h.adoptFromCodexAuth(account, now); adoptErr != nil {
 					h.logger.Warn("codex_auth_sync_failed", "alias", account.Alias, "error", adoptErr)
-				} else if ok && !codexauth.AccessTokenStale(adopted.AccessToken, now) {
+				} else if ok && accessTokenReady(adopted.AccessToken, now) {
 					h.logger.Info("codex_auth_synced_after_refresh_failure", "alias", account.Alias)
 					return adopted, nil
 				}
@@ -270,6 +274,10 @@ func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (a
 		h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
 	}
 	return persisted, true, nil
+}
+
+func accessTokenReady(accessToken string, now time.Time) bool {
+	return codexauth.AccessTokenExpiresKnown(accessToken) && !codexauth.AccessTokenStale(accessToken, now)
 }
 
 func refreshFailureResponse(err error) string {
