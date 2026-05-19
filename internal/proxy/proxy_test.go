@@ -424,8 +424,8 @@ func TestProxyAdoptsCodexAuthWithoutCallingRefreshEndpoint(t *testing.T) {
 	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
 
 	const accountID = "acct-personal"
-	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID)
-	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID)
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
 	auth := codexauth.File{
 		Tokens: &codexauth.TokenData{
 			AccessToken:  fresh,
@@ -491,8 +491,13 @@ func TestProxyAdoptsCodexAuthOnReactiveRefreshWithoutOAuthCall(t *testing.T) {
 	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
 
 	const accountID = "acct-personal"
-	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID)
-	stale := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID)
+	future := time.Now().Add(time.Hour).Unix()
+	// Registry token is not JWT-stale, but upstream rejects it; auth.json holds a different live token.
+	stale := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "registry"})
+	fresh := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "codex-auth"})
+	if stale == fresh {
+		t.Fatal("test setup: stale and fresh tokens must differ")
+	}
 	auth := codexauth.File{
 		Tokens: &codexauth.TokenData{
 			AccessToken:  fresh,
@@ -587,7 +592,7 @@ func freshJWT(t *testing.T) string {
 
 func jwtWithExpiry(t *testing.T, exp int64) string {
 	t.Helper()
-	return jwtWithAccountExpiry(t, exp, "")
+	return jwtWithAccountExpiry(t, exp, "", nil)
 }
 
 func redactTestSecret(value string) string {
@@ -608,12 +613,15 @@ func redactTestSecrets(values []string) []string {
 	return out
 }
 
-func jwtWithAccountExpiry(t *testing.T, exp int64, accountID string) string {
+func jwtWithAccountExpiry(t *testing.T, exp int64, accountID string, extra map[string]any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	claims := map[string]any{"exp": exp}
 	if accountID != "" {
 		claims["chatgpt_account_id"] = accountID
+	}
+	for key, value := range extra {
+		claims[key] = value
 	}
 	payloadBytes, err := json.Marshal(claims)
 	if err != nil {
