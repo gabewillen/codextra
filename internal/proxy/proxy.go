@@ -192,6 +192,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
+		tokenRefreshed = false
 	}
 }
 
@@ -368,6 +369,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
+		tokenRefreshed = false
 	}
 }
 

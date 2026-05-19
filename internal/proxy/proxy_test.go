@@ -127,6 +127,83 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 	}
 }
 
+func TestProxyReactivelyRefreshesAfterRotatingAccounts(t *testing.T) {
+	refreshCalls := 0
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		var req struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(refresh) error = %v", err)
+		}
+		switch req.RefreshToken {
+		case "refresh-personal":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token":  "token-personal-new",
+				"refresh_token": "refresh-personal-new",
+			})
+		case "refresh-work":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token":  "token-work-new",
+				"refresh_token": "refresh-work-new",
+			})
+		default:
+			t.Fatalf("refresh token = %q, want refresh-personal or refresh-work", req.RefreshToken)
+		}
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	resetAt := time.Unix(1_700_000_123, 0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-personal":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "token_expired"}})
+		case "Bearer token-personal-new":
+			w.Header().Set("x-codex-active-limit", "codex_weekly")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type":      "usage_limit_reached",
+					"resets_at": resetAt.Unix(),
+				},
+			})
+		case "Bearer token-work":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "token_expired"}})
+		case "Bearer token-work-new":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		default:
+			t.Fatalf("Authorization = %q, want known bearer token", r.Header.Get("Authorization"))
+		}
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal", RefreshToken: "refresh-personal"},
+			{Alias: "work", AccessToken: "token-work", RefreshToken: "refresh-work"},
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if resp.Body.String() != "ok" {
+		t.Fatalf("body = %q, want ok", resp.Body.String())
+	}
+	if refreshCalls != 2 {
+		t.Fatalf("refreshCalls = %d, want 2", refreshCalls)
+	}
+}
+
 func TestProxyReactivelyRefreshesWhenUpstreamRejectsFreshJWT(t *testing.T) {
 	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
