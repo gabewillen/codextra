@@ -127,6 +127,56 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 	}
 }
 
+func TestProxyReactivelyRefreshesWhenUpstreamRejectsFreshJWT(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	freshToken := freshJWT(t)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "refreshed")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  freshToken,
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + freshToken, "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+	}
+}
+
 func TestProxyRefreshesExpiredTokenBeforeReturningResponse(t *testing.T) {
 	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -308,8 +358,18 @@ func TestNotifyAccountUpdateHandlesNilAndCallbackErrors(t *testing.T) {
 
 func expiredJWT(t *testing.T) string {
 	t.Helper()
+	return jwtWithExpiry(t, time.Now().Add(-time.Minute).Unix())
+}
+
+func freshJWT(t *testing.T) string {
+	t.Helper()
+	return jwtWithExpiry(t, time.Now().Add(time.Hour).Unix())
+}
+
+func jwtWithExpiry(t *testing.T, exp int64) string {
+	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	payloadBytes, err := json.Marshal(map[string]any{"exp": time.Now().Add(-time.Minute).Unix()})
+	payloadBytes, err := json.Marshal(map[string]any{"exp": exp})
 	if err != nil {
 		t.Fatalf("Marshal(exp) error = %v", err)
 	}

@@ -155,7 +155,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
 			resp.Body.Close()
-			updated, refreshErr := h.refreshAccountTokens(r.Context(), account)
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
 				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
@@ -199,10 +199,10 @@ func (h *handler) ensureFreshTokens(ctx context.Context, account accounts.Accoun
 	if !codexauth.AccessTokenStale(account.AccessToken, time.Now()) {
 		return account, nil
 	}
-	return h.refreshAccountTokens(ctx, account)
+	return h.refreshAccountTokens(ctx, account, false)
 }
 
-func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Account, force bool) (accounts.Account, error) {
 	startingRefresh := account.RefreshToken
 	return h.refreshLocks.withLock(account.Alias, func() (accounts.Account, error) {
 		if latest, ok := h.store.Get(account.Alias); ok {
@@ -211,7 +211,7 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 		if startingRefresh != "" && account.RefreshToken != startingRefresh {
 			return account, nil
 		}
-		if !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
+		if !force && !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
 			return account, nil
 		}
 		if account.RefreshToken == "" {
@@ -329,7 +329,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
 			resp.Body.Close()
 			upstreamConn.Close()
-			updated, refreshErr := h.refreshAccountTokens(r.Context(), account)
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
 				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
