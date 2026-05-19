@@ -12,14 +12,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 func TestProxyForwardsWithActiveAccountAuth(t *testing.T) {
@@ -408,6 +411,150 @@ func TestProxyProactivelyRefreshesStaleAccessToken(t *testing.T) {
 	}
 }
 
+func TestProxyAdoptsCodexAuthWithoutCallingRefreshEndpoint(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	const accountID = "acct-personal"
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	auth := codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	}
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantAuth := "Bearer " + fresh
+	if gotAuth != wantAuth {
+		t.Fatalf("Authorization mismatch (got %s, want %s)", redactTestSecret(gotAuth), redactTestSecret(wantAuth))
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
+	}
+	if store.Data.Accounts[0].AccessToken != fresh {
+		t.Fatalf("stored AccessToken mismatch (got %s, want %s)", redactTestSecret(store.Data.Accounts[0].AccessToken), redactTestSecret(fresh))
+	}
+}
+
+func TestProxyAdoptsCodexAuthOnReactiveRefreshWithoutOAuthCall(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	const accountID = "acct-personal"
+	future := time.Now().Add(time.Hour).Unix()
+	// Registry token is not JWT-stale, but upstream rejects it; auth.json holds a different live token.
+	stale := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "registry"})
+	fresh := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "codex-auth"})
+	if stale == fresh {
+		t.Fatal("test setup: stale and fresh tokens must differ")
+	}
+	auth := codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	}
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + stale, "Bearer " + fresh}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
+	}
+}
+
 func TestTokenExpiredMarkerDetects401Payload(t *testing.T) {
 	t.Parallel()
 
@@ -445,10 +592,40 @@ func freshJWT(t *testing.T) string {
 
 func jwtWithExpiry(t *testing.T, exp int64) string {
 	t.Helper()
+	return jwtWithAccountExpiry(t, exp, "", nil)
+}
+
+func redactTestSecret(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	if len(value) <= 12 {
+		return "<redacted>"
+	}
+	return value[:4] + "…" + value[len(value)-4:]
+}
+
+func redactTestSecrets(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = redactTestSecret(value)
+	}
+	return out
+}
+
+func jwtWithAccountExpiry(t *testing.T, exp int64, accountID string, extra map[string]any) string {
+	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	payloadBytes, err := json.Marshal(map[string]any{"exp": exp})
+	claims := map[string]any{"exp": exp}
+	if accountID != "" {
+		claims["chatgpt_account_id"] = accountID
+	}
+	for key, value := range extra {
+		claims[key] = value
+	}
+	payloadBytes, err := json.Marshal(claims)
 	if err != nil {
-		t.Fatalf("Marshal(exp) error = %v", err)
+		t.Fatalf("Marshal(claims) error = %v", err)
 	}
 	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
 	return header + "." + payload + ".signature"

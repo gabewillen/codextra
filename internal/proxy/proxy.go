@@ -158,7 +158,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
-				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				http.Error(w, refreshFailureResponse(refreshErr), http.StatusUnauthorized)
 				return
 			}
 			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
@@ -212,15 +212,39 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 		if startingRefresh != "" && account.RefreshToken != startingRefresh {
 			return account, nil
 		}
-		if !force && !codexauth.AccessTokenStale(account.AccessToken, time.Now()) && codexauth.AccessTokenExpiresKnown(account.AccessToken) {
+		now := time.Now()
+		if !force && accessTokenReady(account.AccessToken, now) {
 			return account, nil
 		}
+
+		if adopted, ok, err := h.adoptFromCodexAuth(account, now); err != nil {
+			h.logger.Warn("codex_auth_sync_failed", "alias", account.Alias, "error", err)
+		} else if ok {
+			h.logger.Info("codex_auth_synced", "alias", account.Alias)
+			account = adopted
+			if accessTokenReady(account.AccessToken, now) {
+				return account, nil
+			}
+		}
+
 		if account.RefreshToken == "" {
-			return account, fmt.Errorf("account %q has no refresh token", account.Alias)
+			return account, fmt.Errorf("account %q has no refresh token; run codextra login %s", account.Alias, account.Alias)
 		}
 
 		tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
 		if err != nil {
+			if accessTokenReady(account.AccessToken, now) {
+				h.logger.Info("token_refresh_skipped_using_adopted", "alias", account.Alias)
+				return account, nil
+			}
+			if codexauth.IsRecoverableRefreshFailure(err) {
+				if adopted, ok, adoptErr := h.adoptFromCodexAuth(account, now); adoptErr != nil {
+					h.logger.Warn("codex_auth_sync_failed", "alias", account.Alias, "error", adoptErr)
+				} else if ok && accessTokenReady(adopted.AccessToken, now) {
+					h.logger.Info("codex_auth_synced_after_refresh_failure", "alias", account.Alias)
+					return adopted, nil
+				}
+			}
 			return account, err
 		}
 		updated := codexauth.MergeRefresh(account, tokens)
@@ -234,6 +258,34 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 		}
 		return persisted, nil
 	})
+}
+
+func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
+	adopted, ok, err := codexauth.AdoptFromCodexAuth(account, now)
+	if err != nil || !ok {
+		return account, ok, err
+	}
+	persisted, err := h.store.UpdateTokens(account.Alias, adopted)
+	if err != nil {
+		h.logger.Warn("codex_auth_sync_persist_failed", "alias", account.Alias, "error", err)
+		persisted = adopted
+	}
+	if err := h.notifyAccountUpdate(persisted); err != nil {
+		h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+	}
+	return persisted, true, nil
+}
+
+func accessTokenReady(accessToken string, now time.Time) bool {
+	return codexauth.AccessTokenExpiresKnown(accessToken) && !codexauth.AccessTokenStale(accessToken, now)
+}
+
+func refreshFailureResponse(err error) string {
+	msg := codexauth.RefreshFailureMessage(err)
+	if msg == "" {
+		return "codextra could not refresh expired account token"
+	}
+	return "codextra could not refresh expired account token: " + msg
 }
 
 func (h *handler) notifyAccountUpdate(account accounts.Account) error {
@@ -333,7 +385,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
-				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				http.Error(w, refreshFailureResponse(refreshErr), http.StatusUnauthorized)
 				return
 			}
 			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)

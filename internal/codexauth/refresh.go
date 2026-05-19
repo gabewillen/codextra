@@ -16,7 +16,7 @@ import (
 
 const (
 	defaultRefreshURL     = "https://auth.openai.com/oauth/token"
-	clientID              = "app_EMoamEEZ73f0CkXaXp7hran"
+	clientID              = "app_EMoamEEZ73f0CkXaXp7hrann"
 	tokenRefreshSkew      = 30 * time.Second
 	defaultRefreshTimeout = 30 * time.Second
 )

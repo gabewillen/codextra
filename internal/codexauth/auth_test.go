@@ -218,6 +218,16 @@ func TestTokenHelpersHandleInvalidInputs(t *testing.T) {
 	}
 }
 
+func redactSecret(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	if len(value) <= 12 {
+		return "<redacted>"
+	}
+	return value[:4] + "…" + value[len(value)-4:]
+}
+
 func fakeJWT(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
