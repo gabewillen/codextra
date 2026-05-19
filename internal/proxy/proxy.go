@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 type Config struct {
@@ -24,6 +25,7 @@ type Config struct {
 	APIUpstream string
 	Store       *accounts.Store
 	Logger      *slog.Logger
+	OnRotate    func(accounts.Account) error
 }
 
 func New(config Config) (*http.Server, error) {
@@ -51,6 +53,7 @@ func New(config Config) (*http.Server, error) {
 		store:       config.Store,
 		client:      http.DefaultClient,
 		logger:      config.Logger,
+		onRotate:    config.OnRotate,
 	}
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -76,6 +79,7 @@ type handler struct {
 	store       *accounts.Store
 	client      *http.Client
 	logger      *slog.Logger
+	onRotate    func(accounts.Account) error
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -110,12 +114,32 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tokenRefreshed := false
 	for {
+		account, err = h.ensureFreshTokens(r.Context(), account)
+		if err != nil {
+			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
+		}
+
 		resp, err := h.forward(r.Context(), r, body, account)
 		if err != nil {
 			h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+			resp.Body.Close()
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account)
+			if refreshErr != nil {
+				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				return
+			}
+			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			account = updated
+			tokenRefreshed = true
+			continue
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
@@ -138,9 +162,41 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		if err := h.notifyRotate(next); err != nil {
+			h.logger.Warn("rotation_callback_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
+		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
 	}
+}
+
+func (h *handler) ensureFreshTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	if !codexauth.AccessTokenStale(account.AccessToken, time.Now()) {
+		return account, nil
+	}
+	return h.refreshAccountTokens(ctx, account)
+}
+
+func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	tokens, err := codexauth.Refresh(ctx, h.client, account.RefreshToken)
+	if err != nil {
+		return account, err
+	}
+	updated := codexauth.MergeRefresh(account, tokens)
+	if err := h.store.Upsert(updated); err != nil {
+		return account, err
+	}
+	if err := h.notifyRotate(updated); err != nil {
+		h.logger.Warn("rotation_callback_failed", "alias", account.Alias, "error", err)
+	}
+	return updated, nil
+}
+
+func (h *handler) notifyRotate(account accounts.Account) error {
+	if h.onRotate == nil {
+		return nil
+	}
+	return h.onRotate(account)
 }
 
 func (h *handler) logResponse(r *http.Request, resp *http.Response, account accounts.Account, elapsed time.Duration, body []byte, copyErr error) {
@@ -207,7 +263,14 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tokenRefreshed := false
 	for {
+		var refreshErr error
+		account, refreshErr = h.ensureFreshTokens(r.Context(), account)
+		if refreshErr != nil {
+			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+		}
+
 		upstreamConn, upstreamReader, upstreamReq, resp, err := h.openWebSocket(r.Context(), r, account)
 		if err != nil {
 			h.logger.Warn("websocket_upstream_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
@@ -218,6 +281,21 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("websocket_upgraded", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "upstream_host", upstreamReq.Host, "duration_ms", time.Since(start).Milliseconds())
 			h.tunnelWebSocket(w, r, upstreamConn, upstreamReader, resp)
 			return
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+			resp.Body.Close()
+			upstreamConn.Close()
+			updated, refreshErr := h.refreshAccountTokens(r.Context(), account)
+			if refreshErr != nil {
+				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
+				http.Error(w, "codextra could not refresh expired account token", http.StatusUnauthorized)
+				return
+			}
+			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			account = updated
+			tokenRefreshed = true
+			continue
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
@@ -241,6 +319,9 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.logger.Warn("account_rotation_exhausted", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit)
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
+		}
+		if err := h.notifyRotate(next); err != nil {
+			h.logger.Warn("rotation_callback_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
 		}
 		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
 		account = next
@@ -388,6 +469,27 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, value)
 		}
 	}
+}
+
+func isTokenExpired(resp *http.Response) bool {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return tokenExpiredMarker(body)
+}
+
+func tokenExpiredMarker(body []byte) bool {
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Code == "token_expired" {
+		return true
+	}
+	return jsonHasStringValue(body, "token_expired")
 }
 
 func isUsageLimit(resp *http.Response) bool {
