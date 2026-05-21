@@ -50,12 +50,12 @@ func run() error {
 		return runProxyServer(ctx)
 	}
 
-	accountAlias, userArgs, err := parseCodextraArgs(os.Args[1:])
+	options, userArgs, err := parseCodextraArgs(os.Args[1:])
 	if err != nil {
 		return err
 	}
-	if accountAlias != "" {
-		if _, err := activateAccount(accountAlias); err != nil {
+	if options.accountAlias != "" {
+		if _, err := activateAccount(options.accountAlias); err != nil {
 			return err
 		}
 	}
@@ -71,6 +71,9 @@ func run() error {
 	defer client.Close()
 
 	codexArgs := codexArgs(proxyURL, userArgs)
+	if options.desktop {
+		codexArgs = codexDesktopArgs(codexArgs)
+	}
 	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -78,7 +81,15 @@ func run() error {
 	cmd.Env = codexEnv(os.Environ(), proxyURL)
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	if !options.desktop || !codexDesktopShouldKeepAlive(userArgs) {
+		return nil
+	}
+	log.Printf("desktop app launched; press Ctrl+C to stop codextra proxy keepalive")
+	<-ctx.Done()
+	return nil
 }
 
 func runProxyServer(ctx context.Context) error {
@@ -717,6 +728,25 @@ func codexArgs(proxyURL string, userArgs []string) []string {
 	return args
 }
 
+func codexDesktopArgs(args []string) []string {
+	desktopArgs := make([]string, 0, len(args)+1)
+	desktopArgs = append(desktopArgs, "app")
+	desktopArgs = append(desktopArgs, args...)
+	return desktopArgs
+}
+
+func codexDesktopShouldKeepAlive(userArgs []string) bool {
+	for _, arg := range userArgs {
+		if arg == "--" {
+			return true
+		}
+		if arg == "-h" || arg == "--help" {
+			return false
+		}
+	}
+	return true
+}
+
 func codexChatGPTBaseURL(proxyURL string) string {
 	return strings.TrimRight(proxyURL, "/") + "/backend-api"
 }
@@ -744,8 +774,13 @@ func codexEnv(base []string, proxyURL string) []string {
 	return env
 }
 
-func parseCodextraArgs(args []string) (string, []string, error) {
-	var account string
+type codextraOptions struct {
+	accountAlias string
+	desktop      bool
+}
+
+func parseCodextraArgs(args []string) (codextraOptions, []string, error) {
+	var options codextraOptions
 	pass := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -755,20 +790,24 @@ func parseCodextraArgs(args []string) (string, []string, error) {
 		}
 		if arg == "--account" {
 			if i+1 >= len(args) {
-				return "", nil, fmt.Errorf("--account requires an alias")
+				return codextraOptions{}, nil, fmt.Errorf("--account requires an alias")
 			}
-			account = args[i+1]
+			options.accountAlias = args[i+1]
 			i++
 			continue
 		}
 		if value, ok := strings.CutPrefix(arg, "--account="); ok {
 			if value == "" {
-				return "", nil, fmt.Errorf("--account requires an alias")
+				return codextraOptions{}, nil, fmt.Errorf("--account requires an alias")
 			}
-			account = value
+			options.accountAlias = value
+			continue
+		}
+		if arg == "--desktop" {
+			options.desktop = true
 			continue
 		}
 		pass = append(pass, arg)
 	}
-	return account, pass, nil
+	return options, pass, nil
 }

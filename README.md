@@ -78,6 +78,7 @@ codextra login personal-plus
 codextra login personal-pro --device-auth
 codextra login --tag
 codextra --account personal-pro
+codextra --desktop .
 ```
 
 `login <alias>` runs the normal `codex login`, imports the resulting active
@@ -107,6 +108,13 @@ codextra account.
 After rotation, Codex's `/status` screen can show mixed account information:
 the `Account` field comes from Codex's startup auth snapshot, while usage limits
 and model requests come from the currently selected codextra proxy account.
+
+Use `--desktop` to launch the Codex desktop app with the codextra proxy instead
+of launching the terminal UI. The flag is consumed by `codextra`; remaining
+arguments are passed to `codex app` after the proxy config overrides, so a path
+argument opens that workspace in Codex Desktop. Keep the `codextra --desktop`
+process running while using the desktop app, because it keeps the local proxy
+alive.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
