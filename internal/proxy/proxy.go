@@ -187,6 +187,17 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
 		}
+		// Attempt to adopt any fresher tokens from Codex's auth.json for the
+		// rotation target before notifying. This prevents overwriting Codex's
+		// copy of a secondary account with a stale refresh token from the
+		// registry (which would make subsequent refresh attempts fail with
+		// "refresh token already used" and prevent recovery via adopt).
+		if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
+			h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
+		} else if ok {
+			h.logger.Info("codex_auth_synced", "alias", next.Alias)
+			next = adopted
+		}
 		if err := h.notifyAccountUpdate(next); err != nil {
 			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
 		}
@@ -261,6 +272,14 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 }
 
 func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
+	return h.adoptFromCodexAuthWithNotify(account, now, true)
+}
+
+func (h *handler) adoptFromCodexAuthWithoutNotify(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
+	return h.adoptFromCodexAuthWithNotify(account, now, false)
+}
+
+func (h *handler) adoptFromCodexAuthWithNotify(account accounts.Account, now time.Time, notify bool) (accounts.Account, bool, error) {
 	adopted, ok, err := codexauth.AdoptFromCodexAuth(account, now)
 	if err != nil || !ok {
 		return account, ok, err
@@ -270,8 +289,10 @@ func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (a
 		h.logger.Warn("codex_auth_sync_persist_failed", "alias", account.Alias, "error", err)
 		persisted = adopted
 	}
-	if err := h.notifyAccountUpdate(persisted); err != nil {
-		h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+	if notify {
+		if err := h.notifyAccountUpdate(persisted); err != nil {
+			h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+		}
 	}
 	return persisted, true, nil
 }
@@ -415,6 +436,17 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.logger.Warn("account_rotation_exhausted", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit)
 			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
 			return
+		}
+		// Attempt to adopt any fresher tokens from Codex's auth.json for the
+		// rotation target before notifying. This prevents overwriting Codex's
+		// copy of a secondary account with a stale refresh token from the
+		// registry (which would make subsequent refresh attempts fail with
+		// "refresh token already used" and prevent recovery via adopt).
+		if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
+			h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
+		} else if ok {
+			h.logger.Info("codex_auth_synced", "alias", next.Alias)
+			next = adopted
 		}
 		if err := h.notifyAccountUpdate(next); err != nil {
 			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)

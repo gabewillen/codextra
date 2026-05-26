@@ -202,3 +202,42 @@ func TestRefreshFailureHelpers(t *testing.T) {
 		t.Fatal("RefreshFailureMessage(empty) did not return default message")
 	}
 }
+
+func TestSyncHelpersCoverRemainingBranches(t *testing.T) {
+	t.Parallel()
+
+	if sameChatGPTAccount(accounts.Account{}, accounts.Account{}) {
+		t.Fatal("sameChatGPTAccount(empty) = true, want false")
+	}
+	if !sameChatGPTAccount(accounts.Account{Email: "WORK@example.com"}, accounts.Account{Email: "work@example.com"}) {
+		t.Fatal("sameChatGPTAccount(email case-insensitive) = false, want true")
+	}
+
+	now := time.Now()
+	stale := fakeJWT(t, map[string]any{"exp": now.Add(-time.Hour).Unix()})
+	fresh := fakeJWT(t, map[string]any{"exp": now.Add(time.Hour).Unix()})
+
+	if shouldAdoptCodexAuth(
+		accounts.Account{AccessToken: fresh, RefreshToken: "refresh-old"},
+		accounts.Account{AccessToken: stale, RefreshToken: "refresh-live"},
+		now,
+	) {
+		t.Fatal("shouldAdoptCodexAuth(live stale, registry fresh) = true, want false")
+	}
+	if shouldAdoptCodexAuth(
+		accounts.Account{AccessToken: fresh, RefreshToken: "refresh-old"},
+		accounts.Account{AccessToken: fresh, RefreshToken: ""},
+		now,
+	) {
+		t.Fatal("shouldAdoptCodexAuth(empty live refresh) = true, want false")
+	}
+	if IsRecoverableRefreshFailure(nil) {
+		t.Fatal("IsRecoverableRefreshFailure(nil) = true, want false")
+	}
+	if !IsRecoverableRefreshFailure(errors.New("refresh token revoked")) {
+		t.Fatal("IsRecoverableRefreshFailure(revoked) = false, want true")
+	}
+	if !IsRecoverableRefreshFailure(errors.New("refresh token rejected")) {
+		t.Fatal("IsRecoverableRefreshFailure(rejected) = false, want true")
+	}
+}
