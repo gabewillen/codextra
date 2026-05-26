@@ -192,7 +192,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		// copy of a secondary account with a stale refresh token from the
 		// registry (which would make subsequent refresh attempts fail with
 		// "refresh token already used" and prevent recovery via adopt).
-		if adopted, ok, adoptErr := h.adoptFromCodexAuth(next, time.Now()); adoptErr != nil {
+		if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
 			h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
 		} else if ok {
 			h.logger.Info("codex_auth_synced", "alias", next.Alias)
@@ -272,6 +272,14 @@ func (h *handler) refreshAccountTokens(ctx context.Context, account accounts.Acc
 }
 
 func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
+	return h.adoptFromCodexAuthWithNotify(account, now, true)
+}
+
+func (h *handler) adoptFromCodexAuthWithoutNotify(account accounts.Account, now time.Time) (accounts.Account, bool, error) {
+	return h.adoptFromCodexAuthWithNotify(account, now, false)
+}
+
+func (h *handler) adoptFromCodexAuthWithNotify(account accounts.Account, now time.Time, notify bool) (accounts.Account, bool, error) {
 	adopted, ok, err := codexauth.AdoptFromCodexAuth(account, now)
 	if err != nil || !ok {
 		return account, ok, err
@@ -281,8 +289,10 @@ func (h *handler) adoptFromCodexAuth(account accounts.Account, now time.Time) (a
 		h.logger.Warn("codex_auth_sync_persist_failed", "alias", account.Alias, "error", err)
 		persisted = adopted
 	}
-	if err := h.notifyAccountUpdate(persisted); err != nil {
-		h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+	if notify {
+		if err := h.notifyAccountUpdate(persisted); err != nil {
+			h.logger.Warn("account_sync_failed", "alias", account.Alias, "error", err)
+		}
 	}
 	return persisted, true, nil
 }
@@ -432,7 +442,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		// copy of a secondary account with a stale refresh token from the
 		// registry (which would make subsequent refresh attempts fail with
 		// "refresh token already used" and prevent recovery via adopt).
-		if adopted, ok, adoptErr := h.adoptFromCodexAuth(next, time.Now()); adoptErr != nil {
+		if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
 			h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
 		} else if ok {
 			h.logger.Info("codex_auth_synced", "alias", next.Alias)
