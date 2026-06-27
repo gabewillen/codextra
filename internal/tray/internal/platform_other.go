@@ -26,4 +26,9 @@ func (n *noopTray) RunUntil(stop <-chan struct{}) error {
 	}
 	return nil
 }
+func (n *noopTray) RunOnMain(fn func()) {
+	if fn != nil {
+		fn()
+	}
+}
 func (n *noopTray) Destroy() {}

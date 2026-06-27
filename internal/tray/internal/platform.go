@@ -13,6 +13,8 @@ type PlatformTray interface {
 	Bounds() (x, y, w, h int)
 	Run() error
 	RunUntil(stop <-chan struct{}) error
+	// RunOnMain schedules fn to execute on the message-loop (main) OS thread.
+	RunOnMain(fn func())
 	Destroy()
 }
 

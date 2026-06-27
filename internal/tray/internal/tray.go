@@ -113,6 +113,11 @@ func (t *Tray) RunUntil(stop <-chan struct{}) error {
 	return t.Platform.RunUntil(stop)
 }
 
+// RunOnMain schedules fn to run on the platform message-loop (main) OS thread.
+func (t *Tray) RunOnMain(fn func()) {
+	t.Platform.RunOnMain(fn)
+}
+
 // Remove destroys the tray icon and releases resources.
 func (t *Tray) Remove() {
 	t.Visible = false

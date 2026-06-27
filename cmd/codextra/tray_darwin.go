@@ -165,7 +165,17 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 	}
 }
 
+// updateTrayMenu builds the menu off the event-loop thread (store I/O, pure Go)
+// and then applies it via RunOnMain so the AppKit NSMenu/NSStatusItem mutation
+// happens on the message-loop thread, as AppKit requires.
 func updateTrayMenu(tray *systray.SystemTray, storePath string, requestRefresh func(), onActivate func(string) error) {
+	menu := buildTrayMenu(storePath, requestRefresh, onActivate)
+	tray.RunOnMain(func() {
+		tray.SetMenu(menu)
+	})
+}
+
+func buildTrayMenu(storePath string, requestRefresh func(), onActivate func(string) error) *systray.Menu {
 	trayLogf("updating tray menu")
 	now := time.Now()
 	snapshot, err := snapshotFromStore(storePath, now)
@@ -173,8 +183,7 @@ func updateTrayMenu(tray *systray.SystemTray, storePath string, requestRefresh f
 		log.Printf("codextra tray menu: failed to load account snapshot: %v", err)
 		menu := systray.NewMenu()
 		menu.AddDisabled("No account store: " + err.Error())
-		tray.SetMenu(menu)
-		return
+		return menu
 	}
 
 	all := append([]accounts.Account(nil), snapshot.Accounts...)
@@ -195,8 +204,7 @@ func updateTrayMenu(tray *systray.SystemTray, storePath string, requestRefresh f
 
 	if len(all) == 0 {
 		menu.AddDisabled("No accounts")
-		tray.SetMenu(menu)
-		return
+		return menu
 	}
 
 	ready, cooling, needsLogin := groupAccounts(all, now)
@@ -206,7 +214,7 @@ func updateTrayMenu(tray *systray.SystemTray, storePath string, requestRefresh f
 
 	trayLogf("menu built current=%q active=%q accountCount=%d ready=%d cooling=%d login=%d",
 		snapshot.CurrentAlias, snapshot.ActiveAlias, len(all), len(ready), len(cooling), len(needsLogin))
-	tray.SetMenu(menu)
+	return menu
 }
 
 func addAccountSection(menu *systray.Menu, title string, group []accounts.Account, currentAlias string, now time.Time, requestRefresh func(), onActivate func(string) error) {

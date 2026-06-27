@@ -119,6 +119,13 @@ func (t *SystemTray) RunUntil(stop <-chan struct{}) error {
 	return t.impl.RunUntil(stop)
 }
 
+// RunOnMain schedules fn to run on the message-loop (main) OS thread. Use this
+// to perform tray/menu mutations from a background goroutine, since the native
+// backends are not thread-safe.
+func (t *SystemTray) RunOnMain(fn func()) {
+	t.impl.RunOnMain(fn)
+}
+
 // Remove destroys the tray icon and releases all resources.
 func (t *SystemTray) Remove() {
 	t.impl.Remove()

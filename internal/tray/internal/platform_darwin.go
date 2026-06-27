@@ -196,6 +196,11 @@ type darwinTray struct {
 	iconData  []byte // stored PNG for recovery after Hide/Show
 	stopOnce  sync.Once
 
+	// mainCalls carries closures that must run on the event-loop (main) OS
+	// thread. AppKit is not thread-safe, so off-thread callers (e.g. the menu
+	// refresh ticker) enqueue work here for RunUntil to execute on-thread.
+	mainCalls chan func()
+
 	// menuActions maps menu item indices to their callbacks.
 	// Populated when SetMenu builds the NSMenu hierarchy.
 	menuActions map[int]func()
@@ -219,6 +224,20 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 		callbacks:   callbacks,
 		menuActions: make(map[int]func()),
 		stop:        make(chan struct{}),
+		mainCalls:   make(chan func(), 64),
+	}
+}
+
+// RunOnMain enqueues fn to run on the event-loop (main) OS thread. It never
+// blocks: if the queue is saturated the update is dropped, and the next refresh
+// reconciles state. fn must not itself block on the event loop.
+func (t *darwinTray) RunOnMain(fn func()) {
+	if fn == nil {
+		return
+	}
+	select {
+	case t.mainCalls <- fn:
+	default:
 	}
 }
 
@@ -749,6 +768,20 @@ func (t *darwinTray) RunUntil(stop <-chan struct{}) error {
 		case <-stop:
 			return nil
 		default:
+		}
+
+		// Run any work queued for the main thread (e.g. menu rebuilds) before
+		// pumping events so AppKit mutations happen on this OS thread.
+	drainMainCalls:
+		for {
+			select {
+			case fn := <-t.mainCalls:
+				if fn != nil {
+					fn()
+				}
+			default:
+				break drainMainCalls
+			}
 		}
 
 		// [NSApp nextEventMatchingMask:untilDate:inMode:dequeue:]

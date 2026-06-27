@@ -74,6 +74,11 @@ func runForever() error {
 			return err
 		}
 		log.Printf("restarting to pick up upgraded codextra binary")
+		// Re-exec the on-disk binary so the upgrade actually loads the new
+		// build; on success this replaces the process and never returns.
+		if err := reexecSelf(); err != nil {
+			log.Printf("re-exec failed; continuing with current binary: %v", err)
+		}
 	}
 }
 
@@ -216,16 +221,25 @@ func run() error {
 				select {
 				case err := <-runDone:
 					commandRunning.Store(false)
-					stopTray()
 					if restartPending {
+						stopTray()
 						trayDone <- errRestartRequested
 						return
 					}
-					if errors.Is(err, context.Canceled) {
-						trayDone <- nil
+					if err != nil && !errors.Is(err, context.Canceled) {
+						stopTray()
+						trayDone <- err
 						return
 					}
-					trayDone <- err
+					if options.desktop && codexDesktopShouldKeepAlive(userArgs) {
+						// The desktop app detaches immediately; keep the tray and
+						// proxy alive until codextra is signaled to shut down,
+						// matching the non-tray keepalive path.
+						log.Printf("desktop app launched; codextra tray stays active until quit")
+						continue
+					}
+					stopTray()
+					trayDone <- nil
 					return
 				case <-restartReqs:
 					if !commandRunning.Load() {
@@ -291,6 +305,12 @@ func run() error {
 }
 
 func runProxyServer(ctx context.Context) error {
+	// The detached proxy shares the codextra binary name, so the installer's
+	// upgrade SIGUSR1 also lands here. The proxy is upgraded separately via the
+	// proxyStateVersion check, so ignore the signal rather than letting its
+	// default action kill the proxy mid-install.
+	ignoreUpgradeSignal()
+
 	storePath, err := defaultStorePath()
 	if err != nil {
 		return err
