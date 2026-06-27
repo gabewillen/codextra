@@ -631,12 +631,60 @@ func TestProxyAdoptsCodexAuthOnReactiveRefreshWithoutOAuthCall(t *testing.T) {
 	}
 }
 
-func TestTokenExpiredMarkerDetects401Payload(t *testing.T) {
-	t.Parallel()
+func TestProxyReactivelyRefreshesOnUnrecognized401(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
 
-	body := []byte(`{"error":{"code":"token_expired"},"status":401}`)
-	if !tokenExpiredMarker(body) {
-		t.Fatal("tokenExpiredMarker() = false, want true")
+	freshToken := freshJWT(t)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			// token_invalidated (session revoked, e.g. rotating refresh token
+			// used elsewhere) is not token_expired but must still trigger
+			// reactive recovery — any 401 means re-mint credentials and retry.
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Your authentication token has been invalidated. Please try signing in again.",
+					"type":    "invalid_request_error",
+					"code":    "token_invalidated",
+				},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "refreshed")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  freshToken,
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + freshToken, "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
 	}
 }
 
@@ -1368,9 +1416,11 @@ func TestProxyWebSocketAdoptsCodexAuthForRotationTargetBeforeNotify(t *testing.T
 func TestProxyWebSocketCopiesPreUpgradeError(t *testing.T) {
 	t.Parallel()
 
+	// Use a non-401 status: 401 now triggers reactive token recovery, so a
+	// plain forbidden response keeps this focused on the pre-upgrade relay path.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"detail":"Unauthorized"}`))
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"Forbidden"}`))
 	}))
 	defer upstream.Close()
 
@@ -1383,15 +1433,15 @@ func TestProxyWebSocketCopiesPreUpgradeError(t *testing.T) {
 
 	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
 	defer conn.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll(body) error = %v", err)
 	}
-	if !strings.Contains(string(body), "Unauthorized") {
-		t.Fatalf("body = %q, want unauthorized detail", string(body))
+	if !strings.Contains(string(body), "Forbidden") {
+		t.Fatalf("body = %q, want forbidden detail", string(body))
 	}
 }
 

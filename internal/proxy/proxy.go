@@ -153,7 +153,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
 			resp.Body.Close()
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
@@ -400,7 +400,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
 			resp.Body.Close()
 			upstreamConn.Close()
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
@@ -598,27 +598,6 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, value)
 		}
 	}
-}
-
-func isTokenExpired(resp *http.Response) bool {
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return tokenExpiredMarker(body)
-}
-
-func tokenExpiredMarker(body []byte) bool {
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Code == "token_expired" {
-		return true
-	}
-	return jsonHasStringValue(body, "token_expired")
 }
 
 func isUsageLimit(resp *http.Response) bool {
