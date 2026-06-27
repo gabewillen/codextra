@@ -249,6 +249,15 @@ func run() error {
 						trayDone <- err
 						return
 					}
+					// An upgrade signal can race in just as the child exits;
+					// honor a buffered request instead of exiting without re-exec.
+					select {
+					case <-restartReqs:
+						stopTray()
+						trayDone <- errRestartRequested
+						return
+					default:
+					}
 					if options.desktop && codexDesktopShouldKeepAlive(userArgs) {
 						// The desktop app detaches immediately; keep the tray and
 						// proxy alive until codextra is signaled to shut down,
@@ -309,6 +318,14 @@ func run() error {
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				return err
+			}
+			// An upgrade signal can race in just as the child exits; select may
+			// take runDone first, so honor a buffered request rather than
+			// exiting without re-exec.
+			select {
+			case <-restartReqs:
+				return errRestartRequested
+			default:
 			}
 			return keepProxyAliveForDesktop(err)
 		case <-restartReqs:
@@ -1124,6 +1141,13 @@ func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error)
 		return 0, 0, fmt.Errorf("fetch wham/usage: %w", err)
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		// Error responses (401, 502, HTML pages) can decode as an empty
+		// rate_limit map without a JSON error; surface them so the caller does
+		// not persist a bogus zero usage and blank the spotlight.
+		return 0, 0, fmt.Errorf("wham/usage status %s", res.Status)
+	}
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {

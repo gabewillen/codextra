@@ -360,6 +360,59 @@ func (id ID) SendInt(sel SEL, arg int64) ID {
 	return msgSend(id, sel, uintptr(arg))
 }
 
+// SendReturnInt sends a zero-argument message whose return type is a native
+// signed integer (NSInteger), e.g. -[NSMenuItem tag]. objc_msgSend must be
+// invoked with an integer-return call interface; reusing the pointer-return
+// path (Send) can mis-decode the value, so callers reading NSInteger results
+// must use this method.
+func (id ID) SendReturnInt(sel SEL) int64 {
+	if id == 0 || sel == 0 {
+		return 0
+	}
+
+	if err := initRuntime(); err != nil {
+		return 0
+	}
+
+	argTypes := []*types.TypeDescriptor{
+		types.PointerTypeDescriptor, // self
+		types.PointerTypeDescriptor, // _cmd
+	}
+
+	cif := &types.CallInterface{}
+	if err := ffi.PrepareCallInterface(
+		cif,
+		types.DefaultCall,
+		types.SInt64TypeDescriptor,
+		argTypes,
+	); err != nil {
+		return 0
+	}
+
+	argBox := &struct {
+		self uintptr
+		cmd  uintptr
+	}{
+		self: uintptr(id),
+		cmd:  uintptr(sel),
+	}
+
+	var result int64
+	if err := ffi.CallFunction(
+		cif,
+		rt.objcMsgSend,
+		unsafe.Pointer(&result),
+		[]unsafe.Pointer{
+			unsafe.Pointer(&argBox.self),
+			unsafe.Pointer(&argBox.cmd),
+		},
+	); err != nil {
+		return 0
+	}
+
+	return result
+}
+
 // SendSize sends a message with an NSSize argument.
 func (id ID) SendSize(sel SEL, size NSSize) ID {
 	if id == 0 || sel == 0 {

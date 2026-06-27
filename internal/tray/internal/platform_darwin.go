@@ -326,10 +326,11 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 			if activeTray == nil {
 				return 0
 			}
-			// Get the tag from the sender: [sender tag]
+			// Get the tag from the sender: [sender tag]. tag returns NSInteger,
+			// so it must use the integer-return call interface; the pointer-return
+			// Send can mis-decode it and route the click to the wrong handler.
 			tagSel := darwin.RegisterSelector("tag")
-			tag := darwin.ID(sender).Send(tagSel)
-			idx := int(tag)
+			idx := int(darwin.ID(sender).SendReturnInt(tagSel))
 
 			activeTray.menuMu.Lock()
 			fn := activeTray.menuActions[idx]
