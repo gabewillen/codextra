@@ -153,8 +153,8 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
-			resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
+			drainAndClose(resp)
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
@@ -400,7 +400,7 @@ func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed && isTokenExpired(resp) {
+		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
 			resp.Body.Close()
 			upstreamConn.Close()
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
@@ -567,6 +567,23 @@ func (h *handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, upstre
 	wg.Wait()
 }
 
+// maxDrainOnRetry bounds how much of an unused upstream body drainAndClose
+// reads back before closing. net/http only returns a connection to its pool
+// once the body is read to EOF, but we cap the drain so an oversized or hostile
+// body can't stall the retry.
+const maxDrainOnRetry = 16 << 10
+
+// drainAndClose discards up to maxDrainOnRetry bytes of an unread response body
+// and then closes it, letting the transport reuse the connection for the retry
+// instead of tearing it down and re-dialing.
+func drainAndClose(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.CopyN(io.Discard, resp.Body, maxDrainOnRetry)
+	resp.Body.Close()
+}
+
 func copyResponse(w http.ResponseWriter, resp *http.Response, captureLimit int) ([]byte, error) {
 	defer resp.Body.Close()
 	copyHeader(w.Header(), resp.Header)
@@ -598,27 +615,6 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, value)
 		}
 	}
-}
-
-func isTokenExpired(resp *http.Response) bool {
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return tokenExpiredMarker(body)
-}
-
-func tokenExpiredMarker(body []byte) bool {
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Code == "token_expired" {
-		return true
-	}
-	return jsonHasStringValue(body, "token_expired")
 }
 
 func isUsageLimit(resp *http.Response) bool {
