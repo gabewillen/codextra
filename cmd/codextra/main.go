@@ -263,8 +263,14 @@ func run() error {
 					restartPending = true
 					log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
 					if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
+						// Cancellation mid-wait means the user is shutting down;
+						// exit cleanly rather than reporting a failure.
 						stopTray()
-						trayDone <- err
+						if errors.Is(err, context.Canceled) {
+							trayDone <- nil
+						} else {
+							trayDone <- err
+						}
 						return
 					}
 					log.Printf("restarting codextra wrapper")
@@ -312,6 +318,11 @@ func run() error {
 			restartPending = true
 			log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
 			if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
+				// Cancellation mid-wait means the user is shutting down; exit
+				// cleanly rather than reporting a failure.
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
 				return err
 			}
 			log.Printf("restarting codextra wrapper")
@@ -1057,6 +1068,24 @@ func activateAccount(alias string) (accounts.Account, error) {
 }
 
 func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string) {
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		log.Printf("codextra usage store: %v", err)
+		return
+	}
+
+	// Capture the active account before the fetch: the proxy serves /wham/usage
+	// for whichever account is active, so the result belongs to this alias.
+	before, err := store.Snapshot(time.Now())
+	if err != nil {
+		log.Printf("codextra usage snapshot: %v", err)
+		return
+	}
+	alias := before.CurrentAlias
+	if alias == "" {
+		return
+	}
+
 	usageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -1066,21 +1095,20 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 		return
 	}
 
-	var store *accounts.Store
-	if store, err = accounts.LoadStore(storePath); err != nil {
-		log.Printf("codextra usage store: %v", err)
-		return
-	}
-	now := time.Now()
-	snapshot, err := store.Snapshot(now)
+	// If the active account changed while the request was in flight, the usage
+	// may belong to a different account; skip the write to avoid attributing it
+	// to the wrong one. The post-switch refresh fetches fresh data for the new
+	// account.
+	after, err := store.Snapshot(time.Now())
 	if err != nil {
 		log.Printf("codextra usage snapshot: %v", err)
 		return
 	}
-	if snapshot.CurrentAlias == "" {
+	if after.CurrentAlias != alias {
 		return
 	}
-	if err := store.UpdateUsage(snapshot.CurrentAlias, percent, resetAt); err != nil {
+
+	if err := store.UpdateUsage(alias, percent, resetAt); err != nil {
 		log.Printf("codextra usage update: %v", err)
 	}
 }
