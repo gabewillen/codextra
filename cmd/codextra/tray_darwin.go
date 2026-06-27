@@ -336,8 +336,14 @@ func formatAccountMenuLabel(account accounts.Account, currentAlias string, now t
 		return fmt.Sprintf("%s  %s  ·  %s %s",
 			accountGlyph(account, now), alias, reason, humanizeDuration(disabledUntil.Sub(now)))
 	}
-	return fmt.Sprintf("%s  %s   %s  %d%%",
-		accountGlyph(account, now), alias, usageBar(account.UsagePercent, 10), account.UsagePercent)
+	// Usage is fetched through the proxy for the active account only, so only the
+	// current account has fresh data. Rendering a meter for the others would show
+	// stale percentages, so inactive ready rows show just the alias.
+	if account.Alias == currentAlias {
+		return fmt.Sprintf("%s  %s   %s  %d%%",
+			accountGlyph(account, now), alias, usageBar(account.UsagePercent, 10), account.UsagePercent)
+	}
+	return fmt.Sprintf("%s  %s", accountGlyph(account, now), alias)
 }
 
 func accountGlyph(account accounts.Account, now time.Time) string {
