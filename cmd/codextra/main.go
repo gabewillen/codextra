@@ -75,9 +75,12 @@ func runForever() error {
 		}
 		log.Printf("restarting to pick up upgraded codextra binary")
 		// Re-exec the on-disk binary so the upgrade actually loads the new
-		// build; on success this replaces the process and never returns.
+		// build; on success this replaces the process and never returns. If it
+		// fails, surface the error instead of looping back into run() — the
+		// child was already stopped for the restart, so re-running would spawn
+		// a fresh codex session the user did not ask for.
 		if err := reexecSelf(); err != nil {
-			log.Printf("re-exec failed; continuing with current binary: %v", err)
+			return fmt.Errorf("upgrade re-exec failed: %w", err)
 		}
 	}
 }
@@ -176,12 +179,22 @@ func run() error {
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 
-	keepProxyAliveForDesktop := func(err error) {
-		if err != nil || !options.desktop || !codexDesktopShouldKeepAlive(userArgs) {
-			return
+	keepProxyAliveForDesktop := func(cmdErr error) error {
+		if cmdErr != nil || !options.desktop || !codexDesktopShouldKeepAlive(userArgs) {
+			return nil
 		}
 		log.Printf("desktop app launched; press Ctrl+C to stop codextra proxy keepalive")
-		<-ctx.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-restartReqs:
+				// The codex child is already gone, so there is nothing to drain;
+				// restart the wrapper directly to pick up the upgraded binary.
+				log.Printf("codextra received upgrade signal; restarting codextra wrapper")
+				return errRestartRequested
+			}
+		}
 	}
 
 	var stopCommandOnce sync.Once
@@ -242,16 +255,21 @@ func run() error {
 					trayDone <- nil
 					return
 				case <-restartReqs:
-					if !commandRunning.Load() {
-						continue
-					}
 					restartPending = true
 					log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
 					if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
+						stopTray()
 						trayDone <- err
 						return
 					}
 					log.Printf("restarting codextra wrapper")
+					if !commandRunning.Load() {
+						// The codex child already exited (desktop keepalive); there
+						// is nothing to stop, so restart the wrapper directly.
+						stopTray()
+						trayDone <- errRestartRequested
+						return
+					}
 					stopCmd()
 				case <-ctx.Done():
 					err := waitCommand()
@@ -281,8 +299,7 @@ func run() error {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				return err
 			}
-			keepProxyAliveForDesktop(err)
-			return nil
+			return keepProxyAliveForDesktop(err)
 		case <-restartReqs:
 			if !commandRunning.Load() {
 				continue
@@ -1092,20 +1109,21 @@ func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error)
 		ResetAt     int64 `json:"reset_at"`
 	}
 	maxPercent := 0
-	var latestReset int64
+	var resetAt int64
 	for _, raw := range payload.RateLimit {
 		var window rateWindow
 		if err := json.Unmarshal(raw, &window); err != nil {
 			continue
 		}
+		// Pair the reset countdown with the window that drives the displayed
+		// peak usage so the tray spotlight shows a consistent bucket, rather
+		// than the peak percent next to an unrelated window's reset time.
 		if window.UsedPercent > maxPercent {
 			maxPercent = window.UsedPercent
-		}
-		if window.ResetAt > latestReset {
-			latestReset = window.ResetAt
+			resetAt = window.ResetAt
 		}
 	}
-	return maxPercent, latestReset, nil
+	return maxPercent, resetAt, nil
 }
 
 func codextraDir() (string, error) {
