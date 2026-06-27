@@ -78,10 +78,12 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 
 	trayCtx, cancel := context.WithCancel(ctx)
 	runnerStopped := make(chan struct{})
+	runnerExited := make(chan struct{})
 	stopped := make(chan struct{})
 	refreshNow := make(chan struct{}, 1)
 	var stopOnce sync.Once
 	var closeRunnerOnce sync.Once
+	var runnerExitOnce sync.Once
 	closeRunner := func() {
 		closeRunnerOnce.Do(func() { close(runnerStopped) })
 	}
@@ -96,7 +98,19 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 		// event loop. Running it here keeps Remove off background goroutines
 		// so stopTray never blocks waiting on the main thread.
 		sysTray.Remove()
+		runnerExitOnce.Do(func() { close(runnerExited) })
 		return err
+	})
+
+	// On a forced exit (second signal or shutdown timeout) the deferred
+	// stopTray never runs, so ask the event-loop thread to remove the status
+	// item and wait briefly for it rather than stranding the menu bar icon.
+	registerPreExitCleanup(func() {
+		closeRunner()
+		select {
+		case <-runnerExited:
+		case <-time.After(500 * time.Millisecond):
+		}
 	})
 
 	requestRefresh := func() {

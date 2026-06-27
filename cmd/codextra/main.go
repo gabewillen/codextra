@@ -43,6 +43,30 @@ func main() {
 
 var errRestartRequested = errors.New("upgrade restart requested")
 
+// preExitCleanup runs platform cleanup (notably removing the macOS tray status
+// item) before a forced os.Exit so a hard shutdown doesn't strand resources that
+// the deferred cleanup path would otherwise handle.
+var (
+	preExitCleanupMu sync.Mutex
+	preExitCleanup   func()
+)
+
+func registerPreExitCleanup(fn func()) {
+	preExitCleanupMu.Lock()
+	preExitCleanup = fn
+	preExitCleanupMu.Unlock()
+}
+
+func forcedExit() {
+	preExitCleanupMu.Lock()
+	fn := preExitCleanup
+	preExitCleanupMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	os.Exit(130)
+}
+
 func runForever() error {
 	for {
 		err := run()
@@ -72,9 +96,9 @@ func run() error {
 		case <-shutdownDone:
 			return
 		case <-sigCh:
-			os.Exit(130)
+			forcedExit()
 		case <-timer.C:
-			os.Exit(130)
+			forcedExit()
 		}
 	}()
 
@@ -213,7 +237,7 @@ func run() error {
 						trayDone <- err
 						return
 					}
-					log.Printf("proxy idle; restarting codextra wrapper")
+					log.Printf("restarting codextra wrapper")
 					stopCmd()
 				case <-ctx.Done():
 					err := waitCommand()
@@ -254,7 +278,7 @@ func run() error {
 			if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
 				return err
 			}
-			log.Printf("proxy idle; restarting codextra wrapper")
+			log.Printf("restarting codextra wrapper")
 			stopCmd()
 		case <-ctx.Done():
 			err := waitCommand()
@@ -315,7 +339,12 @@ func runProxyServer(ctx context.Context) error {
 		_ = server.Shutdown(shutdownCtx)
 	})
 	activity := newProxyActivityTracker()
-	server.Handler = newProxyActivityHandler(newRoutePrefixHandler(routePrefix, lifecycle), activity)
+	// Strip the route prefix before the activity/lifecycle handlers inspect the
+	// path. Clients reach these control endpoints at proxyURL ("/<prefix>/__codextra/...")
+	// so the prefix must be trimmed first; otherwise the prefixed health endpoint
+	// would skip request tracking and the long-lived client connection would be
+	// counted as active traffic forever.
+	server.Handler = newRoutePrefixHandler(routePrefix, newProxyActivityHandler(lifecycle, activity))
 
 	listenURL := "http://" + listener.Addr().String()
 	proxyURL := listenURL + routePrefix
@@ -467,7 +496,10 @@ func waitForProxyIdle(ctx context.Context, proxyURL string, timeout time.Duratio
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("upgrade waits for active requests until timeout")
+			// Per the documented contract, give up waiting after the timeout and
+			// restart anyway rather than aborting the upgrade.
+			log.Printf("codextra upgrade wait timed out after %s; restarting with traffic still in flight", timeout)
+			return nil
 		}
 		select {
 		case <-ctx.Done():

@@ -17,7 +17,7 @@ notify_running_codextra() {
 	fi
 	if ! pgrep -x codextra >/dev/null 2>&1; then
 		return
-	}
+	fi
 	pkill -USR1 -x codextra || true
 }
 

@@ -414,6 +414,9 @@ func (t *darwinTray) SetTooltip(text string) error {
 	if nsStr.IsNil() {
 		return errors.New("darwin: failed to create NSString for tooltip")
 	}
+	// NewNSString returns a retained (+1) object; setToolTip: copies it, so
+	// release our reference once it has been handed off to avoid leaking.
+	defer nsStr.Send(darwinSels.release)
 
 	// [button setToolTip:nsString]
 	t.btn.SendPtr(darwinSels.setToolTip, nsStr.Ptr())
@@ -427,11 +430,19 @@ func (t *darwinTray) SetMenu(menu *Menu) error {
 		return errors.New("darwin: tray not created")
 	}
 
+	// The previous menu is rebuilt on every refresh tick. buildNSMenu hands us a
+	// retained (+1) NSMenu; once the new one is attached, release our reference
+	// to the old one so periodic rebuilds don't leak menus unboundedly.
+	prevMenu := t.nsMenu
+
 	if menu == nil {
 		// Remove the menu. When no menu is set, the button action (trayClicked:)
 		// fires on click.
 		t.statusItem.SendPtr(darwinSels.setMenu, 0)
 		t.nsMenu = 0
+		if !prevMenu.IsNil() {
+			prevMenu.Send(darwinSels.release)
+		}
 		return nil
 	}
 
@@ -452,6 +463,12 @@ func (t *darwinTray) SetMenu(menu *Menu) error {
 	// [statusItem setMenu:nsMenu]
 	t.statusItem.SendPtr(darwinSels.setMenu, nsMenu.Ptr())
 
+	// setMenu: retained the new menu and released the status item's hold on the
+	// old one; drop our own +1 reference to the replaced menu.
+	if !prevMenu.IsNil() {
+		prevMenu.Send(darwinSels.release)
+	}
+
 	return nil
 }
 
@@ -470,6 +487,8 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 	if title != "" {
 		nsTitle := darwin.NewNSString(title)
 		nsMenu = nsMenu.SendPtr(darwinSels.initWithTitle, nsTitle.Ptr())
+		// initWithTitle: copies the string; release our retained reference.
+		nsTitle.Send(darwinSels.release)
 	} else {
 		nsMenu = nsMenu.Send(darwinSels.init)
 	}
@@ -497,6 +516,9 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 			nsItem := darwinClasses.NSMenuItem.Send(darwinSels.alloc)
 			nsItem = darwin.MsgSend3Ptr(nsItem, darwinSels.initWithTitleActionKeyEquiv,
 				nsLabel.Ptr(), 0, emptyKey.Ptr())
+			// initWithTitle:action:keyEquivalent: copies its string args; release ours.
+			nsLabel.Send(darwinSels.release)
+			emptyKey.Send(darwinSels.release)
 			if nsItem.IsNil() {
 				continue
 			}
@@ -505,14 +527,18 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 			subMenu := t.buildNSMenu(item.Label, item.Submenu, counter)
 			if !subMenu.IsNil() {
 				nsItem.SendPtr(darwinSels.setSubmenu, subMenu.Ptr())
+				// setSubmenu: retains the submenu; release our +1 alloc reference.
+				subMenu.Send(darwinSels.release)
 			}
 
 			nsMenu.SendPtr(darwinSels.addItem, nsItem.Ptr())
+			// addItem: retains the item; release our +1 alloc reference.
+			nsItem.Send(darwinSels.release)
 
 		default:
 			// Normal or checkbox item.
 			idx := *counter
-			*counter++
+			(*counter)++
 
 			nsLabel := darwin.NewNSString(item.Label)
 			emptyKey := darwin.NewNSString("")
@@ -525,6 +551,9 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 			}
 			nsItem = darwin.MsgSend3Ptr(nsItem, darwinSels.initWithTitleActionKeyEquiv,
 				nsLabel.Ptr(), action, emptyKey.Ptr())
+			// initWithTitle:action:keyEquivalent: copies its string args; release ours.
+			nsLabel.Send(darwinSels.release)
+			emptyKey.Send(darwinSels.release)
 			if nsItem.IsNil() {
 				continue
 			}
@@ -565,6 +594,8 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 			}
 
 			nsMenu.SendPtr(darwinSels.addItem, nsItem.Ptr())
+			// addItem: retains the item; release our +1 alloc reference.
+			nsItem.Send(darwinSels.release)
 		}
 	}
 
