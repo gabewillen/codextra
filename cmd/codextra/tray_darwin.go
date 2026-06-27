@@ -283,9 +283,15 @@ func accountGlyph(account accounts.Account, now time.Time) string {
 	return "●"
 }
 
-// usageBar renders a fixed-width unicode gauge. width is the number of cells.
-// percent is clamped to [0,100]; "filled" cells use a solid block, the rest
-// use a light shade.
+// usagePartials are the left-aligned block fragments for sub-cell fill, indexed
+// by eighths: index 1 is ▏ (1/8) … index 7 is ▉ (7/8). A full cell uses █.
+var usagePartials = [8]string{"", "▏", "▎", "▍", "▌", "▋", "▊", "▉"}
+
+// usageBar renders a fixed-width unicode meter. width is the number of cells.
+// percent is clamped to [0,100] and resolved to eighth-of-a-cell precision, so
+// the fill edge lands close to the true value instead of snapping to whole
+// cells. Filled cells use a solid block (█), the leading edge a partial block,
+// and the remaining track a light shade (░).
 func usageBar(percent, width int) string {
 	if width <= 0 {
 		return ""
@@ -296,14 +302,28 @@ func usageBar(percent, width int) string {
 	if percent > 100 {
 		percent = 100
 	}
-	filled := percent * width / 100
-	if filled == 0 && percent > 0 {
-		filled = 1
+
+	// Work in eighths of a cell for smooth sub-cell resolution.
+	eighths := percent * width * 8 / 100
+	if eighths == 0 && percent > 0 {
+		eighths = 1 // never show an empty meter for non-zero usage
 	}
-	if filled > width {
-		filled = width
+	full := eighths / 8
+	rem := eighths % 8
+	if full > width {
+		full, rem = width, 0
 	}
-	return strings.Repeat("▰", filled) + strings.Repeat("▱", width-filled)
+
+	var b strings.Builder
+	b.Grow(width * 3)
+	b.WriteString(strings.Repeat("█", full))
+	empty := width - full
+	if rem > 0 && empty > 0 {
+		b.WriteString(usagePartials[rem])
+		empty--
+	}
+	b.WriteString(strings.Repeat("░", empty))
+	return b.String()
 }
 
 func displayAlias(alias string) string {
