@@ -141,8 +141,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	refreshAccountUsage(ctx, proxyURL, storePath)
-	stopTray := startTray(ctx, storePath, func(alias string) error {
+	stopTray := startTray(ctx, storePath, proxyURL, func(alias string) error {
 		_, err := activateAccount(alias)
 		if err != nil {
 			return err

@@ -27,6 +27,7 @@ import (
 )
 
 const trayRefreshInterval = 5 * time.Second
+const trayUsageRefreshInterval = 30 * time.Second
 const trayDebugEnv = "CODEXTRA_TRAY_DEBUG"
 const codexLogoSVGPath = "codextra-logo.svg"
 
@@ -54,7 +55,7 @@ func takeTrayRunner() func() error {
 	return runner
 }
 
-func startTray(ctx context.Context, storePath string, onActivate func(string) error) func() {
+func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(string) error) func() {
 	trayLogf("startTray requested, storePath=%s", storePath)
 
 	if os.Getenv("CODEXTRA_NO_TRAY") == "1" {
@@ -133,6 +134,42 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 		requestRefresh()
 	}
 
+	// Usage data is fetched through the proxy, which must not happen on the
+	// AppKit event-loop thread, so it lives in its own goroutine that writes the
+	// store; the menu ticker then renders the refreshed values from disk.
+	refreshUsageNow := make(chan struct{}, 1)
+	triggerUsageRefresh := func() {
+		select {
+		case refreshUsageNow <- struct{}{}:
+		default:
+		}
+	}
+
+	// Refresh usage after an account switch so the spotlight reflects the newly
+	// active account rather than the previous one's launch-time values.
+	activate := func(alias string) error {
+		if err := onActivate(alias); err != nil {
+			return err
+		}
+		triggerUsageRefresh()
+		return nil
+	}
+
+	go func() {
+		usageTicker := time.NewTicker(trayUsageRefreshInterval)
+		defer usageTicker.Stop()
+		for {
+			refreshAccountUsage(trayCtx, proxyURL, storePath)
+			requestRefresh()
+			select {
+			case <-trayCtx.Done():
+				return
+			case <-usageTicker.C:
+			case <-refreshUsageNow:
+			}
+		}
+	}()
+
 	refreshNow <- struct{}{}
 	go func() {
 		defer close(stopped)
@@ -141,7 +178,7 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 		defer ticker.Stop()
 		trayLogf("started tray update ticker interval=%s", trayRefreshInterval)
 
-		updateTrayMenu(sysTray, storePath, trigger, onActivate)
+		updateTrayMenu(sysTray, storePath, trigger, activate)
 		for {
 			select {
 			case <-trayCtx.Done():
@@ -149,10 +186,10 @@ func startTray(ctx context.Context, storePath string, onActivate func(string) er
 				return
 			case <-ticker.C:
 				trayLogf("tray update ticker tick")
-				updateTrayMenu(sysTray, storePath, trigger, onActivate)
+				updateTrayMenu(sysTray, storePath, trigger, activate)
 			case <-refreshNow:
 				trayLogf("tray update requested")
-				updateTrayMenu(sysTray, storePath, trigger, onActivate)
+				updateTrayMenu(sysTray, storePath, trigger, activate)
 			}
 		}
 	}()
