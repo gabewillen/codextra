@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -28,6 +29,13 @@ import (
 const trayRefreshInterval = 5 * time.Second
 const trayDebugEnv = "CODEXTRA_TRAY_DEBUG"
 const codexLogoSVGPath = "codextra-logo.svg"
+
+// codexLogoSVG is the tray icon source, embedded so installed binaries that
+// ship only the executable still render the icon (no dependency on the process
+// working directory or a source checkout).
+//
+//go:embed codextra-logo.svg
+var codexLogoSVG []byte
 
 var trayRunnerMu sync.Mutex
 var trayRunner func() error
@@ -412,7 +420,7 @@ func trayIconPNG() ([]byte, error) {
 	const offsetX = (size - viewBox*scale) / 2
 	const logoOffsetY = (size-viewBox*scale)/2 - 2
 
-	logoPaths, err := loadSVGPaths(codexLogoSVGPath)
+	logoPaths, err := loadLogoSVGPaths()
 	if err != nil {
 		return nil, err
 	}
@@ -455,6 +463,20 @@ func trayIconPNG() ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// loadLogoSVGPaths prefers the embedded logo so installed binaries always have
+// it, then falls back to scanning the working directory for a source-checkout
+// override (handy when iterating on the icon during development).
+func loadLogoSVGPaths() ([]string, error) {
+	if len(codexLogoSVG) > 0 {
+		paths, err := loadSVGPathsFromBlob("codextra-logo.svg (embedded)", codexLogoSVG)
+		if err == nil {
+			return paths, nil
+		}
+		log.Printf("codextra tray icon: embedded svg parse failed, trying disk: %v", err)
+	}
+	return loadSVGPaths(codexLogoSVGPath)
 }
 
 func loadSVGPaths(path string) ([]string, error) {

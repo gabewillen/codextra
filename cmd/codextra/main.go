@@ -189,9 +189,15 @@ func run() error {
 			case <-ctx.Done():
 				return nil
 			case <-restartReqs:
-				// The codex child is already gone, so there is nothing to drain;
-				// restart the wrapper directly to pick up the upgraded binary.
-				log.Printf("codextra received upgrade signal; restarting codextra wrapper")
+				// The codex child is already gone, but proxied requests from the
+				// detached desktop app may still be in flight; wait for the proxy
+				// to drain (or time out) before re-exec, as the other paths do.
+				log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
+				if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
+					// ctx canceled mid-wait — treat as a normal shutdown.
+					return nil
+				}
+				log.Printf("restarting codextra wrapper")
 				return errRestartRequested
 			}
 		}
