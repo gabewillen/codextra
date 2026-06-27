@@ -89,8 +89,13 @@ func Write(path string, account accounts.Account) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("create codex auth directory: %w", err)
 	}
-	if err := os.WriteFile(path, append(bytes, '\n'), 0600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(bytes, '\n'), 0600); err != nil {
 		return fmt.Errorf("write codex auth: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace codex auth: %w", err)
 	}
 	return nil
 }

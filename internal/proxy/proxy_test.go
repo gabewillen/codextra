@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,12 +12,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gabewillen/codextra/internal/accounts"
+	"github.com/gabewillen/codextra/internal/codexauth"
 )
 
 func TestProxyForwardsWithActiveAccountAuth(t *testing.T) {
@@ -121,6 +127,956 @@ func TestProxyRotatesOnUsageLimitBeforeReturningResponse(t *testing.T) {
 	}
 	if got := store.Data.Accounts[0].DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
 		t.Fatalf("personal disabled reset = %d, want %d", got, resetAt.Unix())
+	}
+}
+
+func TestProxyAdoptsCodexAuthForRotationTargetBeforeNotify(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	const accountID = "acct-work"
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	writeCodexAuth(t, codexHome, codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-work-live",
+			AccountID:    accountID,
+		},
+	})
+
+	var tokens []string
+	resetAt := time.Unix(1_700_000_123, 0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.Header().Set("x-codex-active-limit", "codex_weekly")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type":      "usage_limit_reached",
+					"resets_at": resetAt.Unix(),
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "rotated")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: stale, RefreshToken: "refresh-work-old", AccountID: accountID},
+		},
+	})
+	var synced []accounts.Account
+	server := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnAccountUpdate: func(account accounts.Account) error {
+			synced = append(synced, account)
+			return nil
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", resp.Code, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer token-personal", "Bearer " + fresh}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+	if store.Data.Accounts[1].RefreshToken != "refresh-work-live" {
+		t.Fatalf("stored RefreshToken = %q, want refresh-work-live", store.Data.Accounts[1].RefreshToken)
+	}
+	if len(synced) != 1 {
+		t.Fatalf("OnAccountUpdate calls = %d, want 1", len(synced))
+	}
+	if synced[0].AccessToken != fresh {
+		t.Fatalf("synced AccessToken mismatch (got %s, want %s)", redactTestSecret(synced[0].AccessToken), redactTestSecret(fresh))
+	}
+	if synced[0].RefreshToken != "refresh-work-live" {
+		t.Fatalf("synced RefreshToken = %q, want refresh-work-live", synced[0].RefreshToken)
+	}
+}
+
+func TestProxyReactivelyRefreshesAfterRotatingAccounts(t *testing.T) {
+	refreshCalls := 0
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		var req struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(refresh) error = %v", err)
+		}
+		switch req.RefreshToken {
+		case "refresh-personal":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token":  "token-personal-new",
+				"refresh_token": "refresh-personal-new",
+			})
+		case "refresh-work":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token":  "token-work-new",
+				"refresh_token": "refresh-work-new",
+			})
+		default:
+			t.Fatalf("refresh token = %q, want refresh-personal or refresh-work", req.RefreshToken)
+		}
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	resetAt := time.Unix(1_700_000_123, 0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-personal":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "token_expired"}})
+		case "Bearer token-personal-new":
+			w.Header().Set("x-codex-active-limit", "codex_weekly")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type":      "usage_limit_reached",
+					"resets_at": resetAt.Unix(),
+				},
+			})
+		case "Bearer token-work":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "token_expired"}})
+		case "Bearer token-work-new":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		default:
+			t.Fatalf("Authorization = %q, want known bearer token", r.Header.Get("Authorization"))
+		}
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal", RefreshToken: "refresh-personal"},
+			{Alias: "work", AccessToken: "token-work", RefreshToken: "refresh-work"},
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if resp.Body.String() != "ok" {
+		t.Fatalf("body = %q, want ok", resp.Body.String())
+	}
+	if refreshCalls != 2 {
+		t.Fatalf("refreshCalls = %d, want 2", refreshCalls)
+	}
+}
+
+func TestProxyReactivelyRefreshesWhenUpstreamRejectsFreshJWT(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	freshToken := freshJWT(t)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "refreshed")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  freshToken,
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + freshToken, "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+	}
+}
+
+func TestProxyRefreshesExpiredTokenBeforeReturningResponse(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "refreshed")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  "token-old",
+			RefreshToken: "refresh-old",
+		}},
+	})
+	var synced accounts.Account
+	server := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnAccountUpdate: func(account accounts.Account) error {
+			synced = account
+			return nil
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if resp.Body.String() != "refreshed" {
+		t.Fatalf("body = %q, want refreshed", resp.Body.String())
+	}
+	wantTokens := []string{"Bearer token-old", "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+	}
+	if store.Data.Accounts[0].AccessToken != "token-new" {
+		t.Fatalf("stored AccessToken = %q, want token-new", store.Data.Accounts[0].AccessToken)
+	}
+	if store.Data.Accounts[0].RefreshToken != "refresh-new" {
+		t.Fatalf("stored RefreshToken = %q, want refresh-new", store.Data.Accounts[0].RefreshToken)
+	}
+	if synced.AccessToken != "token-new" {
+		t.Fatalf("synced AccessToken = %q, want token-new", synced.AccessToken)
+	}
+}
+
+func TestProxySerializesConcurrentTokenRefresh(t *testing.T) {
+	refreshCalls := 0
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls++
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  expiredJWT(t),
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			resp := httptest.NewRecorder()
+			server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+			if resp.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", resp.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", refreshCalls)
+	}
+}
+
+func TestProxyProactivelyRefreshesStaleAccessToken(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  expiredJWT(t),
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if gotAuth != "Bearer token-new" {
+		t.Fatalf("Authorization = %q, want Bearer token-new", gotAuth)
+	}
+}
+
+func TestProxyAdoptsCodexAuthWithoutCallingRefreshEndpoint(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	const accountID = "acct-personal"
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	auth := codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	}
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantAuth := "Bearer " + fresh
+	if gotAuth != wantAuth {
+		t.Fatalf("Authorization mismatch (got %s, want %s)", redactTestSecret(gotAuth), redactTestSecret(wantAuth))
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
+	}
+	if store.Data.Accounts[0].AccessToken != fresh {
+		t.Fatalf("stored AccessToken mismatch (got %s, want %s)", redactTestSecret(store.Data.Accounts[0].AccessToken), redactTestSecret(fresh))
+	}
+}
+
+func TestProxyAdoptsCodexAuthOnReactiveRefreshWithoutOAuthCall(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	const accountID = "acct-personal"
+	future := time.Now().Add(time.Hour).Unix()
+	// Registry token is not JWT-stale, but upstream rejects it; auth.json holds a different live token.
+	stale := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "registry"})
+	fresh := jwtWithAccountExpiry(t, future, accountID, map[string]any{"jti": "codex-auth"})
+	if stale == fresh {
+		t.Fatal("test setup: stale and fresh tokens must differ")
+	}
+	auth := codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	}
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + stale, "Bearer " + fresh}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refreshCalls = %d, want 0", refreshCalls.Load())
+	}
+}
+
+func TestProxyReactivelyRefreshesOnUnrecognized401(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	freshToken := freshJWT(t)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			// token_invalidated (session revoked, e.g. rotating refresh token
+			// used elsewhere) is not token_expired but must still trigger
+			// reactive recovery — any 401 means re-mint credentials and retry.
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Your authentication token has been invalidated. Please try signing in again.",
+					"type":    "invalid_request_error",
+					"code":    "token_invalidated",
+				},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "refreshed")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  freshToken,
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	wantTokens := []string{"Bearer " + freshToken, "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+}
+
+func TestNotifyAccountUpdateHandlesNilAndCallbackErrors(t *testing.T) {
+	t.Parallel()
+
+	handler := &handler{}
+	if err := handler.notifyAccountUpdate(accounts.Account{Alias: "work"}); err != nil {
+		t.Fatalf("notifyAccountUpdate(nil callback) error = %v", err)
+	}
+	wantErr := errors.New("callback failed")
+	handler.onAccountUpdate = func(accounts.Account) error {
+		return wantErr
+	}
+	if err := handler.notifyAccountUpdate(accounts.Account{Alias: "work"}); err != wantErr {
+		t.Fatalf("notifyAccountUpdate(error) = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRefreshAccountTokensReturnsMissingRefreshTokenError(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "work",
+		Accounts: []accounts.Account{{
+			Alias:       "work",
+			AccessToken: expiredJWT(t),
+		}},
+	})
+	handler := &handler{
+		store:        store,
+		client:       http.DefaultClient,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		refreshLocks: newRefreshLocks(),
+	}
+
+	_, err := handler.refreshAccountTokens(context.Background(), store.Data.Accounts[0], false)
+	if err == nil || !strings.Contains(err.Error(), "has no refresh token") {
+		t.Fatalf("refreshAccountTokens() error = %v, want missing refresh token", err)
+	}
+}
+
+func TestRefreshAccountTokensAdoptsCodexAuthAfterRecoverableRefreshFailure(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	const accountID = "acct-work"
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeCodexAuth(t, codexHome, codexauth.File{
+			Tokens: &codexauth.TokenData{
+				AccessToken:  fresh,
+				RefreshToken: "refresh-live",
+				AccountID:    accountID,
+			},
+		})
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"refresh_token_reused"}}`))
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "work",
+		Accounts: []accounts.Account{{
+			Alias:        "work",
+			AccessToken:  stale,
+			RefreshToken: "refresh-old",
+			AccountID:    accountID,
+		}},
+	})
+	handler := &handler{
+		store:        store,
+		client:       refreshServer.Client(),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		refreshLocks: newRefreshLocks(),
+	}
+
+	updated, err := handler.refreshAccountTokens(context.Background(), store.Data.Accounts[0], false)
+	if err != nil {
+		t.Fatalf("refreshAccountTokens() error = %v", err)
+	}
+	if updated.AccessToken != fresh {
+		t.Fatalf("AccessToken mismatch (got %s, want %s)", redactTestSecret(updated.AccessToken), redactTestSecret(fresh))
+	}
+	if updated.RefreshToken != "refresh-live" {
+		t.Fatalf("RefreshToken = %q, want refresh-live", updated.RefreshToken)
+	}
+}
+
+func TestRefreshAccountTokensKeepsReadyTokenWhenForcedRefreshFails(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"refresh_token_reused"}}`))
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	fresh := freshJWT(t)
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "work",
+		Accounts: []accounts.Account{{
+			Alias:        "work",
+			AccessToken:  fresh,
+			RefreshToken: "refresh-old",
+		}},
+	})
+	handler := &handler{
+		store:        store,
+		client:       refreshServer.Client(),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		refreshLocks: newRefreshLocks(),
+	}
+
+	updated, err := handler.refreshAccountTokens(context.Background(), store.Data.Accounts[0], true)
+	if err != nil {
+		t.Fatalf("refreshAccountTokens() error = %v", err)
+	}
+	if updated.AccessToken != fresh {
+		t.Fatalf("AccessToken mismatch (got %s, want %s)", redactTestSecret(updated.AccessToken), redactTestSecret(fresh))
+	}
+}
+
+func TestAdoptFromCodexAuthNotifiesEvenWhenStoreUpdateFails(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	const accountID = "acct-work"
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	writeCodexAuth(t, codexHome, codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-live",
+			AccountID:    accountID,
+		},
+	})
+
+	store := newTestStore(t, accounts.Data{Accounts: []accounts.Account{}})
+	var synced accounts.Account
+	handler := &handler{
+		store:  store,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		onAccountUpdate: func(account accounts.Account) error {
+			synced = account
+			return errors.New("sync failed")
+		},
+	}
+
+	updated, ok, err := handler.adoptFromCodexAuth(accounts.Account{
+		Alias:        "work",
+		AccessToken:  stale,
+		RefreshToken: "refresh-old",
+		AccountID:    accountID,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("adoptFromCodexAuth() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("adoptFromCodexAuth() ok = false, want true")
+	}
+	if updated.AccessToken != fresh {
+		t.Fatalf("updated AccessToken mismatch (got %s, want %s)", redactTestSecret(updated.AccessToken), redactTestSecret(fresh))
+	}
+	if synced.AccessToken != fresh {
+		t.Fatalf("synced AccessToken mismatch (got %s, want %s)", redactTestSecret(synced.AccessToken), redactTestSecret(fresh))
+	}
+}
+
+func expiredJWT(t *testing.T) string {
+	t.Helper()
+	return jwtWithExpiry(t, time.Now().Add(-time.Minute).Unix())
+}
+
+func freshJWT(t *testing.T) string {
+	t.Helper()
+	return jwtWithExpiry(t, time.Now().Add(time.Hour).Unix())
+}
+
+func jwtWithExpiry(t *testing.T, exp int64) string {
+	t.Helper()
+	return jwtWithAccountExpiry(t, exp, "", nil)
+}
+
+func redactTestSecret(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	if len(value) <= 12 {
+		return "<redacted>"
+	}
+	return value[:4] + "…" + value[len(value)-4:]
+}
+
+func redactTestSecrets(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = redactTestSecret(value)
+	}
+	return out
+}
+
+func jwtWithAccountExpiry(t *testing.T, exp int64, accountID string, extra map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	claims := map[string]any{"exp": exp}
+	if accountID != "" {
+		claims["chatgpt_account_id"] = accountID
+	}
+	for key, value := range extra {
+		claims[key] = value
+	}
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("Marshal(claims) error = %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".signature"
+}
+
+func TestProxyRefreshesTokenEvenWhenSyncFails(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  expiredJWT(t),
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnAccountUpdate: func(accounts.Account) error {
+			return errors.New("sync failed")
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if store.Data.Accounts[0].AccessToken != "token-new" {
+		t.Fatalf("stored AccessToken = %q, want token-new", store.Data.Accounts[0].AccessToken)
+	}
+}
+
+func TestProxyReturnsUnauthorizedWhenTokenRefreshFails(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"refresh_token_expired"}}`))
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":  map[string]any{"code": "token_expired"},
+			"status": 401,
+		})
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  "token-old",
+			RefreshToken: "refresh-old",
+		}},
+	})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusUnauthorized, resp.Body.String())
+	}
+}
+
+func TestProxyWebSocketReturnsUnauthorizedWhenTokenRefreshFails(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"refresh_token_expired"}}`))
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":  map[string]any{"code": "token_expired"},
+			"status": 401,
+		})
+	}))
+	defer upstream.Close()
+
+	server := newTestProxy(t, upstream.URL, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  "token-old",
+			RefreshToken: "refresh-old",
+		}},
+	})
+	proxyServer := httptest.NewServer(server.Handler)
+	defer proxyServer.Close()
+
+	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestProxyWebSocketRefreshesExpiredTokenBeforeUpgrade(t *testing.T) {
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_expired"},
+				"status": 401,
+			})
+			return
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("upstream writer is not hijackable")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  "token-old",
+			RefreshToken: "refresh-old",
+		}},
+	})
+	proxy := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+	proxyServer := httptest.NewServer(proxy.Handler)
+	defer proxyServer.Close()
+
+	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	wantTokens := []string{"Bearer token-old", "Bearer token-new"}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
 	}
 }
 
@@ -372,12 +1328,99 @@ func TestProxyWebSocketRotatesOnUsageLimitBeforeUpgrade(t *testing.T) {
 	}
 }
 
+func TestProxyWebSocketAdoptsCodexAuthForRotationTargetBeforeNotify(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	const accountID = "acct-work"
+	stale := jwtWithAccountExpiry(t, time.Now().Add(-time.Hour).Unix(), accountID, nil)
+	fresh := jwtWithAccountExpiry(t, time.Now().Add(time.Hour).Unix(), accountID, nil)
+	writeCodexAuth(t, codexHome, codexauth.File{
+		Tokens: &codexauth.TokenData{
+			AccessToken:  fresh,
+			RefreshToken: "refresh-work-live",
+			AccountID:    accountID,
+		},
+	})
+
+	var tokens []string
+	resetAt := time.Unix(1_700_000_123, 0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			w.Header().Set("x-codex-active-limit", "codex_weekly")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type":      "usage_limit_reached",
+					"resets_at": resetAt.Unix(),
+				},
+			})
+			return
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("upstream writer is not hijackable")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{
+			{Alias: "personal", AccessToken: "token-personal"},
+			{Alias: "work", AccessToken: stale, RefreshToken: "refresh-work-old", AccountID: accountID},
+		},
+	})
+	var synced []accounts.Account
+	proxy := newProxyWithConfig(t, Config{
+		Upstream: upstream.URL,
+		Store:    store,
+		OnAccountUpdate: func(account accounts.Account) error {
+			synced = append(synced, account)
+			return nil
+		},
+	})
+	proxyServer := httptest.NewServer(proxy.Handler)
+	defer proxyServer.Close()
+
+	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
+	defer conn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	wantTokens := []string{"Bearer token-personal", "Bearer " + fresh}
+	if !reflect.DeepEqual(tokens, wantTokens) {
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
+	}
+	if store.Data.Accounts[1].RefreshToken != "refresh-work-live" {
+		t.Fatalf("stored RefreshToken = %q, want refresh-work-live", store.Data.Accounts[1].RefreshToken)
+	}
+	if len(synced) != 1 {
+		t.Fatalf("OnAccountUpdate calls = %d, want 1", len(synced))
+	}
+	if synced[0].AccessToken != fresh {
+		t.Fatalf("synced AccessToken mismatch (got %s, want %s)", redactTestSecret(synced[0].AccessToken), redactTestSecret(fresh))
+	}
+}
+
 func TestProxyWebSocketCopiesPreUpgradeError(t *testing.T) {
 	t.Parallel()
 
+	// Use a non-401 status: 401 now triggers reactive token recovery, so a
+	// plain forbidden response keeps this focused on the pre-upgrade relay path.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"detail":"Unauthorized"}`))
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"Forbidden"}`))
 	}))
 	defer upstream.Close()
 
@@ -390,15 +1433,15 @@ func TestProxyWebSocketCopiesPreUpgradeError(t *testing.T) {
 
 	conn, _, resp := openTestWebSocket(t, proxyServer.URL, "/backend-api/codex/responses")
 	defer conn.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll(body) error = %v", err)
 	}
-	if !strings.Contains(string(body), "Unauthorized") {
-		t.Fatalf("body = %q, want unauthorized detail", string(body))
+	if !strings.Contains(string(body), "Forbidden") {
+		t.Fatalf("body = %q, want forbidden detail", string(body))
 	}
 }
 
@@ -920,6 +1963,17 @@ func newTestStore(t *testing.T, data accounts.Data) *accounts.Store {
 	}
 	store.Data = data
 	return store
+}
+
+func writeCodexAuth(t *testing.T, codexHome string, auth codexauth.File) {
+	t.Helper()
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("Marshal(auth) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), bytes, 0600); err != nil {
+		t.Fatalf("WriteFile(auth.json) error = %v", err)
+	}
 }
 
 func openTestWebSocket(t *testing.T, serverURL string, path string) (net.Conn, *bufio.Reader, *http.Response) {
