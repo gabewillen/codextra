@@ -684,7 +684,7 @@ func TestProxyReactivelyRefreshesOnUnrecognized401(t *testing.T) {
 	}
 	wantTokens := []string{"Bearer " + freshToken, "Bearer token-new"}
 	if !reflect.DeepEqual(tokens, wantTokens) {
-		t.Fatalf("tokens = %#v, want %#v", tokens, wantTokens)
+		t.Fatalf("tokens = %#v, want %#v", redactTestSecrets(tokens), redactTestSecrets(wantTokens))
 	}
 }
 

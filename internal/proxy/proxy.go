@@ -154,7 +154,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
-			resp.Body.Close()
+			drainAndClose(resp)
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
@@ -565,6 +565,23 @@ func (h *handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		_, _ = io.Copy(upstreamConn, clientConn)
 	}()
 	wg.Wait()
+}
+
+// maxDrainOnRetry bounds how much of an unused upstream body drainAndClose
+// reads back before closing. net/http only returns a connection to its pool
+// once the body is read to EOF, but we cap the drain so an oversized or hostile
+// body can't stall the retry.
+const maxDrainOnRetry = 16 << 10
+
+// drainAndClose discards up to maxDrainOnRetry bytes of an unread response body
+// and then closes it, letting the transport reuse the connection for the retry
+// instead of tearing it down and re-dialing.
+func drainAndClose(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.CopyN(io.Discard, resp.Body, maxDrainOnRetry)
+	resp.Body.Close()
 }
 
 func copyResponse(w http.ResponseWriter, resp *http.Response, captureLimit int) ([]byte, error) {
