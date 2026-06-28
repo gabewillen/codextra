@@ -29,7 +29,16 @@ import (
 	"github.com/gabewillen/codextra/internal/proxy"
 )
 
-const proxyStateVersion = 12
+// proxyStateVersion is the running-proxy compatibility marker. A foreground
+// codextra reuses an already-running serve-proxy only when its reported version
+// matches; otherwise it stops the stale one and starts a fresh proxy. Bump this
+// whenever the proxy's behavior changes so updated binaries replace a
+// still-running old proxy instead of silently reusing it.
+//
+// 13: fail over from server-invalidated sessions (#11); refresh-token burn guard
+// (#10); recover from any 401 (#8). These all live in the proxy, so a binary
+// update must restart the proxy to take effect.
+const proxyStateVersion = 13
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 const defaultProxyUpgradeWait = 10 * time.Second
