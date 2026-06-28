@@ -56,7 +56,7 @@ func takeTrayRunner() func() error {
 	return runner
 }
 
-func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(string) error) func() {
+func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(string) error, onLogin func(string) error) func() {
 	trayLogf("startTray requested, storePath=%s", storePath)
 
 	if os.Getenv("CODEXTRA_NO_TRAY") == "1" {
@@ -131,10 +131,6 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 		}
 	}
 
-	trigger := func() {
-		requestRefresh()
-	}
-
 	// Usage data is fetched through the proxy, which must not happen on the
 	// AppKit event-loop thread, so it lives in its own goroutine that writes the
 	// store; the menu ticker then renders the refreshed values from disk.
@@ -146,6 +142,13 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 		}
 	}
 
+	// refreshUsage re-fetches usage for the active account and rebuilds the menu;
+	// it backs the account-switch and the "Refresh usage" menu actions.
+	refreshUsage := func() {
+		triggerUsageRefresh()
+		requestRefresh()
+	}
+
 	// Refresh usage after an account switch so the spotlight reflects the newly
 	// active account rather than the previous one's launch-time values.
 	activate := func(alias string) error {
@@ -154,6 +157,19 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 		}
 		triggerUsageRefresh()
 		return nil
+	}
+
+	// login re-authenticates an account in the background (the OAuth flow opens a
+	// browser and can take a while), then refreshes the menu so the account moves
+	// out of "Needs sign-in" once its tokens are restored.
+	login := func(alias string) {
+		go func() {
+			if err := onLogin(alias); err != nil {
+				log.Printf("codextra tray: re-login %q: %v", alias, err)
+			}
+			triggerUsageRefresh()
+			requestRefresh()
+		}()
 	}
 
 	go func() {
@@ -203,7 +219,7 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 		defer ticker.Stop()
 		trayLogf("started tray update ticker interval=%s", trayRefreshInterval)
 
-		updateTrayMenu(sysTray, storePath, trigger, activate)
+		updateTrayMenu(sysTray, storePath, refreshUsage, activate, login)
 		for {
 			select {
 			case <-trayCtx.Done():
@@ -211,10 +227,10 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 				return
 			case <-ticker.C:
 				trayLogf("tray update ticker tick")
-				updateTrayMenu(sysTray, storePath, trigger, activate)
+				updateTrayMenu(sysTray, storePath, refreshUsage, activate, login)
 			case <-refreshNow:
 				trayLogf("tray update requested")
-				updateTrayMenu(sysTray, storePath, trigger, activate)
+				updateTrayMenu(sysTray, storePath, refreshUsage, activate, login)
 			}
 		}
 	}()
@@ -238,21 +254,21 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 // updateTrayMenu builds the menu off the event-loop thread (store I/O, pure Go)
 // and then applies it via RunOnMain so the AppKit NSMenu/NSStatusItem mutation
 // happens on the message-loop thread, as AppKit requires.
-func updateTrayMenu(tray *systray.SystemTray, storePath string, requestRefresh func(), onActivate func(string) error) {
-	menu := buildTrayMenu(storePath, requestRefresh, onActivate)
+func updateTrayMenu(tray *systray.SystemTray, storePath string, refreshUsage func(), onActivate func(string) error, onLogin func(string)) {
+	menu := buildTrayMenu(storePath, refreshUsage, onActivate, onLogin)
 	tray.RunOnMain(func() {
 		tray.SetMenu(menu)
 	})
 }
 
-func buildTrayMenu(storePath string, requestRefresh func(), onActivate func(string) error) *systray.Menu {
+func buildTrayMenu(storePath string, refreshUsage func(), onActivate func(string) error, onLogin func(string)) *systray.Menu {
 	trayLogf("updating tray menu")
 	now := time.Now()
 	snapshot, err := snapshotFromStore(storePath, now)
 	if err != nil {
 		log.Printf("codextra tray menu: failed to load account snapshot: %v", err)
 		menu := systray.NewMenu()
-		menu.AddDisabled("No account store: " + err.Error())
+		menu.AddDisabled("⚠  No account store: " + err.Error())
 		return menu
 	}
 
@@ -263,31 +279,39 @@ func buildTrayMenu(storePath string, requestRefresh func(), onActivate func(stri
 
 	menu := systray.NewMenu()
 
-	// Spotlight the current account at the top, with a fat usage bar.
+	// Spotlight the current account at the top: name, then a glyph + fat usage
+	// bar on its own line.
 	if current, ok := findAccount(all, snapshot.CurrentAlias); ok {
-		menu.AddDisabled("codextra · " + displayAlias(current.Alias))
-		menu.AddDisabled("    " + currentAccountStatLine(current, now))
+		menu.AddDisabled("codextra — " + displayAlias(current.Alias))
+		menu.AddDisabled("   " + accountGlyph(current, now) + "  " + currentAccountStatLine(current, now))
 	} else {
-		menu.AddDisabled("codextra · no active account")
+		menu.AddDisabled("codextra — no active account")
+		menu.AddDisabled("   ⚪  sign in to an account below")
 	}
 	menu.AddSeparator()
 
 	if len(all) == 0 {
-		menu.AddDisabled("No accounts")
+		menu.AddDisabled("No accounts — run: codextra login <alias>")
 		return menu
 	}
 
 	ready, cooling, needsLogin := groupAccounts(all, now)
-	addAccountSection(menu, "Ready", ready, snapshot.CurrentAlias, now, requestRefresh, onActivate)
-	addAccountSection(menu, "Cooling down", cooling, snapshot.CurrentAlias, now, requestRefresh, onActivate)
-	addAccountSection(menu, "Needs sign-in", needsLogin, snapshot.CurrentAlias, now, requestRefresh, onActivate)
+	addAccountSection(menu, "Ready", ready, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
+	addAccountSection(menu, "Cooling down", cooling, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
+	addAccountSection(menu, "Needs sign-in", needsLogin, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
+
+	menu.AddSeparator()
+	menu.Add("↻  Refresh usage", func() {
+		trayLogf("menu refresh-usage selected")
+		refreshUsage()
+	})
 
 	trayLogf("menu built current=%q active=%q accountCount=%d ready=%d cooling=%d login=%d",
 		snapshot.CurrentAlias, snapshot.ActiveAlias, len(all), len(ready), len(cooling), len(needsLogin))
 	return menu
 }
 
-func addAccountSection(menu *systray.Menu, title string, group []accounts.Account, currentAlias string, now time.Time, requestRefresh func(), onActivate func(string) error) {
+func addAccountSection(menu *systray.Menu, title string, group []accounts.Account, currentAlias string, now time.Time, refreshUsage func(), onActivate func(string) error, onLogin func(string)) {
 	if len(group) == 0 {
 		return
 	}
@@ -296,13 +320,22 @@ func addAccountSection(menu *systray.Menu, title string, group []accounts.Accoun
 		alias := account.Alias
 		label := formatAccountMenuLabel(account, currentAlias, now)
 		trayLogf("adding account to menu: alias=%s label=%q", alias, label)
+		// A signed-out account has no token to switch to; clicking it
+		// re-authenticates instead of selecting it.
+		if strings.TrimSpace(account.AccessToken) == "" {
+			menu.Add(label, func() {
+				trayLogf("menu sign-in selected alias=%q", alias)
+				onLogin(alias)
+			})
+			continue
+		}
 		menu.AddCheckbox(label, account.Alias == currentAlias, func() {
 			trayLogf("menu activation selected alias=%q", alias)
 			if err := onActivate(alias); err != nil {
 				log.Printf("codextra tray: activate %q: %v", alias, err)
 				return
 			}
-			requestRefresh()
+			refreshUsage()
 		})
 	}
 }
@@ -355,7 +388,7 @@ func formatAccountMenuLabel(account accounts.Account, currentAlias string, now t
 	alias := displayAlias(account.Alias)
 
 	if strings.TrimSpace(account.AccessToken) == "" {
-		return fmt.Sprintf("%s  %s", accountGlyph(account, now), alias)
+		return fmt.Sprintf("%s  %s  —  Sign in", accountGlyph(account, now), alias)
 	}
 	if disabledUntil, reason := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
 		return fmt.Sprintf("%s  %s  ·  %s %s",
@@ -373,12 +406,12 @@ func formatAccountMenuLabel(account accounts.Account, currentAlias string, now t
 
 func accountGlyph(account accounts.Account, now time.Time) string {
 	if strings.TrimSpace(account.AccessToken) == "" {
-		return "○"
+		return "🔴"
 	}
 	if disabledUntil, _ := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
-		return "◐"
+		return "🟡"
 	}
-	return "●"
+	return "🟢"
 }
 
 // usagePartials are the left-aligned block fragments for sub-cell fill, indexed

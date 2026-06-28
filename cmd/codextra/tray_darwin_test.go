@@ -5,7 +5,10 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"github.com/gabewillen/codextra/internal/accounts"
 )
 
 func TestUsageBarHasFixedCellWidth(t *testing.T) {
@@ -48,5 +51,23 @@ func TestUsageBarShowsSubCellFillForLowUsage(t *testing.T) {
 	}
 	if !strings.ContainsAny(got, "▏▎▍▌▋▊▉") {
 		t.Fatalf("usageBar(1, 10) = %q, want a sub-cell partial block", got)
+	}
+}
+
+func TestSignedOutAccountLabelCuesSignIn(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	label := formatAccountMenuLabel(accounts.Account{Alias: "work"}, "", now)
+	if !strings.Contains(label, "Sign in") {
+		t.Fatalf("signed-out label = %q, want a Sign in cue", label)
+	}
+	if !strings.Contains(label, "🔴") {
+		t.Fatalf("signed-out label = %q, want the needs-sign-in glyph", label)
+	}
+
+	ready := formatAccountMenuLabel(accounts.Account{Alias: "work", AccessToken: "t"}, "work", now)
+	if !strings.Contains(ready, "🟢") {
+		t.Fatalf("ready current label = %q, want the ready glyph", ready)
 	}
 }
