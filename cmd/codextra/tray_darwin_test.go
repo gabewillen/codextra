@@ -6,59 +6,15 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gabewillen/codextra/internal/accounts"
 )
-
-func TestUsageBarHasFixedCellWidth(t *testing.T) {
-	t.Parallel()
-
-	for _, percent := range []int{-10, 0, 1, 13, 50, 72, 99, 100, 150} {
-		got := usageBar(percent, 16)
-		if n := utf8.RuneCountInString(got); n != 16 {
-			t.Fatalf("usageBar(%d, 16) width = %d (%q), want 16", percent, n, got)
-		}
-	}
-
-	if got := usageBar(50, 0); got != "" {
-		t.Fatalf("usageBar(50, 0) = %q, want empty", got)
-	}
-}
-
-func TestUsageBarFillsProportionally(t *testing.T) {
-	t.Parallel()
-
-	if got := usageBar(0, 10); got != strings.Repeat("░", 10) {
-		t.Fatalf("usageBar(0, 10) = %q, want empty track", got)
-	}
-	if got := usageBar(100, 10); got != strings.Repeat("█", 10) {
-		t.Fatalf("usageBar(100, 10) = %q, want full bar", got)
-	}
-	if got := usageBar(50, 10); got != strings.Repeat("█", 5)+strings.Repeat("░", 5) {
-		t.Fatalf("usageBar(50, 10) = %q, want half full", got)
-	}
-}
-
-func TestUsageBarShowsSubCellFillForLowUsage(t *testing.T) {
-	t.Parallel()
-
-	// 1% over a 10-cell meter is 0.8 of a cell — should render a partial block,
-	// not snap down to an empty meter or up to a whole cell.
-	got := usageBar(1, 10)
-	if strings.HasPrefix(got, "█") {
-		t.Fatalf("usageBar(1, 10) = %q, want a partial leading block, not a full cell", got)
-	}
-	if !strings.ContainsAny(got, "▏▎▍▌▋▊▉") {
-		t.Fatalf("usageBar(1, 10) = %q, want a sub-cell partial block", got)
-	}
-}
 
 func TestSignedOutAccountLabelCuesSignIn(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	label := formatAccountMenuLabel(accounts.Account{Alias: "work"}, "", now)
+	label := formatAccountMenuLabel(accounts.Account{Alias: "work"}, now)
 	if !strings.Contains(label, "Sign in") {
 		t.Fatalf("signed-out label = %q, want a Sign in cue", label)
 	}
@@ -66,8 +22,50 @@ func TestSignedOutAccountLabelCuesSignIn(t *testing.T) {
 		t.Fatalf("signed-out label = %q, want the needs-sign-in glyph", label)
 	}
 
-	ready := formatAccountMenuLabel(accounts.Account{Alias: "work", AccessToken: "t"}, "work", now)
+	ready := formatAccountMenuLabel(accounts.Account{Alias: "work", AccessToken: "t"}, now)
 	if !strings.Contains(ready, "🟢") {
-		t.Fatalf("ready current label = %q, want the ready glyph", ready)
+		t.Fatalf("ready label = %q, want the ready glyph", ready)
+	}
+}
+
+func TestUsageWindowLineMirrorsCodex(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.Local)
+
+	// A 5h window resetting later today shows a clock time.
+	soon := now.Add(3 * time.Hour)
+	line := usageWindowLine(accounts.UsageWindow{Label: "5h", Percent: 12, ResetAt: soon.Unix()}, now)
+	if !strings.Contains(line, "5h") || !strings.Contains(line, "12%") {
+		t.Fatalf("line = %q, want label and percent", line)
+	}
+	if !strings.Contains(line, soon.Format("3:04 PM")) {
+		t.Fatalf("line = %q, want a clock-time reset", line)
+	}
+
+	// A weekly window resetting days out shows a date, not a time.
+	later := now.Add(5 * 24 * time.Hour)
+	weekly := usageWindowLine(accounts.UsageWindow{Label: "Weekly", Percent: 99, ResetAt: later.Unix()}, now)
+	if !strings.Contains(weekly, later.Format("Jan 2")) {
+		t.Fatalf("weekly line = %q, want a date reset", weekly)
+	}
+}
+
+func TestCurrentAccountUsageLinesFallback(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	lines := currentAccountUsageLines(accounts.Account{Alias: "work", AccessToken: "t"}, now)
+	if len(lines) != 1 || !strings.Contains(lines[0], "unavailable") {
+		t.Fatalf("no-usage lines = %#v, want a single 'unavailable' placeholder", lines)
+	}
+
+	withUsage := accounts.Account{Alias: "work", AccessToken: "t", Usage: []accounts.UsageWindow{
+		{Label: "5h", Percent: 0},
+		{Label: "Weekly", Percent: 1},
+	}}
+	lines = currentAccountUsageLines(withUsage, now)
+	if len(lines) != 2 {
+		t.Fatalf("usage lines = %#v, want one per window", lines)
 	}
 }

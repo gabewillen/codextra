@@ -22,6 +22,18 @@ type Account struct {
 	LastLimitStatus map[string]string `json:"last_limit_status,omitempty"`
 	UsagePercent    int               `json:"usage_percent,omitempty"`
 	UsageResetAt    int64             `json:"usage_reset_at,omitempty"`
+	// Usage holds the per-window usage for the account (e.g. the 5h and weekly
+	// limits), mirroring what Codex shows. It is populated for the active account
+	// only, since usage is fetched through the proxy for whichever account is
+	// current.
+	Usage []UsageWindow `json:"usage,omitempty"`
+}
+
+// UsageWindow is one rate-limit window's usage, e.g. {"5h", 12, <reset unix>}.
+type UsageWindow struct {
+	Label   string `json:"label"`
+	Percent int    `json:"percent"`
+	ResetAt int64  `json:"reset_at,omitempty"`
 }
 
 type Store struct {
@@ -219,6 +231,40 @@ func (s *Store) UpdateUsage(alias string, percent int, resetAt int64) error {
 		}
 	}
 	return fmt.Errorf("account %q not found", alias)
+}
+
+// UpdateUsageWindows stores the per-window usage for alias and keeps the legacy
+// single-value UsagePercent/UsageResetAt in sync with the peak window so older
+// readers still work.
+func (s *Store) UpdateUsageWindows(alias string, windows []UsageWindow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == alias {
+			s.Data.Accounts[i].Usage = windows
+			peak, resetAt := peakUsageWindow(windows)
+			s.Data.Accounts[i].UsagePercent = peak
+			s.Data.Accounts[i].UsageResetAt = resetAt
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("account %q not found", alias)
+}
+
+// peakUsageWindow returns the highest used percent across windows and the reset
+// time of that window, for the compact single-value fallback.
+func peakUsageWindow(windows []UsageWindow) (int, int64) {
+	peak := 0
+	var resetAt int64
+	for _, w := range windows {
+		if w.Percent > peak {
+			peak = w.Percent
+			resetAt = w.ResetAt
+		}
+	}
+	return peak, resetAt
 }
 
 func (s *Store) UpdateTokens(alias string, tokens Account) (Account, error) {

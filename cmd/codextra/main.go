@@ -1157,7 +1157,7 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 	usageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	percent, resetAt, err := fetchAccountUsage(usageCtx, proxyURL)
+	windows, err := fetchAccountUsage(usageCtx, proxyURL)
 	if err != nil {
 		return alias, err
 	}
@@ -1175,68 +1175,91 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 		return alias, nil
 	}
 
-	if err := store.UpdateUsage(alias, percent, resetAt); err != nil {
+	if err := store.UpdateUsageWindows(alias, windows); err != nil {
 		log.Printf("codextra usage update: %v", err)
 	}
 	return alias, nil
 }
 
-func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error) {
+// fetchAccountUsage fetches the active account's rate-limit windows through the
+// proxy, mirroring what Codex shows: the primary (e.g. 5h) and secondary (e.g.
+// weekly) windows, each with a used percent and reset time.
+func fetchAccountUsage(ctx context.Context, proxyURL string) ([]accounts.UsageWindow, error) {
 	usageURL := strings.TrimRight(proxyURL, "/") + "/backend-api/wham/usage"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("fetch wham/usage: %w", err)
+		return nil, fmt.Errorf("fetch wham/usage: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		// Error responses (401, 502, HTML pages) can decode as an empty
-		// rate_limit map without a JSON error; surface them so the caller does
-		// not persist a bogus zero usage and blank the spotlight. A 401 means the
-		// proxy could not authenticate the active account, so tag it for the
-		// caller to back off and avoid burning the account's refresh token.
+		// A 401 means the proxy could not authenticate the active account, so tag
+		// it for the caller to back off and avoid burning the refresh token.
 		if res.StatusCode == http.StatusUnauthorized {
-			return 0, 0, fmt.Errorf("wham/usage status %s: %w", res.Status, errUsageUnauthorized)
+			return nil, fmt.Errorf("wham/usage status %s: %w", res.Status, errUsageUnauthorized)
 		}
-		return 0, 0, fmt.Errorf("wham/usage status %s", res.Status)
+		return nil, fmt.Errorf("wham/usage status %s", res.Status)
 	}
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read wham/usage: %w", err)
-	}
-
-	var payload struct {
-		RateLimit map[string]json.RawMessage `json:"rate_limit"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, 0, fmt.Errorf("parse wham/usage: %w", err)
+		return nil, fmt.Errorf("read wham/usage: %w", err)
 	}
 
 	type rateWindow struct {
-		UsedPercent int   `json:"used_percent"`
-		ResetAt     int64 `json:"reset_at"`
+		UsedPercent        int   `json:"used_percent"`
+		LimitWindowSeconds int64 `json:"limit_window_seconds"`
+		ResetAt            int64 `json:"reset_at"`
 	}
-	maxPercent := 0
-	var resetAt int64
-	for _, raw := range payload.RateLimit {
-		var window rateWindow
-		if err := json.Unmarshal(raw, &window); err != nil {
+	var payload struct {
+		RateLimit struct {
+			PrimaryWindow   *rateWindow `json:"primary_window"`
+			SecondaryWindow *rateWindow `json:"secondary_window"`
+		} `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse wham/usage: %w", err)
+	}
+
+	var windows []accounts.UsageWindow
+	for _, w := range []*rateWindow{payload.RateLimit.PrimaryWindow, payload.RateLimit.SecondaryWindow} {
+		if w == nil {
 			continue
 		}
-		// Pair the reset countdown with the window that drives the displayed
-		// peak usage so the tray spotlight shows a consistent bucket, rather
-		// than the peak percent next to an unrelated window's reset time.
-		if window.UsedPercent > maxPercent {
-			maxPercent = window.UsedPercent
-			resetAt = window.ResetAt
-		}
+		windows = append(windows, accounts.UsageWindow{
+			Label:   usageWindowLabel(w.LimitWindowSeconds),
+			Percent: w.UsedPercent,
+			ResetAt: w.ResetAt,
+		})
 	}
-	return maxPercent, resetAt, nil
+	return windows, nil
+}
+
+// usageWindowLabel turns a window length in seconds into the short label Codex
+// uses, e.g. 18000 → "5h", 604800 → "Weekly".
+func usageWindowLabel(seconds int64) string {
+	switch {
+	case seconds <= 0:
+		return "Usage"
+	case seconds%604800 == 0:
+		if weeks := seconds / 604800; weeks > 1 {
+			return fmt.Sprintf("%dwk", weeks)
+		}
+		return "Weekly"
+	case seconds%86400 == 0:
+		if days := seconds / 86400; days > 1 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return "Daily"
+	case seconds%3600 == 0:
+		return fmt.Sprintf("%dh", seconds/3600)
+	default:
+		return fmt.Sprintf("%dm", seconds/60)
+	}
 }
 
 func codextraDir() (string, error) {
