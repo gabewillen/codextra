@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -505,6 +506,48 @@ func TestKeepProxyAliveReattachesDroppedClientStream(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("client stream attaches = %d, want at least 2", attaches.Load())
+}
+
+func TestFetchAccountUsageFlagsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	_, _, err := fetchAccountUsage(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("fetchAccountUsage() error = nil, want unauthorized")
+	}
+	// The sentinel lets the tray back off instead of hammering the proxy, which
+	// would otherwise force a token refresh on every poll and burn the account's
+	// single-use refresh token.
+	if !errors.Is(err, errUsageUnauthorized) {
+		t.Fatalf("fetchAccountUsage() error = %v, want errUsageUnauthorized", err)
+	}
+}
+
+func TestFetchAccountUsagePairsResetWithPeakWindow(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"rate_limit":{"primary":{"used_percent":12,"reset_at":111},"secondary":{"used_percent":80,"reset_at":222}}}`))
+	}))
+	defer server.Close()
+
+	percent, resetAt, err := fetchAccountUsage(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("fetchAccountUsage() error = %v", err)
+	}
+	if percent != 80 {
+		t.Fatalf("percent = %d, want 80", percent)
+	}
+	if resetAt != 222 {
+		t.Fatalf("resetAt = %d, want 222 (paired with the peak window)", resetAt)
+	}
 }
 
 func TestRoutePrefixHandlerRequiresSecretPrefix(t *testing.T) {

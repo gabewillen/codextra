@@ -121,18 +121,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveHTTP(w, r)
 }
 
-func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.logger.Warn("request_body_read_failed", "method", r.Method, "path", r.URL.Path, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
+// proxyAttempt is a single authenticated transport round-trip awaiting
+// disposition by serveProxied.
+type proxyAttempt struct {
+	resp *http.Response
+	// onRetry releases the transport resources held by this attempt before the
+	// loop retries (after a token refresh or account rotation).
+	onRetry func()
+	// deliver hands the final (non-retried) response to the client. It owns resp
+	// and is responsible for closing it.
+	deliver func()
+}
 
-	now := time.Now()
-	account, ok := h.store.Current(now)
+// serveProxied runs the shared auth-aware proxy loop used by both the HTTP and
+// WebSocket paths: it selects the active account, refreshes tokens proactively,
+// runs the transport attempt, and then either recovers a 401 by refreshing the
+// token once, rotates to another account on a usage-limit 429, or delivers the
+// response. makeAttempt performs the transport-specific round-trip for the given
+// account; on a transport-level failure it must log the cause and return a
+// non-nil error, which becomes a 502.
+func (h *handler) serveProxied(w http.ResponseWriter, r *http.Request, makeAttempt func(account accounts.Account) (*proxyAttempt, error)) {
+	account, ok := h.store.Current(time.Now())
 	if !ok {
 		h.logger.Warn("no_eligible_account", "method", r.Method, "path", r.URL.Path)
 		http.Error(w, "codextra has no eligible account", http.StatusServiceUnavailable)
@@ -141,20 +150,20 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	tokenRefreshed := false
 	for {
+		var err error
 		account, err = h.ensureFreshTokens(r.Context(), account)
 		if err != nil {
 			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
 		}
 
-		resp, err := h.forward(r.Context(), r, body, account)
+		attempt, err := makeAttempt(account)
 		if err != nil {
-			h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
-			drainAndClose(resp)
+		if attempt.resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
+			attempt.onRetry()
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
 				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
@@ -167,14 +176,13 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
-			captured, err := copyResponse(w, resp, responseCaptureLimit(resp))
-			h.logResponse(r, resp, account, time.Since(start), captured, err)
+		if attempt.resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(attempt.resp) {
+			attempt.deliver()
 			return
 		}
 
-		limit, resetAt := limitInfo(resp)
-		resp.Body.Close()
+		limit, resetAt := limitInfo(attempt.resp)
+		attempt.onRetry()
 		h.logger.Info("usage_limit_detected", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
 		next, rotated, err := h.store.RotateFrom(account.Alias, limit, resetAt, time.Now())
 		if err != nil {
@@ -205,6 +213,33 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		account = next
 		tokenRefreshed = false
 	}
+}
+
+func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logger.Warn("request_body_read_failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	h.serveProxied(w, r, func(account accounts.Account) (*proxyAttempt, error) {
+		resp, err := h.forward(r.Context(), r, body, account)
+		if err != nil {
+			h.logger.Warn("upstream_request_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
+			return nil, err
+		}
+		return &proxyAttempt{
+			resp:    resp,
+			onRetry: func() { drainAndClose(resp) },
+			deliver: func() {
+				captured, copyErr := copyResponse(w, resp, responseCaptureLimit(resp))
+				h.logResponse(r, resp, account, time.Since(start), captured, copyErr)
+			},
+		}, nil
+	})
 }
 
 func (h *handler) ensureFreshTokens(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -373,88 +408,33 @@ func (h *handler) upstreamFor(path string) *url.URL {
 
 func (h *handler) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	account, ok := h.store.Current(time.Now())
-	if !ok {
-		h.logger.Warn("no_eligible_account", "method", r.Method, "path", r.URL.Path)
-		http.Error(w, "codextra has no eligible account", http.StatusServiceUnavailable)
-		return
-	}
-
-	tokenRefreshed := false
-	for {
-		var refreshErr error
-		account, refreshErr = h.ensureFreshTokens(r.Context(), account)
-		if refreshErr != nil {
-			h.logger.Warn("token_refresh_proactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
-		}
-
+	h.serveProxied(w, r, func(account accounts.Account) (*proxyAttempt, error) {
 		upstreamConn, upstreamReader, upstreamReq, resp, err := h.openWebSocket(r.Context(), r, account)
 		if err != nil {
 			h.logger.Warn("websocket_upstream_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
+			return nil, err
 		}
-		if resp.StatusCode == http.StatusSwitchingProtocols {
-			h.logger.Info("websocket_upgraded", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "upstream_host", upstreamReq.Host, "duration_ms", time.Since(start).Milliseconds())
-			h.tunnelWebSocket(w, r, upstreamConn, upstreamReader, resp)
-			return
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
-			resp.Body.Close()
-			upstreamConn.Close()
-			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
-			if refreshErr != nil {
-				h.logger.Warn("token_refresh_reactive_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", refreshErr)
-				http.Error(w, refreshFailureResponse(refreshErr), http.StatusUnauthorized)
-				return
-			}
-			h.logger.Info("token_refreshed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
-			account = updated
-			tokenRefreshed = true
-			continue
-		}
-
-		if resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(resp) {
-			captured, err := copyResponse(w, resp, responseCaptureLimit(resp))
-			h.logResponse(r, resp, account, time.Since(start), captured, err)
-			upstreamConn.Close()
-			return
-		}
-
-		limit, resetAt := limitInfo(resp)
-		resp.Body.Close()
-		upstreamConn.Close()
-		h.logger.Info("usage_limit_detected", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "reset_at", resetAt.Format(time.RFC3339))
-		next, rotated, err := h.store.RotateFrom(account.Alias, limit, resetAt, time.Now())
-		if err != nil {
-			h.logger.Warn("account_rotation_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit, "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if !rotated {
-			h.logger.Warn("account_rotation_exhausted", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "limit", limit)
-			http.Error(w, "all codextra accounts are usage limited", http.StatusTooManyRequests)
-			return
-		}
-		// Attempt to adopt any fresher tokens from Codex's auth.json for the
-		// rotation target before notifying. This prevents overwriting Codex's
-		// copy of a secondary account with a stale refresh token from the
-		// registry (which would make subsequent refresh attempts fail with
-		// "refresh token already used" and prevent recovery via adopt).
-		if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
-			h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
-		} else if ok {
-			h.logger.Info("codex_auth_synced", "alias", next.Alias)
-			next = adopted
-		}
-		if err := h.notifyAccountUpdate(next); err != nil {
-			h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit, "error", err)
-		}
-		h.logger.Info("account_rotated", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "limit", limit)
-		account = next
-		tokenRefreshed = false
-	}
+		return &proxyAttempt{
+			resp: resp,
+			onRetry: func() {
+				resp.Body.Close()
+				upstreamConn.Close()
+			},
+			deliver: func() {
+				// A successful upgrade (101) is the WebSocket terminal case:
+				// hand the hijacked connection to the bidirectional tunnel,
+				// which owns and closes upstreamConn.
+				if resp.StatusCode == http.StatusSwitchingProtocols {
+					h.logger.Info("websocket_upgraded", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "upstream_host", upstreamReq.Host, "duration_ms", time.Since(start).Milliseconds())
+					h.tunnelWebSocket(w, r, upstreamConn, upstreamReader, resp)
+					return
+				}
+				captured, copyErr := copyResponse(w, resp, responseCaptureLimit(resp))
+				h.logResponse(r, resp, account, time.Since(start), captured, copyErr)
+				upstreamConn.Close()
+			},
+		}, nil
+	})
 }
 
 func (h *handler) openWebSocket(ctx context.Context, original *http.Request, account accounts.Account) (net.Conn, *bufio.Reader, *http.Request, *http.Response, error) {
