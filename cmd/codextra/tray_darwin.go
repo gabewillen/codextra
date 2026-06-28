@@ -7,6 +7,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -158,14 +159,35 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 	go func() {
 		usageTicker := time.NewTicker(trayUsageRefreshInterval)
 		defer usageTicker.Stop()
+		// unauthorizedAlias is the account whose usage endpoint last returned 401.
+		// While it stays active we skip periodic polls: each poll makes the proxy
+		// force a token refresh, so hammering a doomed account burns its single-use
+		// refresh token. An explicit refresh (e.g. after a switch) always retries.
+		var unauthorizedAlias string
+		forced := true
 		for {
-			refreshAccountUsage(trayCtx, proxyURL, storePath)
-			requestRefresh()
+			if forced || unauthorizedAlias == "" || activeAlias(storePath) != unauthorizedAlias {
+				alias, err := refreshAccountUsage(trayCtx, proxyURL, storePath)
+				switch {
+				case err == nil:
+					unauthorizedAlias = ""
+				case errors.Is(err, errUsageUnauthorized):
+					if alias != unauthorizedAlias {
+						log.Printf("codextra usage fetch: %v; pausing usage polls for %q until it changes or is re-authenticated", err, alias)
+					}
+					unauthorizedAlias = alias
+				default:
+					log.Printf("codextra usage fetch: %v", err)
+				}
+				requestRefresh()
+			}
+			forced = false
 			select {
 			case <-trayCtx.Done():
 				return
 			case <-usageTicker.C:
 			case <-refreshUsageNow:
+				forced = true
 			}
 		}
 	}()

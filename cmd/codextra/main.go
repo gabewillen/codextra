@@ -1084,11 +1084,38 @@ func activateAccount(alias string) (accounts.Account, error) {
 	return account, nil
 }
 
-func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string) {
+// errUsageUnauthorized signals that the proxy could not authenticate the active
+// account for the usage endpoint (HTTP 401). Each failed poll makes the proxy
+// reactively force a token refresh, so repeatedly polling a doomed account burns
+// its single-use refresh token; callers use this to back off until the account
+// changes or is re-authenticated.
+var errUsageUnauthorized = errors.New("usage endpoint unauthorized")
+
+// activeAlias reports the currently active account alias, or "" if it cannot be
+// determined. It is a lightweight read used to gate usage polling without a
+// full usage fetch.
+func activeAlias(storePath string) string {
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		return ""
+	}
+	snap, err := store.Snapshot(time.Now())
+	if err != nil {
+		return ""
+	}
+	return snap.CurrentAlias
+}
+
+// refreshAccountUsage fetches usage for the active account through the proxy and
+// records it on the store. It returns the alias it attempted and the usage-fetch
+// error (if any) so the caller can back off when the proxy cannot authenticate
+// the account. Operational errors (store load, snapshot, update) are logged here
+// and not returned, since they are local and not the source of poll spam.
+func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string) (string, error) {
 	store, err := accounts.LoadStore(storePath)
 	if err != nil {
 		log.Printf("codextra usage store: %v", err)
-		return
+		return "", nil
 	}
 
 	// Capture the active account before the fetch: the proxy serves /wham/usage
@@ -1096,11 +1123,11 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 	before, err := store.Snapshot(time.Now())
 	if err != nil {
 		log.Printf("codextra usage snapshot: %v", err)
-		return
+		return "", nil
 	}
 	alias := before.CurrentAlias
 	if alias == "" {
-		return
+		return "", nil
 	}
 
 	usageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -1108,8 +1135,7 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 
 	percent, resetAt, err := fetchAccountUsage(usageCtx, proxyURL)
 	if err != nil {
-		log.Printf("codextra usage fetch: %v", err)
-		return
+		return alias, err
 	}
 
 	// If the active account changed while the request was in flight, the usage
@@ -1119,15 +1145,16 @@ func refreshAccountUsage(ctx context.Context, proxyURL string, storePath string)
 	after, err := store.Snapshot(time.Now())
 	if err != nil {
 		log.Printf("codextra usage snapshot: %v", err)
-		return
+		return alias, nil
 	}
 	if after.CurrentAlias != alias {
-		return
+		return alias, nil
 	}
 
 	if err := store.UpdateUsage(alias, percent, resetAt); err != nil {
 		log.Printf("codextra usage update: %v", err)
 	}
+	return alias, nil
 }
 
 func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error) {
@@ -1145,7 +1172,12 @@ func fetchAccountUsage(ctx context.Context, proxyURL string) (int, int64, error)
 	if res.StatusCode != http.StatusOK {
 		// Error responses (401, 502, HTML pages) can decode as an empty
 		// rate_limit map without a JSON error; surface them so the caller does
-		// not persist a bogus zero usage and blank the spotlight.
+		// not persist a bogus zero usage and blank the spotlight. A 401 means the
+		// proxy could not authenticate the active account, so tag it for the
+		// caller to back off and avoid burning the account's refresh token.
+		if res.StatusCode == http.StatusUnauthorized {
+			return 0, 0, fmt.Errorf("wham/usage status %s: %w", res.Status, errUsageUnauthorized)
+		}
 		return 0, 0, fmt.Errorf("wham/usage status %s", res.Status)
 	}
 
