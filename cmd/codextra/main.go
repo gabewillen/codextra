@@ -125,6 +125,9 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "serve-proxy" {
 		return runProxyServer(ctx)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "install-app" {
+		return installDesktopApp()
+	}
 
 	options, userArgs, err := parseCodextraArgs(os.Args[1:])
 	if err != nil {

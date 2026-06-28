@@ -151,3 +151,7 @@ if ! path_contains "$install_dir"; then
 	echo "add this to your shell profile:" >&2
 	echo "  export PATH=\"\$PATH:$install_dir\"" >&2
 fi
+
+if [ "$os" = "darwin" ]; then
+	echo "tip: run '$binary install-app' to add a clickable Codex Desktop launcher"
+fi
