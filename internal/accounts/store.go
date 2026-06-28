@@ -177,6 +177,35 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 	return Account{}, false, s.saveLocked()
 }
 
+// MarkNeedsLogin records that alias was signed out server-side and cannot be
+// recovered by refreshing: it clears the stored access token so the account is
+// no longer eligible (rotation skips it and the tray surfaces it under "Needs
+// sign-in"). If alias was the active account, it switches the active account to
+// another eligible one. It returns the new active account and whether a switch
+// occurred. Re-running login restores the account.
+func (s *Store) MarkNeedsLogin(alias string, now time.Time) (Account, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == alias {
+			s.Data.Accounts[i].AccessToken = ""
+			break
+		}
+	}
+
+	if s.Data.ActiveAlias == alias {
+		for _, account := range s.Data.Accounts {
+			if account.Alias != alias && eligible(account, now) {
+				s.Data.ActiveAlias = account.Alias
+				return account, true, s.saveLocked()
+			}
+		}
+	}
+	return Account{}, false, s.saveLocked()
+}
+
 func (s *Store) UpdateUsage(alias string, percent int, resetAt int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

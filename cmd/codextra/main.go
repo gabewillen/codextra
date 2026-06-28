@@ -147,6 +147,8 @@ func run() error {
 			return err
 		}
 		return nil
+	}, func(alias string) error {
+		return loginAccountFromTray(ctx, alias)
 	})
 	defer stopTray()
 
@@ -1082,6 +1084,28 @@ func activateAccount(alias string) (accounts.Account, error) {
 		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
 	}
 	return account, nil
+}
+
+// loginAccountFromTray re-authenticates alias by re-running the normal login
+// flow (codextra login <alias>), which opens the OAuth browser flow and imports
+// the resulting tokens back into the registry. It re-execs codextra so the flow
+// is identical to the CLI, inheriting this process's streams so any prompt is
+// visible when codextra was launched from a terminal.
+func loginAccountFromTray(ctx context.Context, alias string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find codextra executable: %w", err)
+	}
+	log.Printf("codextra: re-authenticating account %q…", alias)
+	cmd := exec.CommandContext(ctx, exe, "login", alias)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("re-login %q: %w", alias, err)
+	}
+	log.Printf("codextra: account %q re-authenticated", alias)
+	return nil
 }
 
 // errUsageUnauthorized signals that the proxy could not authenticate the active
