@@ -279,24 +279,14 @@ func buildTrayMenu(storePath string, refreshUsage func(), onActivate func(string
 
 	menu := systray.NewMenu()
 
-	// Spotlight the current account at the top: name, then a line per rate-limit
-	// window (5h, Weekly) with its used percent and reset time, mirroring Codex.
-	if current, ok := findAccount(all, snapshot.CurrentAlias); ok {
-		menu.AddDisabled("codextra — " + displayAlias(current.Alias))
-		for _, line := range currentAccountUsageLines(current, now) {
-			menu.AddDisabled("   " + line)
-		}
-	} else {
-		menu.AddDisabled("codextra — no active account")
-		menu.AddDisabled("   sign in to an account below")
-	}
-	menu.AddSeparator()
-
 	if len(all) == 0 {
 		menu.AddDisabled("No accounts — run: codextra login <alias>")
 		return menu
 	}
 
+	// No gray usage header on top: the active account is shown in its list row
+	// and expanded inline with its usage, so usage lives next to the account it
+	// belongs to. Switching accounts moves which one is expanded.
 	ready, cooling, needsLogin := groupAccounts(all, now)
 	addAccountSection(menu, "Ready", ready, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
 	addAccountSection(menu, "Cooling down", cooling, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
@@ -351,19 +341,15 @@ func addAccountSection(menu *systray.Menu, title string, group []accounts.Accoun
 			}
 			refreshUsage()
 		})
-	}
-}
-
-func findAccount(list []accounts.Account, alias string) (accounts.Account, bool) {
-	if alias == "" {
-		return accounts.Account{}, false
-	}
-	for _, account := range list {
-		if account.Alias == alias {
-			return account, true
+		// Expand only the active account inline, beneath its row, with its usage
+		// windows. Inactive accounts stay collapsed (usage is fetched through the
+		// proxy for the active account only, so theirs would be stale or empty).
+		if account.Alias == currentAlias {
+			for _, line := range currentAccountUsageLines(account, now) {
+				menu.AddDisabled("      " + line)
+			}
 		}
 	}
-	return accounts.Account{}, false
 }
 
 func groupAccounts(list []accounts.Account, now time.Time) (ready, cooling, needsLogin []accounts.Account) {
@@ -381,10 +367,10 @@ func groupAccounts(list []accounts.Account, now time.Time) (ready, cooling, need
 	return
 }
 
-// currentAccountUsageLines renders the spotlight body for the active account:
-// one line per rate-limit window (5h, Weekly) with its used percent and reset
-// time, mirroring Codex. A cooling-down account shows its cooldown instead, and
-// an account with no usage data yet shows a placeholder.
+// currentAccountUsageLines renders the active account's usage inline beneath its
+// row: one line per rate-limit window (5h, Weekly) with its used percent and
+// reset time, mirroring Codex. A cooling-down account shows its cooldown
+// instead, and an account with no usage data yet shows a placeholder.
 func currentAccountUsageLines(account accounts.Account, now time.Time) []string {
 	if disabledUntil, reason := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
 		return []string{fmt.Sprintf("%s · cools down in %s", reason, humanizeDuration(disabledUntil.Sub(now)))}
@@ -422,24 +408,16 @@ func formatResetTime(reset, now time.Time) string {
 func formatAccountMenuLabel(account accounts.Account, now time.Time) string {
 	alias := displayAlias(account.Alias)
 
+	// No status glyph: the section the row sits in (Ready / Cooling down / Needs
+	// sign-in) already conveys state, and the ✓ marks the active account. Colored
+	// dots just added noise.
 	if strings.TrimSpace(account.AccessToken) == "" {
-		return fmt.Sprintf("%s  %s  —  Sign in", accountGlyph(account, now), alias)
+		return alias + "  —  Sign in"
 	}
 	if disabledUntil, reason := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
-		return fmt.Sprintf("%s  %s  ·  %s %s",
-			accountGlyph(account, now), alias, reason, humanizeDuration(disabledUntil.Sub(now)))
+		return fmt.Sprintf("%s  ·  %s %s", alias, reason, humanizeDuration(disabledUntil.Sub(now)))
 	}
-	return fmt.Sprintf("%s  %s", accountGlyph(account, now), alias)
-}
-
-func accountGlyph(account accounts.Account, now time.Time) string {
-	if strings.TrimSpace(account.AccessToken) == "" {
-		return "🔴"
-	}
-	if disabledUntil, _ := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
-		return "🟡"
-	}
-	return "🟢"
+	return alias
 }
 
 func displayAlias(alias string) string {
