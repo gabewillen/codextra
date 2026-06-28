@@ -95,7 +95,8 @@ using the account ID. Use `login --tag <alias>` to choose the alias yourself.
 Use aliases for your own paid personal subscriptions; do not use `codextra` to
 manage pools of free or throwaway accounts.
 
-Only `login` and the internal `serve-proxy` command are reserved by `codextra`.
+Only `login`, `install-app`, and the internal `serve-proxy` command are reserved
+by `codextra`.
 All other arguments are passed to `codex` unchanged after injecting the
 `chatgpt_base_url` override.
 
@@ -121,6 +122,23 @@ arguments are passed to `codex app` after the proxy config overrides, so a path
 argument opens that workspace in Codex Desktop. Keep the `codextra --desktop`
 process running while using the desktop app, because it keeps the local proxy
 alive.
+
+### Desktop launcher app (macOS)
+
+To launch Codex Desktop behind the proxy by clicking an icon instead of running
+`codextra --desktop` from a terminal, install a launcher app:
+
+```sh
+codextra install-app
+```
+
+This creates `~/Applications/Codextra.app` — a small bundle that runs
+`codextra --desktop` when opened from Finder, Launchpad, or the Dock, using the
+codextra logo as its icon. It bakes in the resolved paths to `codextra` and
+`codex` so it works even though macOS launches apps with a minimal `PATH`. The
+launcher runs as a menu-bar agent (the tray), and Codex Desktop opens as usual.
+Re-run `codextra install-app` after upgrading codextra to refresh the bundle,
+and remove it with `rm -rf ~/Applications/Codextra.app`.
 
 By default, `codextra` looks for `codex` on `PATH`. Override it with:
 
