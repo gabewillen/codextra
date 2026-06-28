@@ -18,13 +18,11 @@ func TestSignedOutAccountLabelCuesSignIn(t *testing.T) {
 	if !strings.Contains(label, "Sign in") {
 		t.Fatalf("signed-out label = %q, want a Sign in cue", label)
 	}
-	if !strings.Contains(label, "🔴") {
-		t.Fatalf("signed-out label = %q, want the needs-sign-in glyph", label)
-	}
 
+	// The label is plain text now — no emoji status dots, just the alias.
 	ready := formatAccountMenuLabel(accounts.Account{Alias: "work", AccessToken: "t"}, now)
-	if !strings.Contains(ready, "🟢") {
-		t.Fatalf("ready label = %q, want the ready glyph", ready)
+	if ready != "work" {
+		t.Fatalf("ready label = %q, want plain %q", ready, "work")
 	}
 }
 
