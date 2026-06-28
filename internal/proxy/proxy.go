@@ -240,6 +240,41 @@ func (h *handler) serveProxied(w http.ResponseWriter, r *http.Request, makeAttem
 			continue
 		}
 
+		// A 401 that still reports an invalidated session after we tried to
+		// refresh cannot be fixed by codextra: the account was signed out
+		// server-side and needs a fresh login. Its access token may not be
+		// expired, so this is the only point we can detect it. Drop it from
+		// rotation (which surfaces it in the tray as "Needs sign-in") and fail
+		// over to another eligible account so requests keep working.
+		if attempt.resp.StatusCode == http.StatusUnauthorized && tokenRefreshed && isSessionInvalidated(attempt.resp) {
+			attempt.onRetry()
+			h.refreshBurn.clear(account.Alias)
+			next, rotated, markErr := h.store.MarkNeedsLogin(account.Alias, time.Now())
+			if markErr != nil {
+				h.logger.Warn("account_mark_needs_login_failed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias, "error", markErr)
+				http.Error(w, "codextra account "+account.Alias+" needs sign-in: run codextra login "+account.Alias, http.StatusUnauthorized)
+				return
+			}
+			h.logger.Warn("account_session_invalidated", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			if !rotated {
+				http.Error(w, "codextra account "+account.Alias+" needs sign-in: run codextra login "+account.Alias, http.StatusUnauthorized)
+				return
+			}
+			if adopted, ok, adoptErr := h.adoptFromCodexAuthWithoutNotify(next, time.Now()); adoptErr != nil {
+				h.logger.Warn("codex_auth_sync_failed", "alias", next.Alias, "error", adoptErr)
+			} else if ok {
+				h.logger.Info("codex_auth_synced", "alias", next.Alias)
+				next = adopted
+			}
+			if err := h.notifyAccountUpdate(next); err != nil {
+				h.logger.Warn("account_sync_failed", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias, "error", err)
+			}
+			h.logger.Info("account_failed_over", "method", r.Method, "path", r.URL.Path, "from", account.Alias, "to", next.Alias)
+			account = next
+			tokenRefreshed = false
+			continue
+		}
+
 		// Update the burn guard before the final disposition: a 401 that survived
 		// a forced refresh means the refresh was unhelpful, so suppress further
 		// forced refreshes for this account; any non-401 response means its
@@ -683,6 +718,38 @@ func isUsageLimit(resp *http.Response) bool {
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return usageLimitMarker(resp.Header, body)
+}
+
+// isSessionInvalidated reports whether a 401 response says the account was
+// signed out server-side (e.g. signing in elsewhere revoked the session). Such
+// a token cannot be recovered by refreshing — even though its JWT may not be
+// expired — so the only fix is to re-authenticate the account. The body is
+// rebuffered so callers can still read it.
+func isSessionInvalidated(resp *http.Response) bool {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		return false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	switch responseErrorCode(body) {
+	case "token_invalidated", "token_revoked":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseErrorCode(body []byte) string {
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	return payload.Error.Code
 }
 
 func limitInfo(resp *http.Response) (string, time.Time) {

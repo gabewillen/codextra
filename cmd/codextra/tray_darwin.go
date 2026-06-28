@@ -162,11 +162,14 @@ func startTray(ctx context.Context, storePath, proxyURL string, onActivate func(
 		// unauthorizedAlias is the account whose usage endpoint last returned 401.
 		// While it stays active we skip periodic polls: each poll makes the proxy
 		// force a token refresh, so hammering a doomed account burns its single-use
-		// refresh token. An explicit refresh (e.g. after a switch) always retries.
+		// refresh token. We also skip when there is no active account at all (e.g.
+		// every account needs sign-in). An explicit refresh (after a switch)
+		// always retries.
 		var unauthorizedAlias string
 		forced := true
 		for {
-			if forced || unauthorizedAlias == "" || activeAlias(storePath) != unauthorizedAlias {
+			cur := activeAlias(storePath)
+			if forced || (cur != "" && cur != unauthorizedAlias) {
 				alias, err := refreshAccountUsage(trayCtx, proxyURL, storePath)
 				switch {
 				case err == nil:

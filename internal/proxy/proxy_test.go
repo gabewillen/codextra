@@ -333,6 +333,60 @@ func TestProxyReactivelyRefreshesWhenUpstreamRejectsFreshJWT(t *testing.T) {
 	}
 }
 
+func TestProxyFailsOverWhenActiveSessionIsInvalidated(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir()) // no codex auth.json to adopt from
+
+	// The refresh endpoint rejects the dead account's refresh token, so codextra
+	// cannot recover it by refreshing.
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "refresh_token_invalidated"}})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	deadToken := freshJWT(t) // not expired, yet invalidated server-side
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer "+deadToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":  map[string]any{"code": "token_invalidated", "message": "Your authentication token has been invalidated. Please try signing in again."},
+				"status": 401,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok from healthy account")
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "dead",
+		Accounts: []accounts.Account{
+			{Alias: "dead", AccessToken: deadToken, RefreshToken: "refresh-dead"},
+			{Alias: "healthy", AccessToken: "token-healthy", RefreshToken: "refresh-healthy"},
+		},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	resp := httptest.NewRecorder()
+	server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil))
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := resp.Body.String(); got != "ok from healthy account" {
+		t.Fatalf("body = %q, want healthy account response", got)
+	}
+	if store.Data.ActiveAlias != "healthy" {
+		t.Fatalf("ActiveAlias = %q, want healthy (failed over)", store.Data.ActiveAlias)
+	}
+	dead, _ := store.Get("dead")
+	if dead.AccessToken != "" {
+		t.Fatalf("dead account access token = %q, want cleared (needs sign-in)", dead.AccessToken)
+	}
+}
+
 func TestProxyGuardSuppressesRepeatedForcedRefreshWhenRefreshDoesNotHelp(t *testing.T) {
 	var refreshCalls int
 	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

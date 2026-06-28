@@ -9,6 +9,75 @@ import (
 	"time"
 )
 
+func TestMarkNeedsLoginClearsTokenAndFailsOver(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{
+		ActiveAlias: "dead",
+		Accounts: []Account{
+			{Alias: "dead", AccessToken: "token-dead", RefreshToken: "r1"},
+			{Alias: "healthy", AccessToken: "token-healthy", RefreshToken: "r2"},
+		},
+	}
+
+	next, rotated, err := store.MarkNeedsLogin("dead", time.Now())
+	if err != nil {
+		t.Fatalf("MarkNeedsLogin() error = %v", err)
+	}
+	if !rotated {
+		t.Fatal("rotated = false, want true (a healthy account exists)")
+	}
+	if next.Alias != "healthy" {
+		t.Fatalf("next alias = %q, want healthy", next.Alias)
+	}
+	if store.Data.ActiveAlias != "healthy" {
+		t.Fatalf("ActiveAlias = %q, want healthy", store.Data.ActiveAlias)
+	}
+
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	dead, ok := loaded.Get("dead")
+	if !ok {
+		t.Fatal("dead account missing after MarkNeedsLogin")
+	}
+	if dead.AccessToken != "" {
+		t.Fatalf("dead access token = %q, want cleared", dead.AccessToken)
+	}
+}
+
+func TestMarkNeedsLoginWithoutFailoverReportsNoRotation(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{
+		ActiveAlias: "solo",
+		Accounts:    []Account{{Alias: "solo", AccessToken: "token-solo", RefreshToken: "r1"}},
+	}
+
+	_, rotated, err := store.MarkNeedsLogin("solo", time.Now())
+	if err != nil {
+		t.Fatalf("MarkNeedsLogin() error = %v", err)
+	}
+	if rotated {
+		t.Fatal("rotated = true, want false (no other eligible account)")
+	}
+	solo, _ := store.Get("solo")
+	if solo.AccessToken != "" {
+		t.Fatalf("solo access token = %q, want cleared", solo.AccessToken)
+	}
+}
+
 func TestUpsertPersistsAndReplacesAccount(t *testing.T) {
 	t.Parallel()
 
