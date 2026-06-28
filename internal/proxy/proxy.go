@@ -55,6 +55,7 @@ func New(config Config) (*http.Server, error) {
 		logger:          config.Logger,
 		onAccountUpdate: config.OnAccountUpdate,
 		refreshLocks:    newRefreshLocks(),
+		refreshBurn:     newRefreshBurnGuard(),
 	}
 	if handler.logger == nil {
 		handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -82,6 +83,68 @@ type handler struct {
 	logger          *slog.Logger
 	onAccountUpdate func(accounts.Account) error
 	refreshLocks    *refreshLocks
+	refreshBurn     *refreshBurnGuard
+}
+
+// refreshBurnWindow is how long a reactively-refreshed account is barred from
+// another forced refresh after the refreshed token still failed upstream.
+const refreshBurnWindow = 60 * time.Second
+
+// refreshBurnGuard prevents a doomed account from burning its single-use OAuth
+// refresh token on every request. Each reactive 401 forces a refresh, which
+// rotates the refresh token; if the freshly-issued token is also rejected by
+// upstream, refreshing again only consumes another token without helping. The
+// guard records such an unhelpful refresh per alias and suppresses further
+// forced refreshes for refreshBurnWindow. Suppression keys on the refresh token
+// value, so a rotation or a re-login (which changes the token) lifts it at once.
+type refreshBurnGuard struct {
+	mu      sync.Mutex
+	byAlias map[string]refreshBurnRecord
+}
+
+type refreshBurnRecord struct {
+	refreshToken string
+	at           time.Time
+}
+
+func newRefreshBurnGuard() *refreshBurnGuard {
+	return &refreshBurnGuard{byAlias: map[string]refreshBurnRecord{}}
+}
+
+// suppressed reports whether a forced refresh for alias should be skipped: a
+// prior forced refresh produced this same refresh token, upstream still rejected
+// it, and the window has not elapsed. An expired entry is dropped and a token
+// mismatch (rotation/re-login) is never suppressed.
+func (g *refreshBurnGuard) suppressed(alias, refreshToken string, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rec, ok := g.byAlias[alias]
+	if !ok || rec.refreshToken != refreshToken {
+		return false
+	}
+	if now.Sub(rec.at) >= refreshBurnWindow {
+		delete(g.byAlias, alias)
+		return false
+	}
+	return true
+}
+
+// markUnhelpful records that a forced refresh produced refreshToken yet upstream
+// still returned 401, starting a suppression window for alias.
+func (g *refreshBurnGuard) markUnhelpful(alias, refreshToken string, now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.byAlias[alias] = refreshBurnRecord{refreshToken: refreshToken, at: now}
+}
+
+// clear lifts any suppression for alias, called once it serves a non-401
+// response again.
+func (g *refreshBurnGuard) clear(alias string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.byAlias[alias]; ok {
+		delete(g.byAlias, alias)
+	}
 }
 
 type refreshLocks struct {
@@ -162,7 +225,8 @@ func (h *handler) serveProxied(w http.ResponseWriter, r *http.Request, makeAttem
 			return
 		}
 
-		if attempt.resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed {
+		if attempt.resp.StatusCode == http.StatusUnauthorized && !tokenRefreshed &&
+			!h.refreshBurn.suppressed(account.Alias, account.RefreshToken, time.Now()) {
 			attempt.onRetry()
 			updated, refreshErr := h.refreshAccountTokens(r.Context(), account, true)
 			if refreshErr != nil {
@@ -174,6 +238,21 @@ func (h *handler) serveProxied(w http.ResponseWriter, r *http.Request, makeAttem
 			account = updated
 			tokenRefreshed = true
 			continue
+		}
+
+		// Update the burn guard before the final disposition: a 401 that survived
+		// a forced refresh means the refresh was unhelpful, so suppress further
+		// forced refreshes for this account; any non-401 response means its
+		// credentials work again, so lift any suppression.
+		if attempt.resp.StatusCode == http.StatusUnauthorized {
+			if tokenRefreshed {
+				h.refreshBurn.markUnhelpful(account.Alias, account.RefreshToken, time.Now())
+				h.logger.Warn("token_refresh_unhelpful", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			} else {
+				h.logger.Warn("token_refresh_suppressed", "method", r.Method, "path", r.URL.Path, "alias", account.Alias)
+			}
+		} else {
+			h.refreshBurn.clear(account.Alias)
 		}
 
 		if attempt.resp.StatusCode != http.StatusTooManyRequests || !isUsageLimit(attempt.resp) {

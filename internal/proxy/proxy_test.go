@@ -333,6 +333,84 @@ func TestProxyReactivelyRefreshesWhenUpstreamRejectsFreshJWT(t *testing.T) {
 	}
 }
 
+func TestProxyGuardSuppressesRepeatedForcedRefreshWhenRefreshDoesNotHelp(t *testing.T) {
+	var refreshCalls int
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls++
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "token-new",
+			"refresh_token": "refresh-new",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refreshServer.URL)
+
+	// Upstream rejects every token, even a freshly refreshed one, so each forced
+	// refresh is unhelpful and only burns the account's single-use refresh token.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":  map[string]any{"code": "token_expired"},
+			"status": 401,
+		})
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, accounts.Data{
+		ActiveAlias: "personal",
+		Accounts: []accounts.Account{{
+			Alias:        "personal",
+			AccessToken:  freshJWT(t),
+			RefreshToken: "refresh-old",
+		}},
+	})
+	server := newProxyWithConfig(t, Config{Upstream: upstream.URL, Store: store})
+
+	for i := 0; i < 3; i++ {
+		resp := httptest.NewRecorder()
+		server.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader("body")))
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("request %d status = %d, want %d", i, resp.Code, http.StatusUnauthorized)
+		}
+	}
+
+	// Only the first request forces a refresh; the guard then suppresses it so a
+	// doomed account does not burn a fresh refresh token on every request.
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1 (guard should suppress repeats)", refreshCalls)
+	}
+}
+
+func TestRefreshBurnGuard(t *testing.T) {
+	t.Parallel()
+
+	g := newRefreshBurnGuard()
+	now := time.Now()
+
+	if g.suppressed("work", "rt-1", now) {
+		t.Fatal("empty guard should not suppress")
+	}
+
+	g.markUnhelpful("work", "rt-1", now)
+	if !g.suppressed("work", "rt-1", now.Add(refreshBurnWindow-time.Second)) {
+		t.Fatal("should suppress within the window for the same refresh token")
+	}
+	if g.suppressed("work", "rt-2", now) {
+		t.Fatal("should not suppress when the refresh token changed (rotation/re-login)")
+	}
+
+	g.markUnhelpful("work", "rt-1", now)
+	if g.suppressed("work", "rt-1", now.Add(refreshBurnWindow)) {
+		t.Fatal("should not suppress once the window elapses")
+	}
+
+	g.markUnhelpful("work", "rt-1", now)
+	g.clear("work")
+	if g.suppressed("work", "rt-1", now) {
+		t.Fatal("clear should lift suppression")
+	}
+}
+
 func TestProxyRefreshesExpiredTokenBeforeReturningResponse(t *testing.T) {
 	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
