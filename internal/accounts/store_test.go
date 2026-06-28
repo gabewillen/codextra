@@ -462,3 +462,120 @@ func TestStoreFileIsJSON(t *testing.T) {
 		t.Fatalf("ActiveAlias = %q, want personal", data.ActiveAlias)
 	}
 }
+
+func TestSnapshotReturnsCurrentAliasAndCopiesAccounts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	store, err := LoadStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+
+	store.Data = Data{
+		ActiveAlias: "personal",
+		Accounts: []Account{
+			{
+				Alias:           "personal",
+				AccessToken:     "token-personal",
+				DisabledUntil:   map[string]int64{"codex_weekly": now.Add(-time.Hour).Unix()},
+				LastLimitStatus: map[string]string{"codex_weekly": "ready"},
+			},
+			{
+				Alias:       "work",
+				AccessToken: "token-work",
+			},
+		},
+	}
+
+	snapshot, err := store.Snapshot(now)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.ActiveAlias != "personal" {
+		t.Fatalf("ActiveAlias = %q, want personal", snapshot.ActiveAlias)
+	}
+	if snapshot.CurrentAlias != "personal" {
+		t.Fatalf("CurrentAlias = %q, want personal", snapshot.CurrentAlias)
+	}
+	if len(snapshot.Accounts) != 2 {
+		t.Fatalf("len(snapshot.Accounts) = %d, want 2", len(snapshot.Accounts))
+	}
+
+	snapshot.Accounts[0].DisabledUntil["codex_weekly"] = now.Add(time.Hour).Unix()
+	if store.Data.Accounts[0].DisabledUntil["codex_weekly"] == snapshot.Accounts[0].DisabledUntil["codex_weekly"] {
+		t.Fatal("snapshot should copy account maps, not share references")
+	}
+}
+
+func TestUpdateUsagePersistsAndReadsBack(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(Account{Alias: "personal", AccessToken: "token"}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	resetAt := time.Unix(1_778_632_231, 0).Unix()
+	if err := store.UpdateUsage("personal", 42, resetAt); err != nil {
+		t.Fatalf("UpdateUsage() error = %v", err)
+	}
+
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	if len(loaded.Data.Accounts) != 1 {
+		t.Fatalf("len(Accounts) = %d, want 1", len(loaded.Data.Accounts))
+	}
+	if loaded.Data.Accounts[0].UsagePercent != 42 {
+		t.Fatalf("UsagePercent = %d, want 42", loaded.Data.Accounts[0].UsagePercent)
+	}
+	if loaded.Data.Accounts[0].UsageResetAt != resetAt {
+		t.Fatalf("UsageResetAt = %d, want %d", loaded.Data.Accounts[0].UsageResetAt, resetAt)
+	}
+}
+
+func TestUpdateUsageReturnsErrorForUnknownAlias(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.UpdateUsage("missing", 0, 0); err == nil {
+		t.Fatal("UpdateUsage(missing) should return error")
+	}
+}
+
+func TestUpdateUsageResetsExistingValues(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(Account{Alias: "personal", AccessToken: "token", UsagePercent: 80, UsageResetAt: 1}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	if err := store.UpdateUsage("personal", 0, 0); err != nil {
+		t.Fatalf("UpdateUsage() error = %v", err)
+	}
+
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	if loaded.Data.Accounts[0].UsagePercent != 0 {
+		t.Fatalf("UsagePercent = %d, want 0", loaded.Data.Accounts[0].UsagePercent)
+	}
+	if loaded.Data.Accounts[0].UsageResetAt != 0 {
+		t.Fatalf("UsageResetAt = %d, want 0", loaded.Data.Accounts[0].UsageResetAt)
+	}
+}

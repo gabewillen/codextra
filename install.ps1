@@ -81,6 +81,7 @@ try {
     Copy-Item -Force (Join-Path $Temp "$Binary.exe") (Join-Path $InstallDir "$Binary.exe")
 
     Write-Host "installed $Binary $Version to $(Join-Path $InstallDir "$Binary.exe")"
+    Write-Host "Windows installs do not yet auto-restart a running codextra process."
 
     $pathEntries = $env:PATH -split ";"
     if ($pathEntries -notcontains $InstallDir) {

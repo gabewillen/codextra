@@ -20,6 +20,8 @@ type Account struct {
 	PlanType        string            `json:"plan_type,omitempty"`
 	DisabledUntil   map[string]int64  `json:"disabled_until,omitempty"`
 	LastLimitStatus map[string]string `json:"last_limit_status,omitempty"`
+	UsagePercent    int               `json:"usage_percent,omitempty"`
+	UsageResetAt    int64             `json:"usage_reset_at,omitempty"`
 }
 
 type Store struct {
@@ -31,6 +33,12 @@ type Store struct {
 type Data struct {
 	ActiveAlias string    `json:"active_alias,omitempty"`
 	Accounts    []Account `json:"accounts"`
+}
+
+type Snapshot struct {
+	ActiveAlias  string
+	CurrentAlias string
+	Accounts     []Account
 }
 
 func LoadStore(path string) (*Store, error) {
@@ -65,6 +73,69 @@ func (s *Store) Current(now time.Time) (Account, bool) {
 		}
 	}
 	return Account{}, false
+}
+
+func (s *Store) Snapshot(now time.Time) (Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.reloadLocked(); err != nil {
+		return Snapshot{}, err
+	}
+
+	snapshot := Snapshot{
+		ActiveAlias: s.Data.ActiveAlias,
+		Accounts:    make([]Account, len(s.Data.Accounts)),
+	}
+	for i := range s.Data.Accounts {
+		snapshot.Accounts[i] = cloneAccount(s.Data.Accounts[i])
+	}
+
+	if alias, ok := s.currentAliasLocked(now); ok {
+		snapshot.CurrentAlias = alias
+	}
+	return snapshot, nil
+}
+
+func (s *Store) currentAliasLocked(now time.Time) (string, bool) {
+	if account, ok := s.findEligibleLocked(s.Data.ActiveAlias, now); ok {
+		return account.Alias, true
+	}
+	for _, account := range s.Data.Accounts {
+		if eligible(account, now) {
+			return account.Alias, true
+		}
+	}
+	return "", false
+}
+
+func cloneAccount(account Account) Account {
+	cloned := account
+	cloned.DisabledUntil = cloneInt64Map(account.DisabledUntil)
+	cloned.LastLimitStatus = cloneStringMap(account.LastLimitStatus)
+	return cloned
+}
+
+func cloneInt64Map(values map[string]int64) map[string]int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]int64, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (s *Store) Get(alias string) (Account, bool) {
@@ -104,6 +175,21 @@ func (s *Store) RotateFrom(alias string, limit string, resetAt time.Time, now ti
 		}
 	}
 	return Account{}, false, s.saveLocked()
+}
+
+func (s *Store) UpdateUsage(alias string, percent int, resetAt int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.reloadLocked()
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias == alias {
+			s.Data.Accounts[i].UsagePercent = percent
+			s.Data.Accounts[i].UsageResetAt = resetAt
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("account %q not found", alias)
 }
 
 func (s *Store) UpdateTokens(alias string, tokens Account) (Account, error) {
