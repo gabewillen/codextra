@@ -517,7 +517,7 @@ func TestFetchAccountUsageFlagsUnauthorized(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, err := fetchAccountUsage(context.Background(), server.URL)
+	_, err := fetchAccountUsage(context.Background(), server.URL)
 	if err == nil {
 		t.Fatal("fetchAccountUsage() error = nil, want unauthorized")
 	}
@@ -529,24 +529,46 @@ func TestFetchAccountUsageFlagsUnauthorized(t *testing.T) {
 	}
 }
 
-func TestFetchAccountUsagePairsResetWithPeakWindow(t *testing.T) {
+func TestFetchAccountUsageReturnsCodexWindows(t *testing.T) {
 	t.Parallel()
 
+	// Mirrors the real wham/usage shape: primary (5h) and secondary (weekly).
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(`{"rate_limit":{"primary":{"used_percent":12,"reset_at":111},"secondary":{"used_percent":80,"reset_at":222}}}`))
+		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_at":111},"secondary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":222}}}`))
 	}))
 	defer server.Close()
 
-	percent, resetAt, err := fetchAccountUsage(context.Background(), server.URL)
+	windows, err := fetchAccountUsage(context.Background(), server.URL)
 	if err != nil {
 		t.Fatalf("fetchAccountUsage() error = %v", err)
 	}
-	if percent != 80 {
-		t.Fatalf("percent = %d, want 80", percent)
+	if len(windows) != 2 {
+		t.Fatalf("windows = %#v, want 2 (5h + weekly)", windows)
 	}
-	if resetAt != 222 {
-		t.Fatalf("resetAt = %d, want 222 (paired with the peak window)", resetAt)
+	if windows[0].Label != "5h" || windows[0].Percent != 12 || windows[0].ResetAt != 111 {
+		t.Fatalf("primary window = %#v, want {5h 12 111}", windows[0])
+	}
+	if windows[1].Label != "Weekly" || windows[1].Percent != 80 || windows[1].ResetAt != 222 {
+		t.Fatalf("secondary window = %#v, want {Weekly 80 222}", windows[1])
+	}
+}
+
+func TestUsageWindowLabel(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		seconds int64
+		want    string
+	}{
+		{18000, "5h"},
+		{604800, "Weekly"},
+		{86400, "Daily"},
+		{0, "Usage"},
+	} {
+		if got := usageWindowLabel(tc.seconds); got != tc.want {
+			t.Fatalf("usageWindowLabel(%d) = %q, want %q", tc.seconds, got, tc.want)
+		}
 	}
 }
 

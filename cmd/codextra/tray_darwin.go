@@ -279,14 +279,16 @@ func buildTrayMenu(storePath string, refreshUsage func(), onActivate func(string
 
 	menu := systray.NewMenu()
 
-	// Spotlight the current account at the top: name, then a glyph + fat usage
-	// bar on its own line.
+	// Spotlight the current account at the top: name, then a line per rate-limit
+	// window (5h, Weekly) with its used percent and reset time, mirroring Codex.
 	if current, ok := findAccount(all, snapshot.CurrentAlias); ok {
 		menu.AddDisabled("codextra — " + displayAlias(current.Alias))
-		menu.AddDisabled("   " + accountGlyph(current, now) + "  " + currentAccountStatLine(current, now))
+		for _, line := range currentAccountUsageLines(current, now) {
+			menu.AddDisabled("   " + line)
+		}
 	} else {
 		menu.AddDisabled("codextra — no active account")
-		menu.AddDisabled("   ⚪  sign in to an account below")
+		menu.AddDisabled("   sign in to an account below")
 	}
 	menu.AddSeparator()
 
@@ -301,6 +303,18 @@ func buildTrayMenu(storePath string, refreshUsage func(), onActivate func(string
 	addAccountSection(menu, "Needs sign-in", needsLogin, snapshot.CurrentAlias, now, refreshUsage, onActivate, onLogin)
 
 	menu.AddSeparator()
+	// Re-authenticate lets any account — not just signed-out ones — be
+	// revalidated from the tray, e.g. before a session is about to expire or to
+	// recover one that was invalidated server-side.
+	revalidate := systray.NewMenu()
+	for _, account := range all {
+		alias := account.Alias
+		revalidate.Add(displayAlias(alias), func() {
+			trayLogf("menu re-authenticate selected alias=%q", alias)
+			onLogin(alias)
+		})
+	}
+	menu.AddSubmenu("Re-authenticate", revalidate)
 	menu.Add("↻  Refresh usage", func() {
 		trayLogf("menu refresh-usage selected")
 		refreshUsage()
@@ -318,7 +332,7 @@ func addAccountSection(menu *systray.Menu, title string, group []accounts.Accoun
 	menu.AddDisabled(title)
 	for _, account := range group {
 		alias := account.Alias
-		label := formatAccountMenuLabel(account, currentAlias, now)
+		label := formatAccountMenuLabel(account, now)
 		trayLogf("adding account to menu: alias=%s label=%q", alias, label)
 		// A signed-out account has no token to switch to; clicking it
 		// re-authenticates instead of selecting it.
@@ -367,24 +381,45 @@ func groupAccounts(list []accounts.Account, now time.Time) (ready, cooling, need
 	return
 }
 
-// currentAccountStatLine is the fat status line shown under the spotlighted
-// current account: a 16-segment usage bar followed by percent and reset hint.
-func currentAccountStatLine(account accounts.Account, now time.Time) string {
+// currentAccountUsageLines renders the spotlight body for the active account:
+// one line per rate-limit window (5h, Weekly) with its used percent and reset
+// time, mirroring Codex. A cooling-down account shows its cooldown instead, and
+// an account with no usage data yet shows a placeholder.
+func currentAccountUsageLines(account accounts.Account, now time.Time) []string {
 	if disabledUntil, reason := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
-		return fmt.Sprintf("%s · cools down in %s", reason, humanizeDuration(disabledUntil.Sub(now)))
+		return []string{fmt.Sprintf("%s · cools down in %s", reason, humanizeDuration(disabledUntil.Sub(now)))}
 	}
-	bar := usageBar(account.UsagePercent, 16)
-	line := fmt.Sprintf("%s  %d%%", bar, account.UsagePercent)
-	if account.UsageResetAt > 0 {
-		reset := time.Unix(account.UsageResetAt, 0)
-		if reset.After(now) {
-			line += " · resets in " + humanizeDuration(reset.Sub(now))
+	if len(account.Usage) == 0 {
+		return []string{"usage unavailable"}
+	}
+	lines := make([]string, 0, len(account.Usage))
+	for _, w := range account.Usage {
+		lines = append(lines, usageWindowLine(w, now))
+	}
+	return lines
+}
+
+// usageWindowLine formats a single window like Codex: "5h     12%  ·  resets 3:53 PM".
+func usageWindowLine(w accounts.UsageWindow, now time.Time) string {
+	line := fmt.Sprintf("%-7s %3d%%", w.Label, w.Percent)
+	if w.ResetAt > 0 {
+		if reset := time.Unix(w.ResetAt, 0); reset.After(now) {
+			line += "  ·  resets " + formatResetTime(reset, now)
 		}
 	}
 	return line
 }
 
-func formatAccountMenuLabel(account accounts.Account, currentAlias string, now time.Time) string {
+// formatResetTime shows a clock time for resets within a day (e.g. "3:53 PM")
+// and a date for resets further out (e.g. "Jul 2"), matching Codex.
+func formatResetTime(reset, now time.Time) string {
+	if reset.Sub(now) < 24*time.Hour {
+		return reset.Format("3:04 PM")
+	}
+	return reset.Format("Jan 2")
+}
+
+func formatAccountMenuLabel(account accounts.Account, now time.Time) string {
 	alias := displayAlias(account.Alias)
 
 	if strings.TrimSpace(account.AccessToken) == "" {
@@ -393,13 +428,6 @@ func formatAccountMenuLabel(account accounts.Account, currentAlias string, now t
 	if disabledUntil, reason := soonestDisabledUntil(account.DisabledUntil, now); !disabledUntil.IsZero() {
 		return fmt.Sprintf("%s  %s  ·  %s %s",
 			accountGlyph(account, now), alias, reason, humanizeDuration(disabledUntil.Sub(now)))
-	}
-	// Usage is fetched through the proxy for the active account only, so only the
-	// current account has fresh data. Rendering a meter for the others would show
-	// stale percentages, so inactive ready rows show just the alias.
-	if account.Alias == currentAlias {
-		return fmt.Sprintf("%s  %s   %s  %d%%",
-			accountGlyph(account, now), alias, usageBar(account.UsagePercent, 10), account.UsagePercent)
 	}
 	return fmt.Sprintf("%s  %s", accountGlyph(account, now), alias)
 }
@@ -412,49 +440,6 @@ func accountGlyph(account accounts.Account, now time.Time) string {
 		return "🟡"
 	}
 	return "🟢"
-}
-
-// usagePartials are the left-aligned block fragments for sub-cell fill, indexed
-// by eighths: index 1 is ▏ (1/8) … index 7 is ▉ (7/8). A full cell uses █.
-var usagePartials = [8]string{"", "▏", "▎", "▍", "▌", "▋", "▊", "▉"}
-
-// usageBar renders a fixed-width unicode meter. width is the number of cells.
-// percent is clamped to [0,100] and resolved to eighth-of-a-cell precision, so
-// the fill edge lands close to the true value instead of snapping to whole
-// cells. Filled cells use a solid block (█), the leading edge a partial block,
-// and the remaining track a light shade (░).
-func usageBar(percent, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-
-	// Work in eighths of a cell for smooth sub-cell resolution.
-	eighths := percent * width * 8 / 100
-	if eighths == 0 && percent > 0 {
-		eighths = 1 // never show an empty meter for non-zero usage
-	}
-	full := eighths / 8
-	rem := eighths % 8
-	if full > width {
-		full, rem = width, 0
-	}
-
-	var b strings.Builder
-	b.Grow(width * 3)
-	b.WriteString(strings.Repeat("█", full))
-	empty := width - full
-	if rem > 0 && empty > 0 {
-		b.WriteString(usagePartials[rem])
-		empty--
-	}
-	b.WriteString(strings.Repeat("░", empty))
-	return b.String()
 }
 
 func displayAlias(alias string) string {
