@@ -508,6 +508,93 @@ func TestUpdateTokensPreservesLimitState(t *testing.T) {
 	}
 }
 
+func TestReplaceCredentialsClearsRefreshAndPreservesReloadedState(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(Account{
+		Alias:        "personal",
+		AccessToken:  "token-old",
+		RefreshToken: "refresh-old",
+	}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	staleStore, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(stale) error = %v", err)
+	}
+	resetAt := time.Unix(1_700_000_123, 0)
+	external := Data{
+		ActiveAlias: "other",
+		Accounts: []Account{
+			{
+				Alias:         "personal",
+				AccessToken:   "token-old",
+				RefreshToken:  "refresh-old",
+				DisabledUntil: map[string]int64{"codex_weekly": resetAt.Unix()},
+				Usage:         []UsageWindow{{Label: "Weekly", Percent: 88, ResetAt: resetAt.Unix()}},
+			},
+			{Alias: "other", AccessToken: "token-other"},
+		},
+	}
+	bytes, err := json.Marshal(external)
+	if err != nil {
+		t.Fatalf("Marshal(external) error = %v", err)
+	}
+	if err := os.WriteFile(path, bytes, 0600); err != nil {
+		t.Fatalf("WriteFile(external) error = %v", err)
+	}
+
+	updated, err := staleStore.ReplaceCredentials("personal", Account{
+		AccessToken: "token-new",
+		AccountID:   "acct-personal",
+	})
+	if err != nil {
+		t.Fatalf("ReplaceCredentials() error = %v", err)
+	}
+	if updated.AccessToken != "token-new" {
+		t.Fatalf("AccessToken = %q, want token-new", updated.AccessToken)
+	}
+	if updated.RefreshToken != "" {
+		t.Fatalf("RefreshToken = %q, want cleared", updated.RefreshToken)
+	}
+	if got := updated.DisabledUntil["codex_weekly"]; got != resetAt.Unix() {
+		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt.Unix())
+	}
+	if len(updated.Usage) != 1 || updated.Usage[0].Percent != 88 {
+		t.Fatalf("Usage = %#v, want preserved external usage", updated.Usage)
+	}
+
+	reloaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if reloaded.Data.ActiveAlias != "other" {
+		t.Fatalf("ActiveAlias = %q, want other", reloaded.Data.ActiveAlias)
+	}
+	if _, ok := reloaded.Get("other"); !ok {
+		t.Fatal("other account was lost")
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccountID != "acct-personal" {
+		t.Fatalf("AccountID = %q, want acct-personal", personal.AccountID)
+	}
+	if personal.RefreshToken != "" {
+		t.Fatalf("persisted RefreshToken = %q, want cleared", personal.RefreshToken)
+	}
+	if len(personal.Usage) != 1 || personal.Usage[0].Percent != 88 {
+		t.Fatalf("persisted Usage = %#v, want preserved external usage", personal.Usage)
+	}
+}
+
 func TestStoreFileIsJSON(t *testing.T) {
 	t.Parallel()
 

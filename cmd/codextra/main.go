@@ -1098,23 +1098,52 @@ func activateAccount(alias string) (accounts.Account, error) {
 	return account, nil
 }
 
-// loginAccountFromTray re-authenticates alias by re-running the normal login
-// flow (codextra login <alias>), which opens the OAuth browser flow and imports
-// the resulting tokens back into the registry. It re-execs codextra so the flow
-// is identical to the CLI, inheriting this process's streams so any prompt is
-// visible when codextra was launched from a terminal.
-func loginAccountFromTray(ctx context.Context, alias string) error {
-	exe, err := os.Executable()
+func seedCodexAuthForAlias(alias, authPath string) error {
+	storePath, err := defaultStorePath()
 	if err != nil {
-		return fmt.Errorf("find codextra executable: %w", err)
+		return err
+	}
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		return err
+	}
+	account, ok := store.Get(alias)
+	if !ok {
+		return fmt.Errorf("account %q not found", alias)
+	}
+	if strings.TrimSpace(account.AccessToken) == "" {
+		return nil
+	}
+	return codexauth.Write(authPath, account)
+}
+
+// loginAccountFromTray re-authenticates alias by re-running the normal login
+// flow with an isolated Codex home seeded with the selected alias.
+// This keeps a tray re-auth scoped to the clicked account instead of whichever
+// alias happened to be active when the menu item was selected, and avoids racing
+// the detached proxy process for the real auth.json.
+func loginAccountFromTray(ctx context.Context, alias string) error {
+	tempHome, err := os.MkdirTemp("", "codextra-reauth-")
+	if err != nil {
+		return fmt.Errorf("create temporary Codex home: %w", err)
+	}
+	defer os.RemoveAll(tempHome)
+
+	authPath := filepath.Join(tempHome, "auth.json")
+	if err := seedCodexAuthForAlias(alias, authPath); err != nil {
+		return err
 	}
 	log.Printf("codextra: re-authenticating account %q…", alias)
-	cmd := exec.CommandContext(ctx, exe, "login", alias)
+	cmd := exec.CommandContext(ctx, getenv("CODEXTRA_CODEX_BIN", "codex"), "login")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = envWithValue(os.Environ(), "CODEX_HOME", tempHome)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("re-login %q: %w", alias, err)
+	}
+	if err := importAuthFromPath(alias, false, authPath); err != nil {
+		return fmt.Errorf("import re-login %q: %w", alias, err)
 	}
 	log.Printf("codextra: account %q re-authenticated", alias)
 	return nil
@@ -1345,6 +1374,19 @@ func codexEnv(base []string, proxyURL string) []string {
 		env = append(env, value)
 	}
 	env = append(env, "CODEXTRA_PROXY_URL="+proxyURL)
+	return env
+}
+
+func envWithValue(base []string, key, value string) []string {
+	prefix := key + "="
+	env := make([]string, 0, len(base)+1)
+	for _, existing := range base {
+		if strings.HasPrefix(existing, prefix) {
+			continue
+		}
+		env = append(env, existing)
+	}
+	env = append(env, prefix+value)
 	return env
 }
 

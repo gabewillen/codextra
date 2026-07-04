@@ -87,13 +87,18 @@ codextra --account personal-pro
 codextra --desktop .
 ```
 
+<!-- CLI login and account-selection behavior from cmd/codextra/login.go and cmd/codextra/main.go -->
 `login <alias>` runs the normal `codex login`, imports the resulting active
 Codex auth from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, and stores it
-under the alias. `login --tag` skips the login step and stores the current
-Codex auth, using the auth email as the alias when available and otherwise
-using the account ID. Use `login --tag <alias>` to choose the alias yourself.
-Use aliases for your own paid personal subscriptions; do not use `codextra` to
-manage pools of free or throwaway accounts.
+under the alias. If the alias already exists, only the token and identity fields
+are updated; usage and cooldown state remain in the codextra registry. If
+Codex returns credentials for a different existing alias, `codextra` updates
+that matching alias and refuses to overwrite the requested one. `login --tag`
+skips the login step and stores the current Codex auth, using the auth email as
+the alias when available and otherwise using the account ID. Use
+`login --tag <alias>` to choose the alias yourself. Use aliases for your own
+paid personal subscriptions; do not use `codextra` to manage pools of free or
+throwaway accounts.
 
 Only `login`, `install-app`, and the internal `serve-proxy` command are reserved
 by `codextra`.
@@ -193,6 +198,7 @@ by the user.
 
 ### macOS system tray
 
+<!-- macOS tray account actions from cmd/codextra/tray_darwin.go and cmd/codextra/main.go -->
 On macOS, codextra shows a menu bar icon while running.
 
 - `Current`: account used for proxy requests (`eligible` account selection skips
@@ -203,6 +209,9 @@ On macOS, codextra shows a menu bar icon while running.
   `limited (reason) until <timestamp>`), with a checkmark on the current one.
 
 Selecting an account switches the active codextra account immediately.
+The `Re-authenticate` submenu runs `codex login` in an isolated temporary Codex
+home seeded with the selected alias, then imports the returned tokens back into
+the matching saved account.
 
 Disable the menu with:
 
