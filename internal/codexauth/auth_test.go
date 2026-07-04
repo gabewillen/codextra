@@ -50,6 +50,67 @@ func TestImportReadsCodexAuth(t *testing.T) {
 	}
 }
 
+func TestIdentityFromAccessTokenClaimPrecedenceAndFallbacks(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		token  string
+		claims map[string]any
+		want   Identity
+	}{
+		{
+			name: "openai account id and standard identity claims win",
+			claims: map[string]any{
+				"https://api.openai.com/auth_account_id": "acct-auth",
+				"chatgpt_account_id":                     "acct-chatgpt",
+				"account_id":                             "acct-legacy",
+				"email":                                  "standard@example.com",
+				"https://api.openai.com/email":           "url@example.com",
+				"chatgpt_plan_type":                      "team",
+				"https://api.openai.com/plan_type":       "pro",
+			},
+			want: Identity{AccountID: "acct-auth", Email: "standard@example.com", PlanType: "team"},
+		},
+		{
+			name: "chatgpt account id and namespaced identity fallbacks",
+			claims: map[string]any{
+				"chatgpt_account_id":               "acct-chatgpt",
+				"account_id":                       "acct-legacy",
+				"https://api.openai.com/email":     "url@example.com",
+				"https://api.openai.com/plan_type": "pro",
+			},
+			want: Identity{AccountID: "acct-chatgpt", Email: "url@example.com", PlanType: "pro"},
+		},
+		{
+			name:   "legacy account id fallback",
+			claims: map[string]any{"account_id": "acct-legacy"},
+			want:   Identity{AccountID: "acct-legacy"},
+		},
+		{
+			name:  "opaque token",
+			token: "not-a-jwt",
+			want:  Identity{},
+		},
+		{
+			name:  "invalid payload",
+			token: "header.!bad.signature",
+			want:  Identity{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := tc.token
+			if token == "" {
+				token = fakeJWT(t, tc.claims)
+			}
+			if got := IdentityFromAccessToken(token); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("IdentityFromAccessToken() = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWriteCodexAuth(t *testing.T) {
 	t.Parallel()
 

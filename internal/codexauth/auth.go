@@ -50,13 +50,8 @@ func Import(alias, path string) (accounts.Account, error) {
 		return accounts.Account{}, errors.New("codex login did not produce ChatGPT token auth")
 	}
 
-	claims := jwtClaims(auth.Tokens.AccessToken)
-	accountID := firstNonEmpty(
-		auth.Tokens.AccountID,
-		stringClaim(claims, "https://api.openai.com/auth_account_id"),
-		stringClaim(claims, "chatgpt_account_id"),
-		stringClaim(claims, "account_id"),
-	)
+	identity := IdentityFromAccessToken(auth.Tokens.AccessToken)
+	accountID := firstNonEmpty(auth.Tokens.AccountID, identity.AccountID)
 
 	return accounts.Account{
 		Alias:        alias,
@@ -64,9 +59,28 @@ func Import(alias, path string) (accounts.Account, error) {
 		RefreshToken: auth.Tokens.RefreshToken,
 		IDToken:      idTokenString(auth.Tokens.IDToken),
 		AccountID:    accountID,
-		Email:        firstNonEmpty(stringClaim(claims, "email"), stringClaim(claims, "https://api.openai.com/email")),
-		PlanType:     firstNonEmpty(stringClaim(claims, "chatgpt_plan_type"), stringClaim(claims, "https://api.openai.com/plan_type")),
+		Email:        identity.Email,
+		PlanType:     identity.PlanType,
 	}, nil
+}
+
+type Identity struct {
+	AccountID string
+	Email     string
+	PlanType  string
+}
+
+func IdentityFromAccessToken(accessToken string) Identity {
+	claims := jwtClaims(accessToken)
+	return Identity{
+		AccountID: firstNonEmpty(
+			stringClaim(claims, "https://api.openai.com/auth_account_id"),
+			stringClaim(claims, "chatgpt_account_id"),
+			stringClaim(claims, "account_id"),
+		),
+		Email:    firstNonEmpty(stringClaim(claims, "email"), stringClaim(claims, "https://api.openai.com/email")),
+		PlanType: firstNonEmpty(stringClaim(claims, "chatgpt_plan_type"), stringClaim(claims, "https://api.openai.com/plan_type")),
+	}
 }
 
 func Write(path string, account accounts.Account) error {

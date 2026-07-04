@@ -301,6 +301,38 @@ func (s *Store) UpdateTokens(alias string, tokens Account) (Account, error) {
 	return Account{}, fmt.Errorf("account %q not found", alias)
 }
 
+func (s *Store) ReplaceCredentials(alias string, credentials Account) (Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.reloadLocked(); err != nil {
+		return Account{}, err
+	}
+	for i := range s.Data.Accounts {
+		if s.Data.Accounts[i].Alias != alias {
+			continue
+		}
+		acc := &s.Data.Accounts[i]
+		acc.AccessToken = credentials.AccessToken
+		acc.RefreshToken = credentials.RefreshToken
+		if credentials.IDToken != "" {
+			acc.IDToken = credentials.IDToken
+		}
+		if credentials.AccountID != "" {
+			acc.AccountID = credentials.AccountID
+		}
+		if credentials.Email != "" {
+			acc.Email = credentials.Email
+		}
+		if credentials.PlanType != "" {
+			acc.PlanType = credentials.PlanType
+		}
+		updated := *acc
+		return updated, s.saveLocked()
+	}
+	return Account{}, fmt.Errorf("account %q not found", alias)
+}
+
 func (s *Store) Upsert(account Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

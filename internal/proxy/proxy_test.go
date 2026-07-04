@@ -1310,6 +1310,49 @@ func TestResponseCaptureLimitCapsErrorBodies(t *testing.T) {
 	}
 }
 
+func TestRefreshFailureResponseUsesDetailWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("refresh token expired; sign in again")
+	want := "codextra could not refresh expired account token: refresh token expired; sign in again"
+	if got := refreshFailureResponse(err); got != want {
+		t.Fatalf("refreshFailureResponse(detail) = %q, want %q", got, want)
+	}
+	if got := refreshFailureResponse(nil); got != "codextra could not refresh expired account token" {
+		t.Fatalf("refreshFailureResponse(empty detail) = %q, want fallback", got)
+	}
+}
+
+func TestIsSessionInvalidatedVariants(t *testing.T) {
+	t.Parallel()
+
+	body := `{"error":{"code":"token_revoked"}}`
+	revoked := &http.Response{Body: io.NopCloser(strings.NewReader(body))}
+	if !isSessionInvalidated(revoked) {
+		t.Fatal("isSessionInvalidated(token_revoked) = false, want true")
+	}
+	rebuffered, err := io.ReadAll(revoked.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(rebuffered) error = %v", err)
+	}
+	if string(rebuffered) != body {
+		t.Fatalf("rebuffered body = %q, want %q", string(rebuffered), body)
+	}
+
+	active := &http.Response{Body: io.NopCloser(strings.NewReader(`{"error":{"code":"token_expired"}}`))}
+	if isSessionInvalidated(active) {
+		t.Fatal("isSessionInvalidated(token_expired) = true, want false")
+	}
+	malformed := &http.Response{Body: io.NopCloser(strings.NewReader(`{`))}
+	if isSessionInvalidated(malformed) {
+		t.Fatal("isSessionInvalidated(malformed) = true, want false")
+	}
+	unreadable := &http.Response{Body: errReader{}}
+	if isSessionInvalidated(unreadable) {
+		t.Fatal("isSessionInvalidated(read error) = true, want false")
+	}
+}
+
 func TestProxyTunnelsWebSocketWithActiveAccountAuth(t *testing.T) {
 	t.Parallel()
 

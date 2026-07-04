@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -386,23 +388,11 @@ func TestProxyActivityHandlerTracksActiveRequests(t *testing.T) {
 	}()
 
 	<-started
-	active, err := proxyActiveRequests(context.Background(), server.URL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() error = %v", err)
-	}
-	if active != 1 {
-		t.Fatalf("active requests = %d, want 1", active)
-	}
+	waitForProxyActiveRequests(t, server.URL, 1)
 
 	close(release)
 
-	active, err = proxyActiveRequests(context.Background(), server.URL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() after done error = %v", err)
-	}
-	if active != 0 {
-		t.Fatalf("active requests = %d, want 0", active)
-	}
+	waitForProxyActiveRequests(t, server.URL, 0)
 }
 
 func TestPrefixedProxyHealthTracksActiveRequests(t *testing.T) {
@@ -438,23 +428,11 @@ func TestPrefixedProxyHealthTracksActiveRequests(t *testing.T) {
 	}()
 
 	<-started
-	active, err := proxyActiveRequests(context.Background(), proxyURL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() error = %v", err)
-	}
-	if active != 1 {
-		t.Fatalf("active requests = %d, want 1", active)
-	}
+	waitForProxyActiveRequests(t, proxyURL, 1)
 
 	close(release)
 
-	active, err = proxyActiveRequests(context.Background(), proxyURL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() after done error = %v", err)
-	}
-	if active != 0 {
-		t.Fatalf("active requests = %d, want 0", active)
-	}
+	waitForProxyActiveRequests(t, proxyURL, 0)
 }
 
 func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
@@ -759,6 +737,38 @@ func mustJSON(t *testing.T, value any) []byte {
 	return bytes
 }
 
+func mainFakeJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("Marshal(claims) error = %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".signature"
+}
+
+func waitForProxyActiveRequests(t *testing.T, proxyURL string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	var last int
+	var lastErr error
+	for time.Now().Before(deadline) {
+		active, err := proxyActiveRequests(context.Background(), proxyURL)
+		if err == nil && active == want {
+			return
+		}
+		last = active
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("proxyActiveRequests() error = %v", lastErr)
+	}
+	t.Fatalf("active requests = %d, want %d", last, want)
+}
+
 func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
@@ -844,6 +854,998 @@ func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {
 	}
 	if store.Data.ActiveAlias != "acct-work" {
 		t.Fatalf("ActiveAlias = %q, want acct-work", store.Data.ActiveAlias)
+	}
+}
+
+func TestImportCurrentAuthUpdatesExistingAliasWithoutClearingState(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	oldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	newAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com", "chatgpt_plan_type": "pro"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if err := store.Upsert(accounts.Account{
+		Alias:         "work",
+		AccessToken:   oldAccess,
+		RefreshToken:  "refresh-work-old",
+		AccountID:     "acct-work",
+		Email:         "work@example.com",
+		DisabledUntil: map[string]int64{"codex_weekly": resetAt},
+		Usage:         []accounts.UsageWindow{{Label: "Weekly", Percent: 99, ResetAt: resetAt}},
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  newAccess,
+			"refresh_token": "refresh-work-new",
+			"account_id":    "acct-work",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := importCurrentAuth("work", false); err != nil {
+		t.Fatalf("importCurrentAuth(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	account, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if account.AccessToken != newAccess {
+		t.Fatalf("AccessToken not updated")
+	}
+	if account.RefreshToken != "refresh-work-new" {
+		t.Fatalf("RefreshToken = %q, want refresh-work-new", account.RefreshToken)
+	}
+	if got := account.DisabledUntil["codex_weekly"]; got != resetAt {
+		t.Fatalf("DisabledUntil[codex_weekly] = %d, want %d", got, resetAt)
+	}
+	if len(account.Usage) != 1 || account.Usage[0].Percent != 99 {
+		t.Fatalf("Usage = %#v, want preserved weekly usage", account.Usage)
+	}
+}
+
+func TestImportCurrentAuthClearsMissingRefreshToken(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	oldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	newAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  oldAccess,
+		RefreshToken: "refresh-stale",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token": newAccess,
+			"account_id":   "acct-work",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := importCurrentAuth("work", false); err != nil {
+		t.Fatalf("importCurrentAuth(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	account, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if account.AccessToken != newAccess {
+		t.Fatalf("AccessToken not updated")
+	}
+	if account.RefreshToken != "" {
+		t.Fatalf("RefreshToken = %q, want cleared when imported auth omits refresh_token", account.RefreshToken)
+	}
+}
+
+func TestImportCurrentAuthDoesNotOverwriteAliasWithDifferentAccount(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	workAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	personalOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	personalNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalOldAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  personalNewAccess,
+			"refresh_token": "refresh-personal-new",
+			"account_id":    "acct-personal",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `existing alias "personal" instead of "work"`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want different-account protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.RefreshToken != "refresh-work-old" || work.AccessToken != workAccess {
+		t.Fatalf("work account was overwritten: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.RefreshToken != "refresh-personal-new" || personal.AccessToken != personalNewAccess {
+		t.Fatalf("personal account not updated with returned credentials: %#v", personal)
+	}
+}
+
+func TestImportCurrentAuthRejectsIdentitylessAuthForIdentifiedAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	workAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "opaque-access-token",
+			"refresh_token": "refresh-opaque",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `without account identity`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want identityless protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != workAccess || work.RefreshToken != "refresh-work-old" {
+		t.Fatalf("work account changed after identityless import: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthRejectsAmbiguousExistingAliasIdentity(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	oldAccess := mainFakeJWT(t, map[string]any{"scope": "old"})
+	newAccess := mainFakeJWT(t, map[string]any{"email": "work@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  oldAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  newAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `ambiguous account identity`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want ambiguous identity protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != oldAccess || work.RefreshToken != "refresh-work-old" || work.AccountID != "acct-work" || work.Email != "" {
+		t.Fatalf("work account changed after ambiguous import: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthRejectsReverseAmbiguousExistingAliasIdentity(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	oldAccess := mainFakeJWT(t, map[string]any{"scope": "old"})
+	newAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  oldAccess,
+		RefreshToken: "refresh-work-old",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  newAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `ambiguous account identity`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want ambiguous identity protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != oldAccess || work.RefreshToken != "refresh-work-old" || work.AccountID != "" || work.Email != "work@example.com" {
+		t.Fatalf("work account changed after reverse ambiguous import: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthDoesNotDuplicateExistingAccountUnderNewAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	workOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	workNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workOldAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workNewAccess,
+			"refresh_token": "refresh-work-new",
+			"account_id":    "acct-work",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("new-work", false)
+	if err == nil || !strings.Contains(err.Error(), `existing alias "work" instead of new alias "new-work"`) {
+		t.Fatalf("importCurrentAuth(new-work) error = %v, want duplicate-account protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if _, ok := reloaded.Get("new-work"); ok {
+		t.Fatal("new-work alias was created for an existing account")
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.RefreshToken != "refresh-work-new" || work.AccessToken != workNewAccess {
+		t.Fatalf("work account not updated with returned credentials: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthMatchesLegacyStoredTokenClaims(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	workOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	workNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workOldAccess,
+		RefreshToken: "refresh-work-old",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workNewAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("new-work", false)
+	if err == nil || !strings.Contains(err.Error(), `existing alias "work" instead of new alias "new-work"`) {
+		t.Fatalf("importCurrentAuth(new-work) error = %v, want legacy-token duplicate protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if _, ok := reloaded.Get("new-work"); ok {
+		t.Fatal("new-work alias was created for legacy stored token identity")
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != workNewAccess || work.RefreshToken != "refresh-work-new" {
+		t.Fatalf("work account not updated with returned credentials: %#v", work)
+	}
+	if work.AccountID != "acct-work" || work.Email != "work@example.com" {
+		t.Fatalf("work identity not filled from imported token: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthPrefersStoredTokenIdentityOverStaleFields(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	workOldAccess := mainFakeJWT(t, map[string]any{
+		"chatgpt_account_id": "acct-work",
+		"email":              "work@example.com",
+		"chatgpt_plan_type":  "team",
+	})
+	workNewAccess := mainFakeJWT(t, map[string]any{
+		"chatgpt_account_id": "acct-work",
+		"email":              "work@example.com",
+		"chatgpt_plan_type":  "team",
+		"token_version":      "new",
+	})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workOldAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-stale",
+		Email:        "stale@example.com",
+		PlanType:     "free",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workNewAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := importCurrentAuth("work", false); err != nil {
+		t.Fatalf("importCurrentAuth(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != workNewAccess || work.RefreshToken != "refresh-work-new" {
+		t.Fatalf("work credentials not updated: %#v", work)
+	}
+	if work.AccountID != "acct-work" || work.Email != "work@example.com" || work.PlanType != "team" {
+		t.Fatalf("work identity not refreshed from access token: %#v", work)
+	}
+}
+
+func TestImportCurrentAuthRejectsIdentitylessNewAliasWhenRegistryExists(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalAccess,
+		RefreshToken: "refresh-personal",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "opaque-access-token",
+			"refresh_token": "refresh-opaque",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("opaque", false)
+	if err == nil || !strings.Contains(err.Error(), `without account identity`) {
+		t.Fatalf("importCurrentAuth(opaque) error = %v, want identityless new-alias protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if _, ok := reloaded.Get("opaque"); ok {
+		t.Fatal("opaque alias was created from identityless credentials")
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccessToken != personalAccess || personal.RefreshToken != "refresh-personal" {
+		t.Fatalf("personal account changed: %#v", personal)
+	}
+}
+
+func TestImportCurrentAuthIdentifiesExistingIdentitylessAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	workAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		RefreshToken: "refresh-work-old",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := importCurrentAuth("work", false); err != nil {
+		t.Fatalf("importCurrentAuth(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != workAccess || work.RefreshToken != "refresh-work-new" {
+		t.Fatalf("work credentials not updated: %#v", work)
+	}
+	if work.AccountID != "acct-work" || work.Email != "work@example.com" {
+		t.Fatalf("work identity not saved from imported token: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccessToken != personalAccess || personal.RefreshToken != "refresh-personal-old" {
+		t.Fatalf("personal account changed: %#v", personal)
+	}
+}
+
+func TestImportCurrentAuthExistingIdentitylessAliasUpdatesMatchingAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	personalNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		RefreshToken: "refresh-work-old",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalOldAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  personalNewAccess,
+			"refresh_token": "refresh-personal-new",
+			"account_id":    "acct-personal",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `existing alias "personal" instead of "work"`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want matching-alias protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != "" || work.RefreshToken != "refresh-work-old" || work.AccountID != "" || work.Email != "" {
+		t.Fatalf("identityless work alias changed: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccessToken != personalNewAccess || personal.RefreshToken != "refresh-personal-new" {
+		t.Fatalf("personal account not updated with returned credentials: %#v", personal)
+	}
+}
+
+func TestImportCurrentAuthRejectsIdentitylessAuthForIdentitylessAliasWhenOthersExist(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		RefreshToken: "refresh-work-old",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "opaque-access-token",
+			"refresh_token": "refresh-opaque",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	err = importCurrentAuth("work", false)
+	if err == nil || !strings.Contains(err.Error(), `without account identity`) {
+		t.Fatalf("importCurrentAuth(work) error = %v, want identityless protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != "" || work.RefreshToken != "refresh-work-old" || work.AccountID != "" || work.Email != "" {
+		t.Fatalf("identityless work alias changed: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccessToken != personalAccess || personal.RefreshToken != "refresh-personal-old" {
+		t.Fatalf("personal account changed: %#v", personal)
+	}
+}
+
+func TestLoginAccountFromTraySeedsTargetAuthBeforeCodexLogin(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	workOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	workNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		AccessToken:  workOldAccess,
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	initialAuth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  personalAccess,
+			"refresh_token": "refresh-personal-old",
+			"account_id":    "acct-personal",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, initialAuth), 0600); err != nil {
+		t.Fatalf("WriteFile(initial auth) error = %v", err)
+	}
+
+	newAuth := string(mustJSON(t, map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workNewAccess,
+			"refresh_token": "refresh-work-new",
+			"account_id":    "acct-work",
+		},
+	}))
+	fakeCodex := filepath.Join(tempDir, "codex-login")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+if [ "${1:-}" != "login" ]; then
+  echo "unexpected command: ${1:-}" >&2
+  exit 12
+fi
+if ! grep -Fq %q "$CODEX_HOME/auth.json"; then
+  echo "target account was not seeded before login" >&2
+  exit 13
+fi
+cat > "$CODEX_HOME/auth.json" <<'JSON'
+%s
+JSON
+`, workOldAccess, newAuth)
+	if err := os.WriteFile(fakeCodex, []byte(script), 0700); err != nil {
+		t.Fatalf("WriteFile(fake codex) error = %v", err)
+	}
+	t.Setenv("CODEXTRA_CODEX_BIN", fakeCodex)
+
+	if err := loginAccountFromTray(context.Background(), "work"); err != nil {
+		t.Fatalf("loginAccountFromTray(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.RefreshToken != "refresh-work-new" || work.AccessToken != workNewAccess {
+		t.Fatalf("work account not updated after tray reauth: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.RefreshToken != "refresh-personal-old" || personal.AccessToken != personalAccess {
+		t.Fatalf("personal account changed during work reauth: %#v", personal)
+	}
+	globalAuth, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(global auth) error = %v", err)
+	}
+	if !strings.Contains(string(globalAuth), personalAccess) || strings.Contains(string(globalAuth), workNewAccess) {
+		t.Fatalf("global auth was not left on the original account: %s", globalAuth)
+	}
+}
+
+func TestLoginAccountFromTrayTokenlessAliasUsesIsolatedEmptyAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalOldAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	personalNewAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com", "token_version": "new"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		RefreshToken: "refresh-work-old",
+		AccountID:    "acct-work",
+		Email:        "work@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalOldAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	initialAuth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  personalOldAccess,
+			"refresh_token": "refresh-personal-old",
+			"account_id":    "acct-personal",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, initialAuth), 0600); err != nil {
+		t.Fatalf("WriteFile(initial auth) error = %v", err)
+	}
+
+	newAuth := string(mustJSON(t, map[string]any{
+		"tokens": map[string]any{
+			"access_token":  personalNewAccess,
+			"refresh_token": "refresh-personal-new",
+			"account_id":    "acct-personal",
+		},
+	}))
+	fakeCodex := filepath.Join(tempDir, "codex-login")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+if [ "${1:-}" != "login" ]; then
+  echo "unexpected command: ${1:-}" >&2
+  exit 12
+fi
+if [ "$CODEX_HOME" = %q ]; then
+  echo "login used the real Codex home" >&2
+  exit 13
+fi
+if [ -e "$CODEX_HOME/auth.json" ]; then
+  echo "tokenless account should not seed temp auth" >&2
+  exit 14
+fi
+cat > "$CODEX_HOME/auth.json" <<'JSON'
+%s
+JSON
+`, codexHome, newAuth)
+	if err := os.WriteFile(fakeCodex, []byte(script), 0700); err != nil {
+		t.Fatalf("WriteFile(fake codex) error = %v", err)
+	}
+	t.Setenv("CODEXTRA_CODEX_BIN", fakeCodex)
+
+	err = loginAccountFromTray(context.Background(), "work")
+	if err == nil || !strings.Contains(err.Error(), `existing alias "personal" instead of "work"`) {
+		t.Fatalf("loginAccountFromTray(work) error = %v, want wrong-account protection", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != "" || work.RefreshToken != "refresh-work-old" {
+		t.Fatalf("work tokenless account changed: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.RefreshToken != "refresh-personal-new" || personal.AccessToken != personalNewAccess {
+		t.Fatalf("personal account not updated with returned credentials: %#v", personal)
+	}
+	globalAuth, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(global auth) error = %v", err)
+	}
+	if !strings.Contains(string(globalAuth), personalOldAccess) || strings.Contains(string(globalAuth), personalNewAccess) {
+		t.Fatalf("global auth was modified during isolated tokenless reauth: %s", globalAuth)
 	}
 }
 

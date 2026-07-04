@@ -142,9 +142,7 @@ func (g *refreshBurnGuard) markUnhelpful(alias, refreshToken string, now time.Ti
 func (g *refreshBurnGuard) clear(alias string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if _, ok := g.byAlias[alias]; ok {
-		delete(g.byAlias, alias)
-	}
+	delete(g.byAlias, alias)
 }
 
 type refreshLocks struct {
