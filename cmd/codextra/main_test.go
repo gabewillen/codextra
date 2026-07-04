@@ -388,23 +388,11 @@ func TestProxyActivityHandlerTracksActiveRequests(t *testing.T) {
 	}()
 
 	<-started
-	active, err := proxyActiveRequests(context.Background(), server.URL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() error = %v", err)
-	}
-	if active != 1 {
-		t.Fatalf("active requests = %d, want 1", active)
-	}
+	waitForProxyActiveRequests(t, server.URL, 1)
 
 	close(release)
 
-	active, err = proxyActiveRequests(context.Background(), server.URL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() after done error = %v", err)
-	}
-	if active != 0 {
-		t.Fatalf("active requests = %d, want 0", active)
-	}
+	waitForProxyActiveRequests(t, server.URL, 0)
 }
 
 func TestPrefixedProxyHealthTracksActiveRequests(t *testing.T) {
@@ -440,23 +428,11 @@ func TestPrefixedProxyHealthTracksActiveRequests(t *testing.T) {
 	}()
 
 	<-started
-	active, err := proxyActiveRequests(context.Background(), proxyURL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() error = %v", err)
-	}
-	if active != 1 {
-		t.Fatalf("active requests = %d, want 1", active)
-	}
+	waitForProxyActiveRequests(t, proxyURL, 1)
 
 	close(release)
 
-	active, err = proxyActiveRequests(context.Background(), proxyURL)
-	if err != nil {
-		t.Fatalf("proxyActiveRequests() after done error = %v", err)
-	}
-	if active != 0 {
-		t.Fatalf("active requests = %d, want 0", active)
-	}
+	waitForProxyActiveRequests(t, proxyURL, 0)
 }
 
 func TestProxyLifecycleRejectsWrongMethod(t *testing.T) {
@@ -770,6 +746,27 @@ func mainFakeJWT(t *testing.T, claims map[string]any) string {
 	}
 	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
 	return header + "." + payload + ".signature"
+}
+
+func waitForProxyActiveRequests(t *testing.T, proxyURL string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	var last int
+	var lastErr error
+	for time.Now().Before(deadline) {
+		active, err := proxyActiveRequests(context.Background(), proxyURL)
+		if err == nil && active == want {
+			return
+		}
+		last = active
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("proxyActiveRequests() error = %v", lastErr)
+	}
+	t.Fatalf("active requests = %d, want %d", last, want)
 }
 
 func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
