@@ -1376,6 +1376,74 @@ func TestImportCurrentAuthRejectsIdentitylessNewAliasWhenRegistryExists(t *testi
 	}
 }
 
+func TestImportCurrentAuthIdentifiesExistingIdentitylessAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "codex")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codexHome) error = %v", err)
+	}
+
+	personalAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-personal", "email": "personal@example.com"})
+	workAccess := mainFakeJWT(t, map[string]any{"chatgpt_account_id": "acct-work", "email": "work@example.com"})
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "work",
+		RefreshToken: "refresh-work-old",
+	}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{
+		Alias:        "personal",
+		AccessToken:  personalAccess,
+		RefreshToken: "refresh-personal-old",
+		AccountID:    "acct-personal",
+		Email:        "personal@example.com",
+	}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+	auth := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  workAccess,
+			"refresh_token": "refresh-work-new",
+		},
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), mustJSON(t, auth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth) error = %v", err)
+	}
+
+	if err := importCurrentAuth("work", false); err != nil {
+		t.Fatalf("importCurrentAuth(work) error = %v", err)
+	}
+
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	work, ok := reloaded.Get("work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if work.AccessToken != workAccess || work.RefreshToken != "refresh-work-new" {
+		t.Fatalf("work credentials not updated: %#v", work)
+	}
+	if work.AccountID != "acct-work" || work.Email != "work@example.com" {
+		t.Fatalf("work identity not saved from imported token: %#v", work)
+	}
+	personal, ok := reloaded.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if personal.AccessToken != personalAccess || personal.RefreshToken != "refresh-personal-old" {
+		t.Fatalf("personal account changed: %#v", personal)
+	}
+}
+
 func TestImportCurrentAuthExistingIdentitylessAliasUpdatesMatchingAlias(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")

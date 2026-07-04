@@ -142,6 +142,9 @@ func saveImportedAccount(store *accounts.Store, account accounts.Account) (accou
 				}
 				return updated, fmt.Errorf("codex login returned credentials for existing alias %q instead of %q; updated %q and left %q unchanged", matching.Alias, account.Alias, matching.Alias, account.Alias)
 			}
+			if !hasAccountIdentity(existing) {
+				return saveImportedCredentials(store, existing, account)
+			}
 			if identitiesOverlap(existing, account) {
 				return accounts.Account{}, fmt.Errorf("codex login returned credentials that do not match existing alias %q; left registry unchanged", account.Alias)
 			}
