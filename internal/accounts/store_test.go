@@ -552,7 +552,10 @@ func TestReplaceCredentialsClearsRefreshAndPreservesReloadedState(t *testing.T) 
 
 	updated, err := staleStore.ReplaceCredentials("personal", Account{
 		AccessToken: "token-new",
+		IDToken:     "id-token-new",
 		AccountID:   "acct-personal",
+		Email:       "personal@example.com",
+		PlanType:    "pro",
 	})
 	if err != nil {
 		t.Fatalf("ReplaceCredentials() error = %v", err)
@@ -586,6 +589,15 @@ func TestReplaceCredentialsClearsRefreshAndPreservesReloadedState(t *testing.T) 
 	}
 	if personal.AccountID != "acct-personal" {
 		t.Fatalf("AccountID = %q, want acct-personal", personal.AccountID)
+	}
+	if personal.IDToken != "id-token-new" {
+		t.Fatalf("IDToken = %q, want id-token-new", personal.IDToken)
+	}
+	if personal.Email != "personal@example.com" {
+		t.Fatalf("Email = %q, want personal@example.com", personal.Email)
+	}
+	if personal.PlanType != "pro" {
+		t.Fatalf("PlanType = %q, want pro", personal.PlanType)
 	}
 	if personal.RefreshToken != "" {
 		t.Fatalf("persisted RefreshToken = %q, want cleared", personal.RefreshToken)
@@ -733,5 +745,173 @@ func TestUpdateUsageResetsExistingValues(t *testing.T) {
 	}
 	if loaded.Data.Accounts[0].UsageResetAt != 0 {
 		t.Fatalf("UsageResetAt = %d, want 0", loaded.Data.Accounts[0].UsageResetAt)
+	}
+}
+
+func TestUpdateUsageWindowsPersistsWindowsAndPeak(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(Account{Alias: "personal", AccessToken: "token"}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	windows := []UsageWindow{
+		{Label: "5h", Percent: 12, ResetAt: 111},
+		{Label: "weekly", Percent: 88, ResetAt: 222},
+		{Label: "daily", Percent: 42, ResetAt: 333},
+	}
+
+	if err := store.UpdateUsageWindows("personal", windows); err != nil {
+		t.Fatalf("UpdateUsageWindows() error = %v", err)
+	}
+
+	loaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore(persisted) error = %v", err)
+	}
+	account := loaded.Data.Accounts[0]
+	if !reflect.DeepEqual(account.Usage, windows) {
+		t.Fatalf("Usage = %#v, want %#v", account.Usage, windows)
+	}
+	if account.UsagePercent != 88 {
+		t.Fatalf("UsagePercent = %d, want 88", account.UsagePercent)
+	}
+	if account.UsageResetAt != 222 {
+		t.Fatalf("UsageResetAt = %d, want 222", account.UsageResetAt)
+	}
+}
+
+func TestUpdateUsageWindowsClearsPeakAndRejectsMissingAlias(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(Account{Alias: "personal", AccessToken: "token", UsagePercent: 88, UsageResetAt: 222}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	if err := store.UpdateUsageWindows("personal", nil); err != nil {
+		t.Fatalf("UpdateUsageWindows(clear) error = %v", err)
+	}
+	account, ok := store.Get("personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if len(account.Usage) != 0 {
+		t.Fatalf("Usage = %#v, want empty", account.Usage)
+	}
+	if account.UsagePercent != 0 {
+		t.Fatalf("UsagePercent = %d, want 0", account.UsagePercent)
+	}
+	if account.UsageResetAt != 0 {
+		t.Fatalf("UsageResetAt = %d, want 0", account.UsageResetAt)
+	}
+	if err := store.UpdateUsageWindows("missing", nil); err == nil {
+		t.Fatal("UpdateUsageWindows(missing) error = nil, want error")
+	}
+}
+
+func TestSnapshotFallsBackToEligibleAccountAndReportsNoCurrent(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	store, err := LoadStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	store.Data = Data{
+		ActiveAlias: "limited",
+		Accounts: []Account{
+			{
+				Alias:         "limited",
+				AccessToken:   "token-limited",
+				DisabledUntil: map[string]int64{"codex": now.Add(time.Hour).Unix()},
+			},
+			{Alias: "ready", AccessToken: "token-ready"},
+		},
+	}
+
+	snapshot, err := store.Snapshot(now)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.CurrentAlias != "ready" {
+		t.Fatalf("CurrentAlias = %q, want ready", snapshot.CurrentAlias)
+	}
+
+	store.Data = Data{Accounts: []Account{{Alias: "empty"}}}
+	snapshot, err = store.Snapshot(now)
+	if err != nil {
+		t.Fatalf("Snapshot(no current) error = %v", err)
+	}
+	if snapshot.CurrentAlias != "" {
+		t.Fatalf("CurrentAlias = %q, want empty", snapshot.CurrentAlias)
+	}
+}
+
+func TestUpdateTokensPreservesOptionalFieldsAndRejectsMissingAlias(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	original := Account{
+		Alias:        "personal",
+		AccessToken:  "token-old",
+		RefreshToken: "refresh-old",
+		IDToken:      "id-token-old",
+		AccountID:    "acct-old",
+		Email:        "old@example.com",
+		PlanType:     "team",
+	}
+	if err := store.Upsert(original); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	updated, err := store.UpdateTokens("personal", Account{AccessToken: "token-new"})
+	if err != nil {
+		t.Fatalf("UpdateTokens() error = %v", err)
+	}
+	if updated.AccessToken != "token-new" {
+		t.Fatalf("AccessToken = %q, want token-new", updated.AccessToken)
+	}
+	if updated.RefreshToken != original.RefreshToken {
+		t.Fatalf("RefreshToken = %q, want %q", updated.RefreshToken, original.RefreshToken)
+	}
+	if updated.IDToken != original.IDToken {
+		t.Fatalf("IDToken = %q, want %q", updated.IDToken, original.IDToken)
+	}
+	if updated.AccountID != original.AccountID {
+		t.Fatalf("AccountID = %q, want %q", updated.AccountID, original.AccountID)
+	}
+	if updated.Email != original.Email {
+		t.Fatalf("Email = %q, want %q", updated.Email, original.Email)
+	}
+	if updated.PlanType != original.PlanType {
+		t.Fatalf("PlanType = %q, want %q", updated.PlanType, original.PlanType)
+	}
+	if _, err := store.UpdateTokens("missing", Account{AccessToken: "token"}); err == nil {
+		t.Fatal("UpdateTokens(missing) error = nil, want error")
+	}
+}
+
+func TestReplaceCredentialsRejectsMissingAlias(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if _, err := store.ReplaceCredentials("missing", Account{AccessToken: "token"}); err == nil {
+		t.Fatal("ReplaceCredentials(missing) error = nil, want error")
 	}
 }
