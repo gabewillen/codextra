@@ -287,23 +287,20 @@ func hasAccountIdentity(account accounts.Account) bool {
 }
 
 func effectiveAccountIdentity(account accounts.Account) codexauth.Identity {
-	identity := codexauth.Identity{
-		AccountID: account.AccountID,
-		Email:     account.Email,
-		PlanType:  account.PlanType,
-	}
-	if identity.AccountID != "" && identity.Email != "" && identity.PlanType != "" {
-		return identity
-	}
 	derived := codexauth.IdentityFromAccessToken(account.AccessToken)
+	identity := codexauth.Identity{
+		AccountID: derived.AccountID,
+		Email:     derived.Email,
+		PlanType:  derived.PlanType,
+	}
 	if identity.AccountID == "" {
-		identity.AccountID = derived.AccountID
+		identity.AccountID = account.AccountID
 	}
 	if identity.Email == "" {
-		identity.Email = derived.Email
+		identity.Email = account.Email
 	}
 	if identity.PlanType == "" {
-		identity.PlanType = derived.PlanType
+		identity.PlanType = account.PlanType
 	}
 	return identity
 }
