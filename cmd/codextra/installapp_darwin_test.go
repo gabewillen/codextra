@@ -37,6 +37,16 @@ func TestShellSingleQuoteEscapesQuotes(t *testing.T) {
 	}
 }
 
+func TestCodexDesktopOpenURLUsesWorkspace(t *testing.T) {
+	t.Parallel()
+
+	got := codexDesktopOpenURL([]string{"/tmp/my workspace"})
+	want := "codex://threads/new?path=%2Ftmp%2Fmy+workspace"
+	if got != want {
+		t.Fatalf("codexDesktopOpenURL() = %q, want %q", got, want)
+	}
+}
+
 func TestWriteDesktopAppBundleCreatesLauncherAndPlist(t *testing.T) {
 	t.Parallel()
 
