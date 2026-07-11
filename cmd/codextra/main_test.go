@@ -120,41 +120,13 @@ func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	}
 }
 
-func TestCodexDesktopArgsPrefixesAppCommand(t *testing.T) {
+func TestWithoutEnvRemovesOnlyRequestedKeys(t *testing.T) {
 	t.Parallel()
 
-	base := []string{"-c", "chatgpt_base_url=http://proxy/backend-api", "."}
-	got := codexDesktopArgs(base)
-	want := []string{"app", "-c", "chatgpt_base_url=http://proxy/backend-api", "."}
+	got := withoutEnv([]string{"KEEP=1", "DROP=2", "ALSO_DROP=3"}, "DROP", "ALSO_DROP")
+	want := []string{"KEEP=1"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("codexDesktopArgs() = %#v, want %#v", got, want)
-	}
-	if !reflect.DeepEqual(base, []string{"-c", "chatgpt_base_url=http://proxy/backend-api", "."}) {
-		t.Fatalf("codexDesktopArgs mutated base: %#v", base)
-	}
-}
-
-func TestCodexDesktopShouldKeepAlive(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name string
-		args []string
-		want bool
-	}{
-		{name: "workspace", args: []string{"."}, want: true},
-		{name: "no args", args: nil, want: true},
-		{name: "help", args: []string{"--help"}, want: false},
-		{name: "short help", args: []string{"-h"}, want: false},
-		{name: "literal help path", args: []string{"--", "--help"}, want: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := codexDesktopShouldKeepAlive(tc.args); got != tc.want {
-				t.Fatalf("codexDesktopShouldKeepAlive(%#v) = %t, want %t", tc.args, got, tc.want)
-			}
-		})
+		t.Fatalf("withoutEnv() = %#v, want %#v", got, want)
 	}
 }
 

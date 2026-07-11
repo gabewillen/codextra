@@ -80,20 +80,6 @@ func writeDesktopAppBundle(appPath, codextraExe, codexBin string) error {
 	return nil
 }
 
-// resolveCodexBin locates the codex binary at install time and bakes it into the
-// launcher, because macOS launches apps with a minimal PATH that won't include
-// Homebrew or ~/.local/bin. Returns "" if codex can't be found now; the launcher
-// then falls back to PATH at run time.
-func resolveCodexBin() string {
-	if v := os.Getenv("CODEXTRA_CODEX_BIN"); v != "" {
-		return v
-	}
-	if p, err := exec.LookPath("codex"); err == nil {
-		return p
-	}
-	return ""
-}
-
 func desktopLauncherScript(codextraExe, codexBin string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")

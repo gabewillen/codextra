@@ -43,6 +43,12 @@ const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 const defaultProxyUpgradeWait = 10 * time.Second
 
+const (
+	desktopProxyURLEnv = "CODEXTRA_DESKTOP_PROXY_URL"
+	desktopCodexBinEnv = "CODEXTRA_DESKTOP_CODEX_BIN"
+	desktopCLIPathEnv  = "CODEX_CLI_PATH"
+)
+
 func main() {
 	if err := runForever(); err != nil {
 		fmt.Fprintln(os.Stderr, "codextra:", err)
@@ -95,6 +101,10 @@ func runForever() error {
 }
 
 func run() error {
+	if proxyURL := os.Getenv(desktopProxyURLEnv); proxyURL != "" {
+		return runDesktopProxyBridge(proxyURL)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 2)
@@ -177,23 +187,29 @@ func run() error {
 	restartPending := false
 	commandRunning := atomic.Bool{}
 	commandRunning.Store(true)
-	codexArgs := codexArgs(proxyURL, userArgs)
-	if options.desktop {
-		codexArgs = codexDesktopArgs(codexArgs)
-	}
 	cmdCtx, stopCmd := context.WithCancel(ctx)
 	defer stopCmd()
-	cmd := exec.CommandContext(cmdCtx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs...)
+	var cmd *exec.Cmd
+	if options.desktop {
+		appBin, appArgs, err := desktopAppCommand(userArgs)
+		if err != nil {
+			return err
+		}
+		cmd = exec.CommandContext(cmdCtx, appBin, appArgs...)
+		cmd.Env = desktopAppEnv(codexEnv(os.Environ(), proxyURL), proxyURL)
+	} else {
+		cmd = exec.CommandContext(cmdCtx, getenv("CODEXTRA_CODEX_BIN", "codex"), codexArgs(proxyURL, userArgs)...)
+		cmd.Env = codexEnv(os.Environ(), proxyURL)
+	}
 	configureCommandProcess(cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = codexEnv(os.Environ(), proxyURL)
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 
 	keepProxyAliveForDesktop := func(cmdErr error) error {
-		if cmdErr != nil || !options.desktop || !codexDesktopShouldKeepAlive(userArgs) {
+		if cmdErr != nil || !options.desktop || !desktopAppShouldKeepAlive(userArgs) {
 			return nil
 		}
 		log.Printf("desktop app launched; press Ctrl+C to stop codextra proxy keepalive")
@@ -272,7 +288,7 @@ func run() error {
 						return
 					default:
 					}
-					if options.desktop && codexDesktopShouldKeepAlive(userArgs) {
+					if options.desktop && desktopAppShouldKeepAlive(userArgs) {
 						// The desktop app detaches immediately; keep the tray and
 						// proxy alive until codextra is signaled to shut down,
 						// matching the non-tray keepalive path.
@@ -1302,23 +1318,71 @@ func codexArgs(proxyURL string, userArgs []string) []string {
 	return args
 }
 
-func codexDesktopArgs(args []string) []string {
-	desktopArgs := make([]string, 0, len(args)+1)
-	desktopArgs = append(desktopArgs, "app")
-	desktopArgs = append(desktopArgs, args...)
-	return desktopArgs
+// runDesktopProxyBridge is invoked by the Codex desktop app. The app launches
+// its embedded CLI through CODEX_CLI_PATH; pointing that at codextra lets the
+// already-running parent proxy remain the single owner of account rotation.
+func runDesktopProxyBridge(proxyURL string) error {
+	codexBin := os.Getenv(desktopCodexBinEnv)
+	if codexBin == "" {
+		return fmt.Errorf("%s is required when %s is set", desktopCodexBinEnv, desktopProxyURLEnv)
+	}
+	cmd := exec.Command(codexBin, codexArgs(proxyURL, os.Args[1:])...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = withoutEnv(os.Environ(), desktopProxyURLEnv, desktopCodexBinEnv, desktopCLIPathEnv)
+	return cmd.Run()
 }
 
-func codexDesktopShouldKeepAlive(userArgs []string) bool {
-	for _, arg := range userArgs {
-		if arg == "--" {
-			return true
+func desktopAppEnv(env []string, proxyURL string) []string {
+	codexBin := resolveCodexBin()
+	if codexBin == "" {
+		codexBin = "codex"
+	}
+	return append(withoutEnv(env, desktopProxyURLEnv, desktopCodexBinEnv, desktopCLIPathEnv),
+		desktopProxyURLEnv+"="+proxyURL,
+		desktopCodexBinEnv+"="+codexBin,
+		desktopCLIPathEnv+"="+mustExecutablePath(),
+	)
+}
+
+func mustExecutablePath() string {
+	path, err := os.Executable()
+	if err != nil {
+		return os.Args[0]
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+func resolveCodexBin() string {
+	if v := os.Getenv("CODEXTRA_CODEX_BIN"); v != "" {
+		return v
+	}
+	if p, err := exec.LookPath("codex"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func withoutEnv(env []string, keys ...string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		remove := false
+		for _, unwanted := range keys {
+			if key == unwanted {
+				remove = true
+				break
+			}
 		}
-		if arg == "-h" || arg == "--help" {
-			return false
+		if !remove {
+			filtered = append(filtered, entry)
 		}
 	}
-	return true
+	return filtered
 }
 
 func codexChatGPTBaseURL(proxyURL string) string {

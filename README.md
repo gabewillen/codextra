@@ -116,12 +116,13 @@ After rotation, Codex's `/status` screen can show mixed account information:
 the `Account` field comes from Codex's startup auth snapshot, while usage limits
 and model requests come from the currently selected codextra proxy account.
 
-Use `--desktop` to launch the Codex desktop app with the codextra proxy instead
-of launching the terminal UI. The flag is consumed by `codextra`; remaining
-arguments are passed to `codex app` after the proxy config overrides, so a path
-argument opens that workspace in Codex Desktop. Keep the `codextra --desktop`
-process running while using the desktop app, because it keeps the local proxy
-alive.
+<!-- `--desktop` launch behavior from cmd/codextra -->
+Use `--desktop` to launch the current macOS Codex desktop app with the codextra
+proxy instead of launching the terminal UI. The flag is consumed by `codextra`;
+a path argument opens that workspace in Codex. The app runs its embedded Codex
+CLI through codextra, so its model traffic keeps using the same local proxy and
+active account. Keep the app open while using it; codextra stops the proxy when
+the app exits.
 
 ### Desktop launcher app (macOS)
 
