@@ -48,9 +48,3 @@ func codexDesktopOpenURL(userArgs []string) string {
 	query := url.Values{"path": []string{workspace}}
 	return "codex://threads/new?" + query.Encode()
 }
-
-func desktopAppShouldKeepAlive(_ []string) bool {
-	// The app executable remains attached until the user quits it, so the
-	// parent proxy naturally stays alive for exactly the app's lifetime.
-	return false
-}

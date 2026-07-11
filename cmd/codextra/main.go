@@ -208,30 +208,6 @@ func run() error {
 
 	log.Printf("using proxy %s", proxyDisplayURL(proxyURL))
 
-	keepProxyAliveForDesktop := func(cmdErr error) error {
-		if cmdErr != nil || !options.desktop || !desktopAppShouldKeepAlive(userArgs) {
-			return nil
-		}
-		log.Printf("desktop app launched; press Ctrl+C to stop codextra proxy keepalive")
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-restartReqs:
-				// The codex child is already gone, but proxied requests from the
-				// detached desktop app may still be in flight; wait for the proxy
-				// to drain (or time out) before re-exec, as the other paths do.
-				log.Printf("codextra received upgrade signal; waiting for proxy idleness before restart")
-				if err := waitForProxyIdle(cmdCtx, proxyURL, restartWait); err != nil {
-					// ctx canceled mid-wait — treat as a normal shutdown.
-					return nil
-				}
-				log.Printf("restarting codextra wrapper")
-				return errRestartRequested
-			}
-		}
-	}
-
 	var stopCommandOnce sync.Once
 	requestCommandStop := func() {
 		stopCommandOnce.Do(func() {
@@ -287,13 +263,6 @@ func run() error {
 						trayDone <- errRestartRequested
 						return
 					default:
-					}
-					if options.desktop && desktopAppShouldKeepAlive(userArgs) {
-						// The desktop app detaches immediately; keep the tray and
-						// proxy alive until codextra is signaled to shut down,
-						// matching the non-tray keepalive path.
-						log.Printf("desktop app launched; codextra tray stays active until quit")
-						continue
 					}
 					stopTray()
 					trayDone <- nil
@@ -357,7 +326,7 @@ func run() error {
 				return errRestartRequested
 			default:
 			}
-			return keepProxyAliveForDesktop(err)
+			return nil
 		case <-restartReqs:
 			if !commandRunning.Load() {
 				continue
@@ -1330,7 +1299,10 @@ func runDesktopProxyBridge(proxyURL string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = withoutEnv(os.Environ(), desktopProxyURLEnv, desktopCodexBinEnv, desktopCLIPathEnv)
+	cmd.Env = codexEnv(
+		withoutEnv(os.Environ(), desktopProxyURLEnv, desktopCodexBinEnv, desktopCLIPathEnv),
+		proxyURL,
+	)
 	return cmd.Run()
 }
 

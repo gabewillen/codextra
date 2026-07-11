@@ -130,6 +130,25 @@ func TestWithoutEnvRemovesOnlyRequestedKeys(t *testing.T) {
 	}
 }
 
+func TestDesktopBridgeEnvPreservesProxyURL(t *testing.T) {
+	t.Parallel()
+
+	base := []string{
+		"KEEP=1",
+		desktopProxyURLEnv + "=http://bridge",
+		desktopCodexBinEnv + "=/path/to/codex",
+		desktopCLIPathEnv + "=/path/to/codextra",
+	}
+	got := codexEnv(
+		withoutEnv(base, desktopProxyURLEnv, desktopCodexBinEnv, desktopCLIPathEnv),
+		"http://127.0.0.1:9999",
+	)
+	want := []string{"KEEP=1", "CODEXTRA_PROXY_URL=http://127.0.0.1:9999"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("desktop bridge environment = %#v, want %#v", got, want)
+	}
+}
+
 func TestCodexChatGPTBaseURLPreservesBackendAPIBasePath(t *testing.T) {
 	t.Parallel()
 
