@@ -376,6 +376,15 @@ func currentAccountUsageLines(account accounts.Account, now time.Time) []string 
 		return []string{fmt.Sprintf("%s · cools down in %s", reason, humanizeDuration(disabledUntil.Sub(now)))}
 	}
 	if len(account.Usage) == 0 {
+		// Versions before per-window usage stored just this summary. Retain it as
+		// a display fallback so upgrading does not hide already-fetched usage.
+		if account.UsagePercent != 0 || account.UsageResetAt != 0 {
+			return []string{usageWindowLine(accounts.UsageWindow{
+				Label:   "Usage",
+				Percent: account.UsagePercent,
+				ResetAt: account.UsageResetAt,
+			}, now)}
+		}
 		return []string{"usage unavailable"}
 	}
 	lines := make([]string, 0, len(account.Usage))

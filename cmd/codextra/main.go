@@ -35,10 +35,11 @@ import (
 // whenever the proxy's behavior changes so updated binaries replace a
 // still-running old proxy instead of silently reusing it.
 //
-// 13: fail over from server-invalidated sessions (#11); refresh-token burn guard
-// (#10); recover from any 401 (#8). These all live in the proxy, so a binary
-// update must restart the proxy to take effect.
-const proxyStateVersion = 13
+// 14: stop proxy token refreshes and rotation from overwriting Codex's own
+// auth.json. The proxy registry owns selected-account credentials; Codex's
+// login state owns its local threads. This lives in the proxy process, so a
+// binary update must restart a still-running old proxy to take effect.
+const proxyStateVersion = 14
 const defaultProxyLogMaxBytes int64 = 1 << 20
 const defaultProxyIdleGrace = 10 * time.Second
 const defaultProxyUpgradeWait = 10 * time.Second
@@ -388,13 +389,7 @@ func runProxyServer(ctx context.Context) error {
 	}
 	defer listener.Close()
 
-	server, err := proxy.New(proxy.Config{
-		Upstream:        upstream,
-		APIUpstream:     apiUpstream,
-		Store:           store,
-		Logger:          logger,
-		OnAccountUpdate: updateCodexAuthForAccount,
-	})
+	server, err := proxy.New(codextraProxyConfig(upstream, apiUpstream, store, logger))
 	if err != nil {
 		return err
 	}
@@ -1051,17 +1046,16 @@ func defaultStorePath() (string, error) {
 	return filepath.Join(dir, "accounts.json"), nil
 }
 
-var codexAuthWriteMu sync.Mutex
-
-func updateCodexAuthForAccount(account accounts.Account) error {
-	codexAuthWriteMu.Lock()
-	defer codexAuthWriteMu.Unlock()
-
-	authPath, err := codexauth.Path()
-	if err != nil {
-		return err
+// codextraProxyConfig keeps the two independent identity stores separated:
+// codextra's registry owns proxy credentials, while Codex owns auth.json and
+// its local thread history. In particular, do not set OnAccountUpdate here.
+func codextraProxyConfig(upstream, apiUpstream string, store *accounts.Store, logger *slog.Logger) proxy.Config {
+	return proxy.Config{
+		Upstream:    upstream,
+		APIUpstream: apiUpstream,
+		Store:       store,
+		Logger:      logger,
 	}
-	return codexauth.Write(authPath, account)
 }
 
 func activateAccount(alias string) (accounts.Account, error) {

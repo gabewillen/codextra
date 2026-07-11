@@ -122,6 +122,15 @@ func TestCodexArgsAllowsUserOverrideToWinByOrder(t *testing.T) {
 	}
 }
 
+func TestCodextraProxyConfigDoesNotRewriteCodexAuth(t *testing.T) {
+	t.Parallel()
+
+	config := codextraProxyConfig("https://chatgpt.com", "https://api.openai.com", nil, nil)
+	if config.OnAccountUpdate != nil {
+		t.Fatal("OnAccountUpdate is configured; proxy credential changes must not rewrite Codex auth.json")
+	}
+}
+
 func TestWithoutEnvRemovesOnlyRequestedKeys(t *testing.T) {
 	t.Parallel()
 

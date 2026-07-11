@@ -58,6 +58,16 @@ func TestCurrentAccountUsageLinesFallback(t *testing.T) {
 		t.Fatalf("no-usage lines = %#v, want a single 'unavailable' placeholder", lines)
 	}
 
+	legacy := currentAccountUsageLines(accounts.Account{
+		Alias:        "work",
+		AccessToken:  "t",
+		UsagePercent: 37,
+		UsageResetAt: now.Add(time.Hour).Unix(),
+	}, now)
+	if len(legacy) != 1 || !strings.Contains(legacy[0], "37%") {
+		t.Fatalf("legacy usage lines = %#v, want the stored usage summary", legacy)
+	}
+
 	withUsage := accounts.Account{Alias: "work", AccessToken: "t", Usage: []accounts.UsageWindow{
 		{Label: "5h", Percent: 0},
 		{Label: "Weekly", Percent: 1},
