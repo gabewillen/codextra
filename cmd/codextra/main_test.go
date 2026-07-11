@@ -769,7 +769,7 @@ func waitForProxyActiveRequests(t *testing.T, proxyURL string, want int) {
 	t.Fatalf("active requests = %d, want %d", last, want)
 }
 
-func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
+func TestActivateAccountForLaunchReplacesCodexAuth(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
 	codexHome := filepath.Join(tempDir, "codex")
@@ -797,10 +797,16 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Upsert(work) error = %v", err)
 	}
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codex home) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"tokens":{"access_token":"token-personal"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(existing auth.json) error = %v", err)
+	}
 
-	account, err := activateAccount("work")
+	account, err := activateAccountForLaunch("work")
 	if err != nil {
-		t.Fatalf("activateAccount(work) error = %v", err)
+		t.Fatalf("activateAccountForLaunch(work) error = %v", err)
 	}
 	if account.Alias != "work" {
 		t.Fatalf("activated account alias = %q, want work", account.Alias)
@@ -814,8 +820,15 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 		t.Fatalf("ActiveAlias = %q, want work", loaded.Data.ActiveAlias)
 	}
 
-	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
-		t.Fatalf("auth.json stat error = %v, want not exist", err)
+	auth, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth.json) error = %v", err)
+	}
+	if !strings.Contains(string(auth), `"access_token": "token-work"`) {
+		t.Fatalf("auth.json does not contain selected account token")
+	}
+	if strings.Contains(string(auth), "token-personal") {
+		t.Fatalf("auth.json contains a different account token")
 	}
 }
 func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {

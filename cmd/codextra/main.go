@@ -145,7 +145,7 @@ func run() error {
 		return err
 	}
 	if options.accountAlias != "" {
-		if _, err := activateAccount(options.accountAlias); err != nil {
+		if _, err := activateAccountForLaunch(options.accountAlias); err != nil {
 			return err
 		}
 	}
@@ -1073,6 +1073,25 @@ func activateAccount(alias string) (accounts.Account, error) {
 	account, ok := store.Get(alias)
 	if !ok {
 		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
+	}
+	return account, nil
+}
+
+// activateAccountForLaunch selects alias for the proxy and makes the same
+// credentials available to Codex's local UI for this launch. Proxy-driven
+// rotation deliberately does not call this function, so it cannot overwrite
+// Codex's auth.json while a session is running.
+func activateAccountForLaunch(alias string) (accounts.Account, error) {
+	account, err := activateAccount(alias)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	authPath, err := codexauth.Path()
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if err := codexauth.Write(authPath, account); err != nil {
+		return accounts.Account{}, fmt.Errorf("set Codex auth for account %q: %w", alias, err)
 	}
 	return account, nil
 }
