@@ -115,7 +115,9 @@ history, resume state, config, and other local files stay in the normal Codex
 home. Because Codex still reads the normal `auth.json` locally, UI and status
 metadata can show the account logged in through Codex itself rather than the
 alias selected with `--account`; proxied model requests still use the selected
-codextra account.
+codextra account. Token refreshes and account rotation update only codextra's
+registry; they never rewrite Codex's `auth.json`, so switching aliases does not
+change the local Codex account or its thread history.
 
 After rotation, Codex's `/status` screen can show mixed account information:
 the `Account` field comes from Codex's startup auth snapshot, while usage limits
