@@ -869,6 +869,47 @@ func TestActivateAccountForLaunchLeavesActiveAliasWhenAuthWriteFails(t *testing.
 		t.Fatalf("ActiveAlias = %q, want unchanged work alias", reloaded.Data.ActiveAlias)
 	}
 }
+
+func TestCodexAuthSnapshotRestore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte("original auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(original auth) error = %v", err)
+	}
+	snapshot, err := snapshotCodexAuth(path)
+	if err != nil {
+		t.Fatalf("snapshotCodexAuth() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("replacement auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(replacement auth) error = %v", err)
+	}
+	if err := snapshot.restore(path); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(restored auth) error = %v", err)
+	}
+	if got := string(contents); got != "original auth" {
+		t.Fatalf("restored auth = %q, want original auth", got)
+	}
+}
+
+func TestMissingCodexAuthSnapshotRestoreRemovesNewFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	snapshot, err := snapshotCodexAuth(path)
+	if err != nil {
+		t.Fatalf("snapshotCodexAuth() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("new auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(new auth) error = %v", err)
+	}
+	if err := snapshot.restore(path); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restored new auth stat error = %v, want not exist", err)
+	}
+}
 func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")

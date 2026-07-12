@@ -124,6 +124,9 @@ func replaceWrittenAuth(tmp, path string, windows bool) error {
 	}
 
 	backup := path + ".bak"
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale auth backup: %w", err)
+	}
 	if err := os.Rename(path, backup); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return os.Rename(tmp, path)

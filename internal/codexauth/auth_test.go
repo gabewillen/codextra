@@ -195,6 +195,33 @@ func TestReplaceWrittenAuthWindowsReplacesExistingFile(t *testing.T) {
 	}
 }
 
+func TestReplaceWrittenAuthWindowsRemovesStaleBackup(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(path, []byte("current auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(current auth) error = %v", err)
+	}
+	if err := os.WriteFile(tmp, []byte("new auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(replacement auth) error = %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("stale auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(stale backup) error = %v", err)
+	}
+	if err := replaceWrittenAuth(tmp, path, true); err != nil {
+		t.Fatalf("replaceWrittenAuth(windows) error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(replaced auth) error = %v", err)
+	}
+	if got := string(contents); got != "new auth" {
+		t.Fatalf("auth contents = %q, want new auth", got)
+	}
+}
+
 func TestPathUsesCodexHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)

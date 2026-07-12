@@ -1094,8 +1094,11 @@ func activateAccountForLaunch(alias string) (accounts.Account, error) {
 	if !ok {
 		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
 	}
-	previous, hadPrevious := store.Get(store.Data.ActiveAlias)
 	authPath, err := codexauth.Path()
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	previousAuth, err := snapshotCodexAuth(authPath)
 	if err != nil {
 		return accounts.Account{}, err
 	}
@@ -1103,14 +1106,49 @@ func activateAccountForLaunch(alias string) (accounts.Account, error) {
 		return accounts.Account{}, fmt.Errorf("set Codex auth for account %q: %w", alias, err)
 	}
 	if err := store.SetActive(alias); err != nil {
-		if hadPrevious && strings.TrimSpace(previous.AccessToken) != "" {
-			if restoreErr := codexauth.Write(authPath, previous); restoreErr != nil {
-				return accounts.Account{}, fmt.Errorf("activate account %q: %w (also restore prior Codex auth: %v)", alias, err, restoreErr)
-			}
+		if restoreErr := previousAuth.restore(authPath); restoreErr != nil {
+			return accounts.Account{}, fmt.Errorf("activate account %q: %w (also restore prior Codex auth: %v)", alias, err, restoreErr)
 		}
 		return accounts.Account{}, err
 	}
 	return account, nil
+}
+
+type codexAuthSnapshot struct {
+	contents []byte
+	mode     os.FileMode
+	exists   bool
+}
+
+func snapshotCodexAuth(path string) (codexAuthSnapshot, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return codexAuthSnapshot{}, nil
+		}
+		return codexAuthSnapshot{}, fmt.Errorf("stat existing Codex auth: %w", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return codexAuthSnapshot{}, fmt.Errorf("read existing Codex auth: %w", err)
+	}
+	return codexAuthSnapshot{contents: contents, mode: info.Mode(), exists: true}, nil
+}
+
+func (snapshot codexAuthSnapshot) restore(path string) error {
+	if !snapshot.exists {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove newly created Codex auth: %w", err)
+		}
+		return nil
+	}
+	if err := os.WriteFile(path, snapshot.contents, snapshot.mode.Perm()); err != nil {
+		return fmt.Errorf("write previous Codex auth: %w", err)
+	}
+	if err := os.Chmod(path, snapshot.mode.Perm()); err != nil {
+		return fmt.Errorf("restore Codex auth permissions: %w", err)
+	}
+	return nil
 }
 
 func seedCodexAuthForAlias(alias, authPath string) error {
