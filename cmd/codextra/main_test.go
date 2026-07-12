@@ -769,7 +769,7 @@ func waitForProxyActiveRequests(t *testing.T, proxyURL string, want int) {
 	t.Fatalf("active requests = %d, want %d", last, want)
 }
 
-func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
+func TestActivateAccountForLaunchReplacesCodexAuth(t *testing.T) {
 	tempDir := t.TempDir()
 	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
 	codexHome := filepath.Join(tempDir, "codex")
@@ -797,10 +797,16 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Upsert(work) error = %v", err)
 	}
+	if err := os.MkdirAll(codexHome, 0700); err != nil {
+		t.Fatalf("MkdirAll(codex home) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"tokens":{"access_token":"token-personal"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(existing auth.json) error = %v", err)
+	}
 
-	account, err := activateAccount("work")
+	account, err := activateAccountForLaunch("work")
 	if err != nil {
-		t.Fatalf("activateAccount(work) error = %v", err)
+		t.Fatalf("activateAccountForLaunch(work) error = %v", err)
 	}
 	if account.Alias != "work" {
 		t.Fatalf("activated account alias = %q, want work", account.Alias)
@@ -814,8 +820,94 @@ func TestActivateAccountSetsSelectedAliasOnlyInCodextraStore(t *testing.T) {
 		t.Fatalf("ActiveAlias = %q, want work", loaded.Data.ActiveAlias)
 	}
 
-	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
-		t.Fatalf("auth.json stat error = %v, want not exist", err)
+	auth, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth.json) error = %v", err)
+	}
+	var storedAuth struct {
+		Tokens struct {
+			AccessToken string `json:"access_token"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(auth, &storedAuth); err != nil {
+		t.Fatalf("Unmarshal(auth.json) error = %v", err)
+	}
+	if got := storedAuth.Tokens.AccessToken; got != "token-work" {
+		t.Fatalf("auth.json access token = %q, want token-work", got)
+	}
+}
+
+func TestActivateAccountForLaunchLeavesActiveAliasWhenAuthWriteFails(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "not-a-directory")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(codexHome, []byte("block auth directory"), 0600); err != nil {
+		t.Fatalf("WriteFile(CODEX_HOME blocker) error = %v", err)
+	}
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{Alias: "work", AccessToken: "token-work"}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{Alias: "personal", AccessToken: "token-personal"}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+
+	if _, err := activateAccountForLaunch("personal"); err == nil {
+		t.Fatal("activateAccountForLaunch(personal) error = nil, want error")
+	}
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if reloaded.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want unchanged work alias", reloaded.Data.ActiveAlias)
+	}
+}
+
+func TestCodexAuthSnapshotRestore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte("original auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(original auth) error = %v", err)
+	}
+	snapshot, err := snapshotCodexAuth(path)
+	if err != nil {
+		t.Fatalf("snapshotCodexAuth() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("replacement auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(replacement auth) error = %v", err)
+	}
+	if err := snapshot.restore(path); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(restored auth) error = %v", err)
+	}
+	if got := string(contents); got != "original auth" {
+		t.Fatalf("restored auth = %q, want original auth", got)
+	}
+}
+
+func TestMissingCodexAuthSnapshotRestoreRemovesNewFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	snapshot, err := snapshotCodexAuth(path)
+	if err != nil {
+		t.Fatalf("snapshotCodexAuth() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("new auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(new auth) error = %v", err)
+	}
+	if err := snapshot.restore(path); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restored new auth stat error = %v, want not exist", err)
 	}
 }
 func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {

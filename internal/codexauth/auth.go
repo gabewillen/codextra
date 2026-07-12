@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -107,9 +108,39 @@ func Write(path string, account accounts.Account) error {
 	if err := os.WriteFile(tmp, append(bytes, '\n'), 0600); err != nil {
 		return fmt.Errorf("write codex auth: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceWrittenAuth(tmp, path, runtime.GOOS == "windows"); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace codex auth: %w", err)
+	}
+	return nil
+}
+
+// replaceWrittenAuth replaces path with tmp. Windows cannot rename over an
+// existing file, so move the old file aside first and restore it if the new
+// rename fails. Other platforms retain os.Rename's atomic replacement.
+func replaceWrittenAuth(tmp, path string, windows bool) error {
+	if !windows {
+		return os.Rename(tmp, path)
+	}
+
+	backup := path + ".bak"
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale auth backup: %w", err)
+	}
+	if err := os.Rename(path, backup); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return os.Rename(tmp, path)
+		}
+		return fmt.Errorf("move existing auth aside: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		if restoreErr := os.Rename(backup, path); restoreErr != nil {
+			return fmt.Errorf("write replacement: %w; restore existing auth: %v", err, restoreErr)
+		}
+		return fmt.Errorf("write replacement: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return fmt.Errorf("remove auth backup: %w", err)
 	}
 	return nil
 }

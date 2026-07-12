@@ -107,21 +107,18 @@ All other arguments are passed to `codex` unchanged after injecting the
 
 Use `--account <alias>` or `--account=<alias>` to switch the active codextra
 account before launching Codex. The flag is consumed by `codextra` and is not
-passed through to `codex`. Selecting an account only updates codextra's account
-registry; proxied requests get their `Authorization` and `ChatGPT-Account-ID`
-headers from the active codextra account instead of relying on Codex's
-`auth.json`. `codextra` does not replace `CODEX_HOME`, so Codex session
-history, resume state, config, and other local files stay in the normal Codex
-home. Because Codex still reads the normal `auth.json` locally, UI and status
-metadata can show the account logged in through Codex itself rather than the
-alias selected with `--account`; proxied model requests still use the selected
-codextra account. Token refreshes and account rotation update only codextra's
-registry; they never rewrite Codex's `auth.json`, so switching aliases does not
-change the local Codex account or its thread history.
+passed through to `codex`. Selecting an account updates the codextra registry
+and replaces Codex's normal `auth.json` with that alias’s saved credentials
+before Codex starts, so the UI and usage display use the selected account too.
+`codextra` does not replace `CODEX_HOME`, so Codex session history, resume
+state, config, and other local files stay in the normal Codex home. Token
+refreshes and automatic account rotation update only codextra's registry; they
+do not rewrite Codex's `auth.json` while a session is running.
 
-After rotation, Codex's `/status` screen can show mixed account information:
-the `Account` field comes from Codex's startup auth snapshot, while usage limits
-and model requests come from the currently selected codextra proxy account.
+After automatic rotation, Codex's `/status` screen can show mixed account
+information: the `Account` field comes from Codex's launch-time auth snapshot,
+while usage limits and model requests come from the current codextra proxy
+account.
 
 <!-- `--desktop` launch behavior from cmd/codextra -->
 Use `--desktop` to launch the current macOS Codex desktop app with the codextra

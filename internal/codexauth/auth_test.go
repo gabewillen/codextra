@@ -3,6 +3,7 @@ package codexauth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -145,6 +146,79 @@ func TestWriteCodexAuth(t *testing.T) {
 	}
 	if auth.LastRefresh == "" {
 		t.Fatal("LastRefresh = empty, want timestamp")
+	}
+}
+
+func TestWriteReplacesExistingCodexAuth(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte(`{"tokens":{"access_token":"old-token"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(existing auth) error = %v", err)
+	}
+	if err := Write(path, accounts.Account{Alias: "work", AccessToken: "new-token"}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	account, err := Import("work", path)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if account.AccessToken != "new-token" {
+		t.Fatalf("AccessToken = %q, want new-token", account.AccessToken)
+	}
+}
+
+func TestReplaceWrittenAuthWindowsReplacesExistingFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(path, []byte("old auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(existing auth) error = %v", err)
+	}
+	if err := os.WriteFile(tmp, []byte("new auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(replacement auth) error = %v", err)
+	}
+	if err := replaceWrittenAuth(tmp, path, true); err != nil {
+		t.Fatalf("replaceWrittenAuth(windows) error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(replaced auth) error = %v", err)
+	}
+	if got := string(contents); got != "new auth" {
+		t.Fatalf("auth contents = %q, want new auth", got)
+	}
+	if _, err := os.Stat(path + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup stat error = %v, want not exist", err)
+	}
+}
+
+func TestReplaceWrittenAuthWindowsRemovesStaleBackup(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(path, []byte("current auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(current auth) error = %v", err)
+	}
+	if err := os.WriteFile(tmp, []byte("new auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(replacement auth) error = %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("stale auth"), 0600); err != nil {
+		t.Fatalf("WriteFile(stale backup) error = %v", err)
+	}
+	if err := replaceWrittenAuth(tmp, path, true); err != nil {
+		t.Fatalf("replaceWrittenAuth(windows) error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(replaced auth) error = %v", err)
+	}
+	if got := string(contents); got != "new auth" {
+		t.Fatalf("auth contents = %q, want new auth", got)
 	}
 }
 
