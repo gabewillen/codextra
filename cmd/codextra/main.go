@@ -1094,6 +1094,7 @@ func activateAccountForLaunch(alias string) (accounts.Account, error) {
 	if !ok {
 		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
 	}
+	previous, hadPrevious := store.Get(store.Data.ActiveAlias)
 	authPath, err := codexauth.Path()
 	if err != nil {
 		return accounts.Account{}, err
@@ -1102,6 +1103,11 @@ func activateAccountForLaunch(alias string) (accounts.Account, error) {
 		return accounts.Account{}, fmt.Errorf("set Codex auth for account %q: %w", alias, err)
 	}
 	if err := store.SetActive(alias); err != nil {
+		if hadPrevious && strings.TrimSpace(previous.AccessToken) != "" {
+			if restoreErr := codexauth.Write(authPath, previous); restoreErr != nil {
+				return accounts.Account{}, fmt.Errorf("activate account %q: %w (also restore prior Codex auth: %v)", alias, err, restoreErr)
+			}
+		}
 		return accounts.Account{}, err
 	}
 	return account, nil
