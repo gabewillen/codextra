@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -106,6 +107,14 @@ func Write(path string, account accounts.Account) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(bytes, '\n'), 0600); err != nil {
 		return fmt.Errorf("write codex auth: %w", err)
+	}
+	// Windows does not allow os.Rename to replace an existing destination.
+	// Remove the old file first there; Unix keeps the atomic rename behavior.
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("remove codex auth before replacement: %w", err)
+		}
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

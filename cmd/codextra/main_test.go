@@ -824,11 +824,49 @@ func TestActivateAccountForLaunchReplacesCodexAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(auth.json) error = %v", err)
 	}
-	if !strings.Contains(string(auth), `"access_token": "token-work"`) {
-		t.Fatalf("auth.json does not contain selected account token")
+	var storedAuth struct {
+		Tokens struct {
+			AccessToken string `json:"access_token"`
+		} `json:"tokens"`
 	}
-	if strings.Contains(string(auth), "token-personal") {
-		t.Fatalf("auth.json contains a different account token")
+	if err := json.Unmarshal(auth, &storedAuth); err != nil {
+		t.Fatalf("Unmarshal(auth.json) error = %v", err)
+	}
+	if got := storedAuth.Tokens.AccessToken; got != "token-work" {
+		t.Fatalf("auth.json access token = %q, want token-work", got)
+	}
+}
+
+func TestActivateAccountForLaunchLeavesActiveAliasWhenAuthWriteFails(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "codextra", "accounts.json")
+	codexHome := filepath.Join(tempDir, "not-a-directory")
+	t.Setenv("CODEXTRA_STORE", storePath)
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(codexHome, []byte("block auth directory"), 0600); err != nil {
+		t.Fatalf("WriteFile(CODEX_HOME blocker) error = %v", err)
+	}
+
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{Alias: "work", AccessToken: "token-work"}); err != nil {
+		t.Fatalf("Upsert(work) error = %v", err)
+	}
+	if err := store.Upsert(accounts.Account{Alias: "personal", AccessToken: "token-personal"}); err != nil {
+		t.Fatalf("Upsert(personal) error = %v", err)
+	}
+
+	if _, err := activateAccountForLaunch("personal"); err == nil {
+		t.Fatal("activateAccountForLaunch(personal) error = nil, want error")
+	}
+	reloaded, err := accounts.LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("LoadStore(reloaded) error = %v", err)
+	}
+	if reloaded.Data.ActiveAlias != "work" {
+		t.Fatalf("ActiveAlias = %q, want unchanged work alias", reloaded.Data.ActiveAlias)
 	}
 }
 func TestRunLoginTagImportsCurrentCodexAuth(t *testing.T) {

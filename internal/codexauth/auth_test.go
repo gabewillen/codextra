@@ -148,6 +148,25 @@ func TestWriteCodexAuth(t *testing.T) {
 	}
 }
 
+func TestWriteReplacesExistingCodexAuth(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte(`{"tokens":{"access_token":"old-token"}}`), 0600); err != nil {
+		t.Fatalf("WriteFile(existing auth) error = %v", err)
+	}
+	if err := Write(path, accounts.Account{Alias: "work", AccessToken: "new-token"}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	account, err := Import("work", path)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if account.AccessToken != "new-token" {
+		t.Fatalf("AccessToken = %q, want new-token", account.AccessToken)
+	}
+}
+
 func TestPathUsesCodexHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)

@@ -1082,9 +1082,17 @@ func activateAccount(alias string) (accounts.Account, error) {
 // rotation deliberately does not call this function, so it cannot overwrite
 // Codex's auth.json while a session is running.
 func activateAccountForLaunch(alias string) (accounts.Account, error) {
-	account, err := activateAccount(alias)
+	storePath, err := defaultStorePath()
 	if err != nil {
 		return accounts.Account{}, err
+	}
+	store, err := accounts.LoadStore(storePath)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	account, ok := store.Get(alias)
+	if !ok {
+		return accounts.Account{}, fmt.Errorf("account %q not found", alias)
 	}
 	authPath, err := codexauth.Path()
 	if err != nil {
@@ -1092,6 +1100,9 @@ func activateAccountForLaunch(alias string) (accounts.Account, error) {
 	}
 	if err := codexauth.Write(authPath, account); err != nil {
 		return accounts.Account{}, fmt.Errorf("set Codex auth for account %q: %w", alias, err)
+	}
+	if err := store.SetActive(alias); err != nil {
+		return accounts.Account{}, err
 	}
 	return account, nil
 }
